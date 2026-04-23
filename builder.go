@@ -12,6 +12,8 @@ import (
 	"github.com/codefly-dev/core/wool"
 
 	"github.com/codefly-dev/core/agents/services"
+	"github.com/codefly-dev/core/agents/services/audit"
+	"github.com/codefly-dev/core/agents/services/upgrade"
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/core/templates"
@@ -87,6 +89,36 @@ func (s *Builder) Sync(ctx context.Context, req *builderv0.SyncRequest) (*builde
 	ctx = s.Wool.Inject(ctx)
 
 	return s.Builder.SyncResponse()
+}
+
+// Audit scans the postgres image for known CVEs (HIGH/CRITICAL) via
+// trivy. The image tag comes from the package-level `image` var
+// (postgres:16.1-alpine by default).
+func (s *Builder) Audit(ctx context.Context, req *builderv0.AuditRequest) (*builderv0.AuditResponse, error) {
+	defer s.Wool.Catch()
+	ctx = s.Wool.Inject(ctx)
+	res, err := audit.Docker(ctx, image.FullName())
+	if err != nil {
+		return s.Builder.AuditError(err)
+	}
+	return s.Builder.AuditResponse(res.Findings, res.Outdated, res.Tool, res.Language)
+}
+
+// Upgrade reports a tag bump from the current postgres image (e.g.
+// 16.1-alpine → 16.4 within major 16; or 17.0 if --major). Persisting
+// the new tag is left to the caller — postgres has no lockfile to
+// rewrite, the image var lives in the agent code.
+func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*builderv0.UpgradeResponse, error) {
+	defer s.Wool.Catch()
+	ctx = s.Wool.Inject(ctx)
+	res, err := upgrade.Docker(ctx, image.FullName(), upgrade.Options{
+		IncludeMajor: req.IncludeMajor,
+		DryRun:       req.DryRun,
+	})
+	if err != nil {
+		return s.Builder.UpgradeError(err)
+	}
+	return s.Builder.UpgradeResponse(res.Changes, res.LockfileDiff)
 }
 
 type DockerTemplating struct {
