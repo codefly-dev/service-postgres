@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"github.com/codefly-dev/core/agents/communicate"
 	dockerhelpers "github.com/codefly-dev/core/agents/helpers/docker"
 	v0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
@@ -252,6 +253,12 @@ func (s *Builder) CreateEndpoints(ctx context.Context) error {
 	s.TcpEndpoint, err = resources.NewAPI(ctx, endpoint, resources.ToTCPAPI(tcp))
 	s.Endpoints = []*v0.Endpoint{s.TcpEndpoint}
 	return nil
+}
+
+func (s *Builder) Communicate(stream builderv0.Builder_CommunicateServer) error {
+	asker := communicate.NewQuestionAsker(stream)
+	_, err := asker.RunSequence(nil)
+	return err
 }
 
 //go:embed templates/factory

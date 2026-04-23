@@ -173,7 +173,7 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 
 	s.Wool.Debug("waiting for ready", wool.Field("connection", s.connection))
 
-	maxRetry := 5
+	maxRetry := 30
 	for retry := 0; retry < maxRetry; retry++ {
 		db, err := sql.Open("postgres", s.connection)
 		if err != nil {

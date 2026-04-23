@@ -1,4 +1,4 @@
-module github.com/codefly-dev/service-external-postgres
+module github.com/codefly-dev/service-postgres
 
 go 1.25.0
 
@@ -8,6 +8,7 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.80.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -99,5 +100,4 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260406210006-6f92a3bedf2d // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260406210006-6f92a3bedf2d // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
