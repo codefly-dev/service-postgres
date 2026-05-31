@@ -27,6 +27,11 @@ type Runtime struct {
 	// internal
 	runnerEnvironment *runners.DockerEnvironment
 
+	// nixRuntime is set instead of runnerEnvironment when the caller requests
+	// RuntimeContextNix — postgres then runs natively from a nix-provisioned
+	// binary (no Docker), serving the same connection string + database.
+	nixRuntime *nixPostgres
+
 	postgresPort uint16
 }
 
@@ -135,13 +140,33 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 
 	w.Debug("connection string", wool.Field("connection", s.connection))
 
-	// Docker
-	runner, err := runners.NewDockerHeadlessEnvironment(ctx, image, s.UniqueWithWorkspace())
+	// Configuration (postgres user/password) is needed by both runtimes.
+	err = s.LoadConfiguration(ctx, s.Configuration)
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
 
-	err = s.LoadConfiguration(ctx, s.Configuration)
+	// Nix runtime: run postgres natively from a nix-provisioned binary instead
+	// of a Docker container — selected when the caller requests
+	// RuntimeContextNix (e.g. a host without Docker). Same connection string +
+	// database as the Docker path, so the rest of the agent is unchanged.
+	if rc := req.GetRuntimeContext(); rc != nil && rc.Kind == resources.RuntimeContextNix {
+		w.Debug("using nix runtime for postgres", wool.Field("port", instance.Port))
+		nixpg, errNix := newNixPostgres(ctx, s.Location, uint16(instance.Port),
+			s.postgresUser, s.postgresPassword, s.DatabaseName, s.LogLevel, s.Wool)
+		if errNix != nil {
+			return s.Runtime.InitError(errNix)
+		}
+		if errNix = nixpg.Init(ctx); errNix != nil {
+			return s.Runtime.InitError(errNix)
+		}
+		s.nixRuntime = nixpg
+		s.Wool.Debug("nix postgres init successful")
+		return s.Runtime.InitResponse()
+	}
+
+	// Docker
+	runner, err := runners.NewDockerHeadlessEnvironment(ctx, image, s.UniqueWithWorkspace())
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
@@ -154,6 +179,23 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 		resources.Env("POSTGRES_USER", s.postgresUser),
 		resources.Env("POSTGRES_PASSWORD", s.postgresPassword),
 		resources.Env("POSTGRES_DB", s.DatabaseName))
+
+	// Quieten the server when a log level is configured. The official
+	// postgres image's ENTRYPOINT is docker-entrypoint.sh and its
+	// default CMD is `postgres`. WithCommand only overrides CMD, so
+	// we provide just `postgres <flags>` — the entrypoint still runs
+	// initdb on first boot, then execs our postgres + flags. The
+	// `-c` args are passed straight to the server and override the
+	// equivalent postgresql.conf entries.
+	if lvl := strings.ToLower(strings.TrimSpace(s.LogLevel)); lvl != "" {
+		runner.WithCommand(
+			"postgres",
+			"-c", "log_min_messages="+lvl,
+			"-c", "log_statement=none",
+			"-c", "log_connections=off",
+			"-c", "log_disconnections=off",
+		)
+	}
 
 	s.runnerEnvironment = runner
 
@@ -174,6 +216,7 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 	s.Wool.Debug("waiting for ready", wool.Field("connection", s.connection))
 
 	maxRetry := 30
+	var lastErr error
 	for retry := 0; retry < maxRetry; retry++ {
 		db, err := sql.Open("postgres", s.connection)
 		if err != nil {
@@ -190,10 +233,20 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 				return nil
 			}
 		}
+		lastErr = err
 		s.Wool.Debug("waiting for database to be ready", wool.ErrField(err))
 		time.Sleep(3 * time.Second)
 	}
-	return s.Wool.NewError("database is not ready")
+	// Tail container logs so the user sees the real failure (bad CMD,
+	// disk full, port collision, ...) instead of a generic timeout.
+	tail := ""
+	if s.runnerEnvironment != nil {
+		tail = s.runnerEnvironment.TailLogs(ctx, 30)
+	}
+	if tail != "" {
+		return s.Wool.NewError("database not ready after %d retries (last probe: %v); container logs (tail 30):\n%s", maxRetry, lastErr, tail)
+	}
+	return s.Wool.NewError("database not ready after %d retries (last probe: %v)", maxRetry, lastErr)
 }
 
 func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runtimev0.StartResponse, error) {
@@ -245,6 +298,14 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	ctx = s.Wool.Inject(ctx)
 
 	s.Wool.Debug("Destroying")
+
+	// Nix runtime: stop the native postgres process.
+	if s.nixRuntime != nil {
+		if err := s.nixRuntime.Stop(ctx); err != nil {
+			return s.Runtime.DestroyError(err)
+		}
+		return s.Runtime.DestroyResponse()
+	}
 
 	// Get the runner environment
 	runner, err := runners.NewDockerHeadlessEnvironment(ctx, image, s.UniqueWithWorkspace())
