@@ -10,6 +10,7 @@ import (
 	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
 	"github.com/codefly-dev/core/network"
 	"github.com/codefly-dev/core/resources"
+	runners "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/core/wool"
 	"github.com/stretchr/testify/require"
@@ -22,7 +23,24 @@ import (
 // TODO: Add tests
 // - migrations: up/down
 
-func TestCreateToRun(t *testing.T) {
+// TestCreateToRunDocker runs the full agent lifecycle against the Docker
+// runtime (the default container backend).
+func TestCreateToRunDocker(t *testing.T) {
+	testCreateToRun(t, resources.NewRuntimeContextFree())
+}
+
+// TestCreateToRunNix runs the SAME full lifecycle against the nix runtime —
+// the third backend in the native/docker/nix matrix. Requires nix.
+func TestCreateToRunNix(t *testing.T) {
+	if !runners.CheckNixInstalled() || !runners.IsNixSupported() {
+		t.Skip("nix not installed/supported on this host")
+	}
+	testCreateToRun(t, resources.NewRuntimeContextNix())
+}
+
+// testCreateToRun drives Load → Init → Start → connect → SELECT 1 for one
+// runtime context, so docker and nix exercise the identical agent path.
+func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	wool.SetGlobalLogLevel(wool.DEBUG)
 	ctx := context.Background()
 
@@ -93,7 +111,7 @@ func TestCreateToRun(t *testing.T) {
 	}
 
 	init, err := runtime.Init(ctx, &runtimev0.InitRequest{
-		RuntimeContext:          resources.NewRuntimeContextFree(),
+		RuntimeContext:          runtimeContext,
 		Configuration:           conf,
 		ProposedNetworkMappings: networkMappings,
 	})
