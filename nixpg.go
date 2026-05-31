@@ -46,6 +46,12 @@ type nixPostgres struct {
 	logLevel  string
 	out       io.Writer
 	proc      runners.Proc
+	// serverCancel cancels serverCtx — the context the postgres process runs
+	// under. It MUST outlive Init: starting postgres under the Init RPC's ctx
+	// kills it ("smart shutdown") the instant Init returns and that ctx is
+	// cancelled. Cancelled only by Stop.
+	serverCtx    context.Context
+	serverCancel context.CancelFunc
 	// binDir is the absolute nix store bin dir holding initdb + postgres.
 	// Resolved once after materialization and used for ALL postgres invocations
 	// so PATH contamination (e.g. a system Homebrew postgres) can never make
@@ -163,7 +169,11 @@ func (n *nixPostgres) startServer(ctx context.Context) error {
 	if n.out != nil {
 		proc.WithOutput(n.out)
 	}
-	if err := proc.Start(ctx); err != nil {
+	// Run postgres under a context that outlives Init — NOT the Init RPC ctx,
+	// which is cancelled the moment Init returns and would SIGTERM the server.
+	n.serverCtx, n.serverCancel = context.WithCancel(context.Background())
+	if err := proc.Start(n.serverCtx); err != nil {
+		n.serverCancel()
 		return fmt.Errorf("start postgres: %w", err)
 	}
 	n.proc = proc
@@ -222,6 +232,9 @@ func (n *nixPostgres) ensureDatabase(ctx context.Context) error {
 
 // Stop terminates the postgres server.
 func (n *nixPostgres) Stop(ctx context.Context) error {
+	if n.serverCancel != nil {
+		n.serverCancel()
+	}
 	if n.proc == nil {
 		return nil
 	}
