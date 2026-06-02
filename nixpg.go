@@ -19,11 +19,14 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	runners "github.com/codefly-dev/core/runners/base"
@@ -149,6 +152,9 @@ func (n *nixPostgres) Init(ctx context.Context) error {
 	if err := n.initdbIfNeeded(ctx); err != nil {
 		return err
 	}
+	if err := n.clearStalePostmasterPid(); err != nil {
+		return err
+	}
 	if err := n.startServer(ctx); err != nil {
 		return err
 	}
@@ -156,6 +162,43 @@ func (n *nixPostgres) Init(ctx context.Context) error {
 		return err
 	}
 	return n.ensureDatabase(ctx)
+}
+
+// clearStalePostmasterPid removes a leftover postmaster.pid when no live
+// postmaster owns it. The nix runner launches `postgres` directly (not
+// pg_ctl), so it must replicate pg_ctl's stale-lock cleanup — otherwise a
+// crashed or SIGKILL'd prior run (codefly currently reaps orphaned nix deps
+// only on the NEXT startup, after a fresh run already tried to start) leaves a
+// pid file that aborts boot: `FATAL: lock file "postmaster.pid" is empty` /
+// "is the remnant of a previous server startup crash". A pid file owned by a
+// LIVE process is left untouched so we never stomp a concurrent postmaster.
+func (n *nixPostgres) clearStalePostmasterPid() error {
+	pidPath := filepath.Join(n.dataDir, "postmaster.pid")
+	data, err := os.ReadFile(pidPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return nil // best-effort; let postgres surface any real error
+	}
+	// Line 1 of postmaster.pid is the postmaster PID. An empty/corrupt file is
+	// stale by definition.
+	fields := strings.Fields(string(data))
+	if len(fields) > 0 {
+		if pid, perr := strconv.Atoi(fields[0]); perr == nil && pid > 0 && processAlive(pid) {
+			return nil // a live process owns the lock — do NOT remove it
+		}
+	}
+	return os.Remove(pidPath)
+}
+
+// processAlive reports whether a PID names a live process (signal 0 probe).
+func processAlive(pid int) bool {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
 }
 
 // initdbIfNeeded creates the cluster the first time (PG_VERSION marks an
