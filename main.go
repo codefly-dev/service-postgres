@@ -32,12 +32,25 @@ type Settings struct {
 
 	WithoutSSL  bool `yaml:"without-ssl"`  // Default to SSL
 	NoMigration bool `yaml:"no-migration"` // Developer only
+
+	// LogLevel controls postgres server log verbosity. When set, the
+	// agent passes `-c log_min_messages=<lvl>` plus a handful of
+	// quietening knobs to suppress per-statement / per-connection
+	// chatter. Accepts postgres' native values: debug5..debug1,
+	// log, notice, warning, error, fatal, panic. Empty = postgres
+	// default (warning, but image emits a lot of startup chatter).
+	LogLevel string `yaml:"log-level"`
 }
 
 const HotReload = "hot-reload"
 const DatabaseName = "database-name"
 
-var image = &resources.DockerImage{Name: "postgres", Tag: "16.1-alpine"}
+// pgvector/pgvector:pg16 is the official Postgres 16 image with the pgvector
+// extension preinstalled (same docker-entrypoint as the stock postgres image).
+// Required so `CREATE EXTENSION vector` works — consumers like Mind's
+// knowledge-graph migration (vector(1024) column) depend on it. The nix runtime
+// gets pgvector via nix/flake.nix; this keeps both runtimes at parity.
+var image = &resources.DockerImage{Name: "pgvector/pgvector", Tag: "pg16"}
 
 type Service struct {
 	*services.Base

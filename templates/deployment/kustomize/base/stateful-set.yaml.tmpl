@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Service.Name.DNSCase }}
+  namespace: "{{ .Namespace }}"
+spec:
+  serviceName: {{ .Service.Name.DNSCase }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Service.Name.DNSCase }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Service.Name.DNSCase }}
+    spec:
+      # Pod-level security context. fsGroup=70 = postgres user in
+      # the alpine image — needed so the postgres process can write
+      # to the PV (otherwise the PV is owned by root:root and pg
+      # init fails). seccomp RuntimeDefault picks up the kernel's
+      # default syscall filter; restrictive PSS profile mandates
+      # this is set explicitly.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          # Pinned in lockstep with main.go's runtime image. Bump both
+          # together. pgvector/pgvector:pg16 is the official Postgres 16 image
+          # with pgvector preinstalled (same entrypoint env: POSTGRES_USER /
+          # POSTGRES_PASSWORD / POSTGRES_DB at first-boot); after that the data
+          # dir is authoritative.
+          image: pgvector/pgvector:pg16
+          imagePullPolicy: IfNotPresent
+          # Container-level security. Defense-in-depth on top of the
+          # pod-level securityContext above. allowPrivilegeEscalation
+          # = false stops setuid binaries from gaining root inside
+          # the container. capabilities.drop=ALL strips every Linux
+          # capability — postgres doesn't need any.
+          #
+          # readOnlyRootFilesystem is left FALSE here because postgres
+          # writes pg_stat_tmp / pg_wal / config files outside
+          # /var/lib/postgresql/data. Hardening to true would require
+          # mounting emptyDir at those paths — possible but noisy;
+          # leaving as a TODO once we standardize on it across agents.
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 70
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: secret-{{ .Service.Name.DNSCase }}
+          # Modest defaults — tune in overlay per-tenant. The PSS
+          # baseline + ResourceQuota at namespace level requires
+          # every container to declare requests/limits.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # pg_isready is the canonical "is postgres accepting
+          # connections" check. Without -U the env-injected user
+          # is implied. Probes intentionally separated:
+          #   startup:    grants up to 60s for first-boot init
+          #               (which can run schema migrations).
+          #   readiness:  takes the pod out of the Service if
+          #               postgres stalls without restarting it.
+          #   liveness:   restarts only on hard hangs — not on
+          #               momentary connection saturation.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"]
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              # subPath keeps init metadata out of the PV root — the
+              # official image refuses to start when /var/lib/postgresql/data
+              # contains a `lost+found` (which `ext4` PVs include).
+              subPath: pgdata
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
