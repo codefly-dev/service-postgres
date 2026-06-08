@@ -332,16 +332,44 @@ func (n *nixPostgres) Stop(ctx context.Context) error {
 // dir — rather than the bare command on PATH — guarantees initdb and postgres
 // are the same version even when a different system postgres shadows PATH.
 func (n *nixPostgres) resolveBinDir() error {
-	matches, err := filepath.Glob("/nix/store/*-postgresql-16*/bin/initdb")
+	// Broad glob: match BOTH the plain `postgresql-16*` build AND the
+	// `withPackages` wrapper (`postgresql-and-plugins-16*`) that bundles
+	// pgvector. The old pattern `*-postgresql-16*` did NOT match the wrapper
+	// (its name is "postgresql-and-plugins-16…", which has no "postgresql-16"
+	// substring), so it always resolved to the PLAIN build — whose extension
+	// dir has no vector.control. Mind's KG migration does `CREATE EXTENSION
+	// vector`, which then aborts mid-migration (golang-migrate goes dirty) and
+	// kg_nodes is never created.
+	matches, err := filepath.Glob("/nix/store/*postgresql*16*/bin/initdb")
 	if err != nil {
 		return fmt.Errorf("glob nix postgres: %w", err)
 	}
+	var fallback string
 	for _, m := range matches {
-		// Skip the lib-only output (no postgres binary alongside).
-		if _, err := os.Stat(filepath.Join(filepath.Dir(m), "postgres")); err == nil {
-			n.binDir = filepath.Dir(m)
+		binDir := filepath.Dir(m)
+		// Must have the postgres server binary alongside initdb (skip
+		// lib/man/doc-only outputs).
+		if _, err := os.Stat(filepath.Join(binDir, "postgres")); err != nil {
+			continue
+		}
+		// PREFER a build whose extension dir ships pgvector — that is the
+		// withPackages wrapper the flake builds. <prefix>/bin/initdb →
+		// <prefix>/share/postgresql/extension/vector.control.
+		vectorControl := filepath.Join(filepath.Dir(binDir), "share", "postgresql", "extension", "vector.control")
+		if _, err := os.Stat(vectorControl); err == nil {
+			n.binDir = binDir
 			return nil
 		}
+		if fallback == "" {
+			fallback = binDir
+		}
+	}
+	if fallback != "" {
+		// No pgvector-enabled build found — use a plain one so non-vector
+		// schemas still work; CREATE EXTENSION vector will then fail loudly
+		// rather than us silently skipping a vector build that does exist.
+		n.binDir = fallback
+		return nil
 	}
 	return fmt.Errorf("no nix postgresql-16 with both initdb+postgres found in /nix/store (materialization may have failed)")
 }

@@ -68,8 +68,27 @@ func (s *Runtime) applyMigration(ctx context.Context) error {
 		}
 		if err := m.Up(); err == nil {
 			return nil
+		} else if errors.Is(err, migrate.ErrNoChange) {
+			return nil
 		} else {
-			if errors.Is(err, migrate.ErrNoChange) {
+			// Self-heal a dirty database left by an INTERRUPTED prior migration
+			// (process killed mid-apply — e.g. a consumer connected before
+			// migrations finished and then tore the stack down). golang-migrate
+			// runs each migration file atomically, so a dirty version V means V
+			// fully rolled back and the schema is clean at V-1. Force the version
+			// pointer back to V-1 (clearing the dirty flag) and re-run Up to
+			// re-apply V onward. Without this, a single interrupted run wedges
+			// the database forever ("Dirty database version N") and every later
+			// start fails until someone manually resets the data dir.
+			var dirty migrate.ErrDirty
+			if errors.As(err, &dirty) {
+				s.Wool.Warn("recovering dirty migration", wool.Field("dirty_version", dirty.Version))
+				if ferr := m.Force(dirty.Version - 1); ferr != nil {
+					return s.Wool.Wrapf(ferr, "cannot force dirty migration %d to clean state", dirty.Version)
+				}
+				if uerr := m.Up(); uerr != nil && !errors.Is(uerr, migrate.ErrNoChange) {
+					return s.Wool.Wrapf(uerr, "cannot re-apply migrations after dirty recovery")
+				}
 				return nil
 			}
 			return s.Wool.Wrapf(err, "can't apply migration")
