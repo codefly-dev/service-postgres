@@ -32,6 +32,12 @@ type Settings struct {
 
 	WithoutSSL  bool `yaml:"without-ssl"`  // Default to SSL
 	NoMigration bool `yaml:"no-migration"` // Developer only
+
+	// LogLevel quietens the postgres server when set. Accepts postgres
+	// levels (debug5..debug1, log, notice, warning, error, fatal, panic);
+	// empty = the image default (chatty). Consumed in runtime.go to pass
+	// `-c log_min_messages=<level>` to the server (Docker + nix paths).
+	LogLevel string `yaml:"log-level"`
 }
 
 const HotReload = "hot-reload"
