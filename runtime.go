@@ -162,6 +162,9 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 		}
 		s.nixRuntime = nixpg
 		s.Wool.Debug("nix postgres init successful")
+		if errNix = s.migrateOnInit(ctx); errNix != nil {
+			return s.Runtime.InitError(errNix)
+		}
 		return s.Runtime.InitResponse()
 	}
 
@@ -206,7 +209,31 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	}
 
 	s.Wool.Debug("init successful")
+	if err := s.migrateOnInit(ctx); err != nil {
+		return s.Runtime.InitError(err)
+	}
 	return s.Runtime.InitResponse()
+}
+
+// migrateOnInit applies schema migrations DURING Init — after the database is
+// up but BEFORE Init returns. This closes a readiness race: the codefly
+// --exclude-root readiness gate every WithDependencies consumer uses is a plain
+// TCP dial on the postgres port (cli/pkg/orchestration/flow.go networkMapping
+// TCPReachable), and that port opens in Init. When migrations ran only in Start
+// (after Init exposed the port), a fast consumer could be told "ready" and
+// connect mid-migration — reading an incomplete schema, or tearing the stack
+// down and leaving golang-migrate "dirty" at a random version. Running them in
+// Init makes "port reachable" imply "schema migrated". Start still calls
+// applyMigration; with the schema already current it is an idempotent no-op
+// (migrate.ErrNoChange).
+func (s *Runtime) migrateOnInit(ctx context.Context) error {
+	if s.Settings.NoMigration {
+		return nil
+	}
+	if err := s.WaitForReady(ctx); err != nil {
+		return err
+	}
+	return s.applyMigration(ctx)
 }
 
 func (s *Runtime) WaitForReady(ctx context.Context) error {

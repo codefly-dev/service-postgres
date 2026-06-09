@@ -56,6 +56,7 @@ func (s *Runtime) applyMigration(ctx context.Context) error {
 		}
 		driver, err := postgres.WithInstance(db, &postgres.Config{DatabaseName: s.Settings.DatabaseName})
 		if err != nil {
+			_ = db.Close() // don't leak a *sql.DB per retry
 			time.Sleep(time.Second)
 			continue
 		}
@@ -83,7 +84,15 @@ func (s *Runtime) applyMigration(ctx context.Context) error {
 			var dirty migrate.ErrDirty
 			if errors.As(err, &dirty) {
 				s.Wool.Warn("recovering dirty migration", wool.Field("dirty_version", dirty.Version))
-				if ferr := m.Force(dirty.Version - 1); ferr != nil {
+				if dirty.Version <= 1 {
+					// Dirty at the FIRST migration: there is no "version 0"
+					// migration to force back to (forcing 0 leaves migrate in an
+					// ambiguous pre-1 state). The clean state is "nothing applied"
+					// — Drop everything and re-apply from scratch.
+					if derr := m.Drop(); derr != nil {
+						return s.Wool.Wrapf(derr, "cannot drop to recover dirty migration %d", dirty.Version)
+					}
+				} else if ferr := m.Force(dirty.Version - 1); ferr != nil {
 					return s.Wool.Wrapf(ferr, "cannot force dirty migration %d to clean state", dirty.Version)
 				}
 				if uerr := m.Up(); uerr != nil && !errors.Is(uerr, migrate.ErrNoChange) {
