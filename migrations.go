@@ -48,15 +48,20 @@ func (s *Runtime) applyMigration(ctx context.Context) error {
 	}
 
 	s.Wool.Debug("migrations", wool.Field("connection", s.connection))
+	// One pool for the whole function — sql.Open is lazy and the *sql.DB is
+	// reused across retries, so a single defer cleans it up on EVERY return
+	// path (success, error, retries-exceeded). The old code opened a new
+	// *sql.DB inside the loop and only closed it on the WithInstance-error
+	// path, leaking a connection pool on every success/other-error return.
+	db, err := sql.Open("postgres", s.connection)
+	if err != nil {
+		return s.Wool.Wrapf(err, "cannot open database")
+	}
+	defer db.Close()
 	maxRetry := 3
-	for retry := 0; retry < maxRetry; retry++ {
-		db, err := sql.Open("postgres", s.connection)
-		if err != nil {
-			return s.Wool.Wrapf(err, "cannot open database")
-		}
+	for range maxRetry {
 		driver, err := postgres.WithInstance(db, &postgres.Config{DatabaseName: s.Settings.DatabaseName})
 		if err != nil {
-			_ = db.Close() // don't leak a *sql.DB per retry
 			time.Sleep(time.Second)
 			continue
 		}
@@ -123,6 +128,7 @@ func (s *Runtime) updateMigration(ctx context.Context, migrationFile string) err
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot open database")
 	}
+	defer db.Close() // was leaked on every code path
 	driver, err := postgres.WithInstance(db, &postgres.Config{DatabaseName: s.Settings.DatabaseName})
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot create driver")

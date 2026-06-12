@@ -242,14 +242,19 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 
 	s.Wool.Debug("waiting for ready", wool.Field("connection", s.connection))
 
+	// One pool, opened once and reused for every probe. sql.Open is lazy
+	// (it doesn't dial until Ping), so a single *sql.DB pinged in a loop is
+	// the idiomatic readiness check. The old code opened a NEW *sql.DB every
+	// iteration and never closed any of them — up to 30 leaked connection
+	// pools per Init, which alone can exhaust Postgres' default 100-conn limit.
+	db, err := sql.Open("postgres", s.connection)
+	if err != nil {
+		return s.Wool.Wrapf(err, "cannot open database")
+	}
+	defer db.Close()
 	maxRetry := 30
 	var lastErr error
-	for retry := 0; retry < maxRetry; retry++ {
-		db, err := sql.Open("postgres", s.connection)
-		if err != nil {
-			return s.Wool.Wrapf(err, "cannot open database")
-		}
-
+	for range maxRetry {
 		err = db.Ping()
 		if err == nil {
 			s.Wool.Debug("ping successful")
