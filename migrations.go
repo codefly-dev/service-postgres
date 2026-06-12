@@ -143,21 +143,22 @@ func (s *Runtime) updateMigration(ctx context.Context, migrationFile string) err
 		return s.Wool.Wrapf(err, "cannot create migration")
 	}
 
+	// Re-apply ONLY the changed migration (hot-reload during dev). Force sets
+	// the version to N (clearing any dirty flag), then we step exactly one
+	// migration down and back up.
+	//
+	// The previous code called m.Down() then m.Up(), which roll ALL migrations
+	// to version 0 and back — i.e. every save of a migration file dropped and
+	// recreated the entire schema, destroying all data in the database.
 	if err := m.Force(migrationNumber); err != nil {
-		return s.Wool.Wrapf(err, "cannot force migration")
+		return s.Wool.Wrapf(err, "cannot force migration to %d", migrationNumber)
 	}
-	// Now, re-apply migration by moving down.
-	if err := m.Down(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return s.Wool.Wrapf(err, "cannot apply migration")
+	if err := m.Steps(-1); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return s.Wool.Wrapf(err, "cannot roll back migration %d", migrationNumber)
 	}
-	// Now, re-apply migration by moving up.
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return s.Wool.Wrapf(err, "cannot apply migration")
+	if err := m.Steps(1); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return s.Wool.Wrapf(err, "cannot re-apply migration %d", migrationNumber)
 	}
-	// Optionally, check if there are any errors in the migration process
-	var errMigrate migrate.ErrDirty
-	if errors.As(err, &errMigrate) {
-		return s.Wool.Wrapf(err, "migration is dirty")
-	}
-	return s.Wool.Wrapf(err, "migration applied")
+	s.Wool.Info(fmt.Sprintf("re-applied migration %d", migrationNumber))
+	return nil
 }

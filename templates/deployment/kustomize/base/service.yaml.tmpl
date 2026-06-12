@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Service.Name.DNSCase }}
+  namespace: "{{ .Namespace }}"
+spec:
+  selector:
+    app: {{ .Service.Name.DNSCase }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+  # Headless — clients reach postgres via the StatefulSet pod's stable
+  # DNS (<svc>-0.<svc>.<ns>.svc). For prod-style RDS deployments,
+  # replace this entire kustomize layer with an ExternalName Service
+  # in the module-level overlay (see saas-starter aws overlay).
+  clusterIP: None

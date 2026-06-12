@@ -1,3 +1,15 @@
 resources:
   - namespace.yaml
+  # In-cluster postgres (local-mode). For prod where the database is
+  # managed externally (RDS, CloudNativePG operator, etc.), the
+  # module-level overlay strips the per-service Application entirely
+  # and adds an ExternalName Service instead — see saas-starter's
+  # aws overlay.
+  - stateful-set.yaml
+  - service.yaml
+  # Migration runner. Built locally as a one-shot Job that applies
+  # SQL files via golang-migrate. Fires after the StatefulSet is
+  # ready (Job-then-StatefulSet ordering would deadlock; we rely on
+  # the Job's connect-retry behavior to wait the few seconds postgres
+  # needs to accept connections).
   - job.yaml

@@ -134,7 +134,10 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 
 	if !s.WithMigration() {
 		s.Wool.Debug("build: no migration")
-		return nil, nil
+		// Return a real (empty) success response, not (nil, nil): a nil gRPC
+		// response message fails to marshal on the wire and surfaces as an
+		// opaque RPC error to the caller.
+		return s.Builder.BuildResponse()
 	}
 
 	s.Wool.Debug("building migration docker image")
