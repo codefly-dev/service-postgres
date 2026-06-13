@@ -97,7 +97,7 @@ func (s *Builder) Sync(ctx context.Context, req *builderv0.SyncRequest) (*builde
 func (s *Builder) Audit(ctx context.Context, req *builderv0.AuditRequest) (*builderv0.AuditResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	res, err := audit.Docker(ctx, image.FullName())
+	res, err := audit.Docker(ctx, s.dockerImage().FullName())
 	if err != nil {
 		return s.Builder.AuditError(err)
 	}

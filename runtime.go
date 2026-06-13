@@ -169,7 +169,7 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	}
 
 	// Docker
-	runner, err := runners.NewDockerHeadlessEnvironment(ctx, image, s.UniqueWithWorkspace())
+	runner, err := runners.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
@@ -227,13 +227,71 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 // applyMigration; with the schema already current it is an idempotent no-op
 // (migrate.ErrNoChange).
 func (s *Runtime) migrateOnInit(ctx context.Context) error {
-	if s.Settings.NoMigration {
-		return nil
-	}
 	if err := s.WaitForReady(ctx); err != nil {
 		return err
 	}
+	// Extensions are not migrations — ensure them even when NoMigration is set,
+	// so "port reachable" also implies "configured extensions available".
+	if err := s.ensureExtensions(ctx); err != nil {
+		return err
+	}
+	if s.Settings.NoMigration {
+		return nil
+	}
 	return s.applyMigration(ctx)
+}
+
+// ensureExtensions CREATE EXTENSION IF NOT EXISTS for the always-on defaults
+// plus anything in Settings.Extensions, BEFORE migrations run (so schema files
+// can rely on them). Best-effort per extension: a name whose shared library is
+// absent from the image (e.g. postgis on the pgvector image) is logged and
+// skipped, never fatal — point Settings.DockerImage at an image that ships it.
+func (s *Runtime) ensureExtensions(ctx context.Context) error {
+	exts := append([]string{}, defaultExtensions...)
+	exts = append(exts, s.Settings.Extensions...)
+
+	db, err := sql.Open("postgres", s.connection)
+	if err != nil {
+		return s.Wool.Wrapf(err, "cannot open database to create extensions")
+	}
+	defer db.Close()
+
+	seen := make(map[string]bool, len(exts))
+	for _, ext := range exts {
+		ext = strings.TrimSpace(ext)
+		if ext == "" || seen[ext] {
+			continue
+		}
+		seen[ext] = true
+		if !validExtName(ext) {
+			s.Wool.Warn("skipping extension with unsafe name", wool.Field("extension", ext))
+			continue
+		}
+		// Extension names cannot be parameterized; validExtName above restricts
+		// them to [A-Za-z0-9_-] so the quoted identifier is injection-safe.
+		if _, err := db.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS "`+ext+`"`); err != nil {
+			s.Wool.Warn("could not create extension (is its library in the image?)",
+				wool.Field("extension", ext), wool.ErrField(err))
+			continue
+		}
+		s.Wool.Debug("extension ready", wool.Field("extension", ext))
+	}
+	return nil
+}
+
+// validExtName reports whether name is a safe postgres extension identifier.
+func validExtName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		ok := r == '_' || r == '-' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Runtime) WaitForReady(ctx context.Context) error {
@@ -294,6 +352,10 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 		return s.Runtime.StartError(err)
 	}
 
+	if err := s.ensureExtensions(ctx); err != nil {
+		return s.Runtime.StartError(err)
+	}
+
 	if !s.Settings.NoMigration {
 		s.Wool.Debug("applying migrations")
 		err = s.applyMigration(ctx)
@@ -340,7 +402,7 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	}
 
 	// Get the runner environment
-	runner, err := runners.NewDockerHeadlessEnvironment(ctx, image, s.UniqueWithWorkspace())
+	runner, err := runners.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
 	if err != nil {
 		return s.Runtime.DestroyError(err)
 	}
