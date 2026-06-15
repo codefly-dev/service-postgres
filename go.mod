@@ -2,6 +2,8 @@ module github.com/codefly-dev/service-postgres
 
 go 1.25.0
 
+toolchain go1.26.4
+
 require (
 	github.com/codefly-dev/core v0.1.164
 	github.com/golang-migrate/migrate/v4 v4.19.1
@@ -94,3 +96,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260420184626-e10c466a9529 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
+
+replace github.com/codefly-dev/core => /Users/antoine/Development/deus/codefly.dev/core
