@@ -153,7 +153,7 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	if rc := req.GetRuntimeContext(); rc != nil && rc.Kind == resources.RuntimeContextNix {
 		w.Debug("using nix runtime for postgres", wool.Field("port", instance.Port))
 		nixpg, errNix := newNixPostgres(ctx, s.Location, uint16(instance.Port),
-			s.postgresUser, s.postgresPassword, s.DatabaseName, s.LogLevel, s.Wool)
+			s.postgresUser, s.postgresPassword, s.DatabaseName, s.LogLevel, newPGLogWriter(s.Wool))
 		if errNix != nil {
 			return s.Runtime.InitError(errNix)
 		}
@@ -174,7 +174,7 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 		return s.Runtime.InitError(err)
 	}
 
-	runner.WithOutput(s.Wool)
+	runner.WithOutput(newPGLogWriter(s.Wool))
 	runner.WithPortMapping(ctx, uint16(instance.Port), s.postgresPort)
 
 	runner.WithEnvironmentVariables(
