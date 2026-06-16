@@ -4,3 +4,6 @@ go.work*
 dist
 
 dist/
+
+# Compiled agent binary — never track binaries.
+/service-postgres
