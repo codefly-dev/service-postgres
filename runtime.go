@@ -15,7 +15,7 @@ import (
 
 	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
 	"github.com/codefly-dev/core/resources"
-	runners "github.com/codefly-dev/core/runners/base"
+	dockerrun "github.com/codefly-dev/core/runners/dockerrun"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	_ "github.com/lib/pq"
 )
@@ -25,7 +25,7 @@ type Runtime struct {
 	*Service
 
 	// internal
-	runnerEnvironment *runners.DockerEnvironment
+	runnerEnvironment *dockerrun.DockerEnvironment
 
 	// nixRuntime is set instead of runnerEnvironment when the caller requests
 	// RuntimeContextNix — postgres then runs natively from a nix-provisioned
@@ -169,7 +169,7 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	}
 
 	// Docker
-	runner, err := runners.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
+	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
@@ -402,7 +402,7 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	}
 
 	// Get the runner environment
-	runner, err := runners.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
+	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
 	if err != nil {
 		return s.Runtime.DestroyError(err)
 	}
