@@ -5,7 +5,8 @@ go 1.25.0
 toolchain go1.26.4
 
 require (
-	github.com/codefly-dev/core v0.1.164
+	github.com/codefly-dev/core v0.2.2
+	github.com/codefly-dev/gortk v0.0.0-20260619134945-d5474be5f046
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/lib/pq v1.12.3
 	github.com/stretchr/testify v1.11.1
@@ -23,7 +24,6 @@ require (
 	github.com/VividCortex/ewma v1.2.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
-	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cheggaaa/pb/v3 v3.1.7 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect

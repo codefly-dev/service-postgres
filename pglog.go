@@ -10,20 +10,44 @@ package main
 // stream into lines, parses the stock log_line_prefix, drops the redundant
 // timestamp (Wool stamps its own), keeps the PID as a compact field, and emits
 // each line at the Wool level its postgres severity maps to.
+//
+// The parsing rules (prefix regex, severity map, routine-noise demotion) are a
+// declarative gortk LogSpec rather than hand-written Go — the same engine other
+// service agents can reuse for their own log streams. pgLogWriter keeps only
+// the streaming shell (buffer, split) and the level→Wool routing.
 
 import (
 	"bytes"
 	"io"
-	"regexp"
 	"strings"
 
 	"github.com/codefly-dev/core/wool"
+	"github.com/codefly-dev/gortk"
 )
 
-// pgLogLine matches a line produced by postgres' stock log_line_prefix ("%m
-// [%p] "): an ISO timestamp with timezone, the PID in brackets, then
-// "SEVERITY:  message". Capture groups: 1=PID, 2=severity, 3=message.
-var pgLogLine = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \S+ \[(\d+)\] (\w+):\s*(.*)$`)
+// pgLog parses postgres' stock log_line_prefix ("%m [%p] "): an ISO timestamp
+// with timezone, the PID, then "SEVERITY:  message". Named captures pid/level/
+// msg become Record fields; postgres severities map to canonical levels;
+// checkpoint/restartpoint bookkeeping is demoted to debug so it filters out
+// unless someone is explicitly looking at debug output.
+var pgLog = mustCompileLog(gortk.LogSpec{
+	LineRegex: `^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \S+ \[(?P<pid>\d+)\] (?P<level>\w+):\s*(?P<msg>.*)$`,
+	LevelMap: map[string]string{
+		"PANIC": "fatal", "FATAL": "fatal", "ERROR": "error", "WARNING": "warn",
+		"LOG": "info", "INFO": "info", "NOTICE": "info",
+		"DEBUG1": "debug", "DEBUG2": "debug", "DEBUG3": "debug", "DEBUG4": "debug", "DEBUG5": "debug",
+	},
+	DefaultLevel:   "info",
+	DemotePatterns: []string{`^checkpoint `, `^restartpoint `},
+})
+
+func mustCompileLog(s gortk.LogSpec) *gortk.LogParser {
+	p, err := s.Compile()
+	if err != nil {
+		panic("postgres pglog: " + err.Error())
+	}
+	return p
+}
 
 // pgLogWriter parses the postgres log stream and re-emits each line through
 // Wool at a severity-mapped level. It implements io.Writer so it can be handed
@@ -57,27 +81,38 @@ func (p *pgLogWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// emit parses one postgres log line and forwards it at the mapped Wool level.
-// Lines that don't match the postgres prefix (e.g. initdb progress) pass
-// through at INFO so nothing is silently dropped.
+// emit parses one postgres log line via the gortk LogParser and forwards it at
+// the mapped Wool level, keeping the PID as a compact field. Lines that don't
+// match the postgres prefix (e.g. initdb progress) come back at the default
+// level so nothing is silently dropped.
 func (p *pgLogWriter) emit(line string) {
 	if strings.TrimSpace(line) == "" {
 		return
 	}
-	m := pgLogLine.FindStringSubmatch(line)
-	if m == nil {
-		p.w.Info(line)
-		return
+	rec := pgLog.Parse(line)
+	msg, _ := rec.Fields["msg"].(string)
+
+	var fields []*wool.LogField
+	if pid, ok := rec.Fields["pid"].(string); ok && pid != "" {
+		fields = append(fields, wool.Field("pid", pid))
 	}
-	pid, severity, msg := m[1], m[2], m[3]
-	level := pgSeverityToLevel(severity)
-	// Checkpoint/restartpoint summaries are high-frequency, low-value LOG
-	// chatter — drop them below the default INFO threshold so they're filtered
-	// unless someone is explicitly looking at debug output.
-	if level == wool.INFO && isPGRoutineNoise(msg) {
-		level = wool.DEBUG
+	p.logAt(woolLevel(rec.Level), msg, fields...)
+}
+
+// woolLevel maps a gortk canonical level onto a Wool log level.
+func woolLevel(level string) wool.Loglevel {
+	switch level {
+	case "fatal":
+		return wool.FATAL
+	case "error":
+		return wool.ERROR
+	case "warn":
+		return wool.WARN
+	case "debug":
+		return wool.DEBUG
+	default:
+		return wool.INFO
 	}
-	p.logAt(level, msg, wool.Field("pid", pid))
 }
 
 func (p *pgLogWriter) logAt(level wool.Loglevel, msg string, fields ...*wool.LogField) {
@@ -93,31 +128,4 @@ func (p *pgLogWriter) logAt(level wool.Loglevel, msg string, fields ...*wool.Log
 	default:
 		p.w.Info(msg, fields...)
 	}
-}
-
-// pgSeverityToLevel maps a postgres message severity onto a Wool log level.
-// PANIC/FATAL/ERROR/WARNING map to their direct equivalents; LOG/INFO/NOTICE
-// are routine operational output and map to INFO; DEBUG1..DEBUG5 map to DEBUG.
-// An unrecognized severity defaults to INFO rather than being hidden.
-func pgSeverityToLevel(severity string) wool.Loglevel {
-	switch severity {
-	case "PANIC", "FATAL":
-		return wool.FATAL
-	case "ERROR":
-		return wool.ERROR
-	case "WARNING":
-		return wool.WARN
-	case "LOG", "INFO", "NOTICE":
-		return wool.INFO
-	}
-	if strings.HasPrefix(severity, "DEBUG") {
-		return wool.DEBUG
-	}
-	return wool.INFO
-}
-
-// isPGRoutineNoise reports whether a LOG message is high-frequency background
-// bookkeeping (checkpoints, restartpoints) worth de-emphasizing.
-func isPGRoutineNoise(msg string) bool {
-	return strings.HasPrefix(msg, "checkpoint ") || strings.HasPrefix(msg, "restartpoint ")
 }
