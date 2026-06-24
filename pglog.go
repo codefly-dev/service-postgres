@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	"github.com/codefly-dev/core/wool"
-	"github.com/codefly-dev/gortk"
+	"github.com/mind-build/gortk"
 )
 
 // pgLog parses postgres' stock log_line_prefix ("%m [%p] "): an ISO timestamp
