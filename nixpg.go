@@ -5,12 +5,12 @@ package main
 // The postgres service agent runs the database in a container by default
 // (NewDockerHeadlessEnvironment). On hosts without Docker, the same agent can
 // run postgres NATIVELY using a nix-provisioned binary: the codefly
-// NixEnvironment materializes `postgresql_16` from the embedded flake (so no
+// NixEnvironment materializes `postgresql_17` from the embedded flake (so no
 // system install is required), and this file drives the native postgres
 // lifecycle the Docker image's entrypoint would otherwise handle — initdb on
 // first boot, launch `postgres`, and create the configured database.
 //
-// Both runtimes serve the same postgres 16 + the same connection string, so the
+// Both runtimes serve the same postgres 17 + the same connection string, so the
 // rest of the agent (migrations, readiness, configuration) is unchanged.
 
 import (
@@ -326,21 +326,21 @@ func (n *nixPostgres) Stop(ctx context.Context) error {
 	return n.proc.Stop(ctx)
 }
 
-// resolveBinDir locates the nix store bin dir that holds postgres 16's initdb,
+// resolveBinDir locates the nix store bin dir that holds postgres 17's initdb,
 // so every invocation uses that exact build. env.Init has already materialized
 // (downloaded) the package, so it is present in the store. Using the absolute
 // dir — rather than the bare command on PATH — guarantees initdb and postgres
 // are the same version even when a different system postgres shadows PATH.
 func (n *nixPostgres) resolveBinDir() error {
-	// Broad glob: match BOTH the plain `postgresql-16*` build AND the
-	// `withPackages` wrapper (`postgresql-and-plugins-16*`) that bundles
-	// pgvector. The old pattern `*-postgresql-16*` did NOT match the wrapper
-	// (its name is "postgresql-and-plugins-16…", which has no "postgresql-16"
+	// Broad glob: match BOTH the plain `postgresql-17*` build AND the
+	// `withPackages` wrapper (`postgresql-and-plugins-17*`) that bundles
+	// pgvector. The old pattern `*-postgresql-17*` did NOT match the wrapper
+	// (its name is "postgresql-and-plugins-17…", which has no "postgresql-17"
 	// substring), so it always resolved to the PLAIN build — whose extension
 	// dir has no vector.control. Mind's KG migration does `CREATE EXTENSION
 	// vector`, which then aborts mid-migration (golang-migrate goes dirty) and
 	// kg_nodes is never created.
-	matches, err := filepath.Glob("/nix/store/*postgresql*16*/bin/initdb")
+	matches, err := filepath.Glob("/nix/store/*postgresql*17*/bin/initdb")
 	if err != nil {
 		return fmt.Errorf("glob nix postgres: %w", err)
 	}
@@ -371,7 +371,7 @@ func (n *nixPostgres) resolveBinDir() error {
 		n.binDir = fallback
 		return nil
 	}
-	return fmt.Errorf("no nix postgresql-16 with both initdb+postgres found in /nix/store (materialization may have failed)")
+	return fmt.Errorf("no nix postgresql-17 with both initdb+postgres found in /nix/store (materialization may have failed)")
 }
 
 // pgQuoteIdent double-quotes a postgres identifier, escaping embedded quotes.

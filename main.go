@@ -53,6 +53,33 @@ type Settings struct {
 	// contrib set + vector. A missing extension is logged and skipped, never
 	// fatal. e.g. ["postgis", "hstore", "unaccent"].
 	Extensions []string `yaml:"extensions"`
+
+	// MigrationSources lets SEVERAL services share this ONE database while each
+	// owns its own migrations/ folder. Each source is applied with its own
+	// golang-migrate tracking table (schema_migrations_<name>), so the per-source
+	// integer version sequences never collide. This service's own ./migrations
+	// dir is always applied first with the default table (schema_migrations).
+	//
+	//   migration-sources:
+	//     - name: api          # applies ../api/migrations (default path)
+	//     - name: billing
+	//       path: ../billing/db/migrations
+	//
+	// Paths are relative to this service's directory (or absolute). A source
+	// whose directory is missing is skipped with a warning.
+	MigrationSources []MigrationSource `yaml:"migration-sources"`
+}
+
+// MigrationSource declares one additional service contributing migrations to
+// the shared database. See Settings.MigrationSources.
+type MigrationSource struct {
+	// Name identifies the lineage and names its tracking table
+	// (schema_migrations_<name>). Must be a safe SQL identifier ([A-Za-z0-9_]).
+	Name string `yaml:"name"`
+	// Path is the migrations directory, relative to this service's directory or
+	// absolute. Empty defaults to ../<name>/migrations (the sibling-service
+	// layout used inside a module).
+	Path string `yaml:"path"`
 }
 
 const HotReload = "hot-reload"
