@@ -64,9 +64,9 @@ func TestPGLogWriter_ParsesSeverityAndStripsPrefix(t *testing.T) {
 		},
 		{
 			name:      "FATAL maps to FATAL",
-			line:      `2026-06-16 14:56:37.339 UTC [35804] FATAL:  the database system is starting up`,
+			line:      `2026-06-16 14:56:37.339 UTC [35804] FATAL:  password authentication failed for user "app"`,
 			wantLevel: wool.FATAL,
-			wantMsg:   "the database system is starting up",
+			wantMsg:   `password authentication failed for user "app"`,
 			wantPID:   "35804",
 		},
 		{
@@ -123,6 +123,30 @@ func TestPGLogWriter_CheckpointDeEmphasized(t *testing.T) {
 	// routine checkpoint noise.
 	if cap.logs[0].Level != wool.DEBUG {
 		t.Errorf("checkpoint level: got %v want DEBUG", cap.logs[0].Level)
+	}
+}
+
+func TestPGLogWriter_RecoveryRejectionDemoted(t *testing.T) {
+	// While the server recovers, our WaitForReady probe reconnects every few
+	// seconds; postgres rejects each attempt with a FATAL "starting up" line.
+	// These are transient/expected, so they demote to DEBUG rather than
+	// flooding the output at FATAL once per probe.
+	lines := []string{
+		`2026-07-06 15:50:22.100 UTC [35804] FATAL:  the database system is starting up`,
+		`2026-07-06 15:50:25.100 UTC [35810] FATAL:  the database system is shutting down`,
+	}
+	for _, line := range lines {
+		w, cap := newCaptureWool()
+		pw := newPGLogWriter(w)
+		if _, err := pw.Write([]byte(line + "\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if len(cap.logs) != 1 {
+			t.Fatalf("expected 1 log, got %d", len(cap.logs))
+		}
+		if cap.logs[0].Level != wool.DEBUG {
+			t.Errorf("recovery-rejection level for %q: got %v want DEBUG", line, cap.logs[0].Level)
+		}
 	}
 }
 

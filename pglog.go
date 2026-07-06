@@ -30,6 +30,15 @@ import (
 // msg become Record fields; postgres severities map to canonical levels;
 // checkpoint/restartpoint bookkeeping is demoted to debug so it filters out
 // unless someone is explicitly looking at debug output.
+//
+// "the database system is starting up" / "...shutting down" are demoted too.
+// Postgres logs those at FATAL, but they are the transient rejection message
+// sent to a client that connects while the server is still in recovery (or
+// draining). Our own WaitForReady probe (runtime.go) pings once every few
+// seconds until the DB accepts connections, so during crash recovery postgres
+// emits one such FATAL line PER probe — a stream of identical, alarming-looking
+// lines that are entirely expected. Demoting them to debug keeps the real
+// FATALs (bad config, corrupt WAL, OOM) visible without the probe-rejection noise.
 var pgLog = mustCompileLog(gortk.LogSpec{
 	LineRegex: `^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \S+ \[(?P<pid>\d+)\] (?P<level>\w+):\s*(?P<msg>.*)$`,
 	LevelMap: map[string]string{
@@ -37,8 +46,11 @@ var pgLog = mustCompileLog(gortk.LogSpec{
 		"LOG": "info", "INFO": "info", "NOTICE": "info",
 		"DEBUG1": "debug", "DEBUG2": "debug", "DEBUG3": "debug", "DEBUG4": "debug", "DEBUG5": "debug",
 	},
-	DefaultLevel:   "info",
-	DemotePatterns: []string{`^checkpoint `, `^restartpoint `},
+	DefaultLevel: "info",
+	DemotePatterns: []string{
+		`^checkpoint `, `^restartpoint `,
+		`^the database system is (starting up|shutting down|not yet accepting connections)`,
+	},
 })
 
 func mustCompileLog(s gortk.LogSpec) *gortk.LogParser {
