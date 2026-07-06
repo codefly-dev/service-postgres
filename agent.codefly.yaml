@@ -1,4 +1,4 @@
 publisher: codefly.dev
 kind: codefly:service
 name: postgres
-version: 0.0.96
+version: 0.0.97
