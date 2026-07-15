@@ -1,0 +1,13 @@
+resources:
+  - namespace.yaml
+  # In-cluster postgres (local-mode). For prod where the database is
+  # managed externally (RDS, CloudNativePG operator, etc.), the
+  # module-level overlay strips the per-service Application entirely
+  # and adds an ExternalName Service instead.
+  - stateful-set.yaml
+  - service.yaml
+{{- if .Deployment.Parameters.WithMigration }}
+  # Migration runner. The workload still deploys when migrations are disabled;
+  # only this one-shot Job is conditional.
+  - job.yaml
+{{- end }}

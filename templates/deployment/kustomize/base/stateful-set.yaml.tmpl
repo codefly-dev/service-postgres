@@ -31,12 +31,13 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: postgres
-          # Pinned in lockstep with main.go's runtime image. Bump both
-          # together. pgvector/pgvector:pg16 is the official Postgres 16 image
-          # with pgvector preinstalled (same entrypoint env: POSTGRES_USER /
+          # Supplied by main.go's managed-image declaration (or the service
+          # override), including its digest when one is configured.
+          # pgvector/pgvector is the official Postgres image with pgvector
+          # preinstalled (same entrypoint env: POSTGRES_USER /
           # POSTGRES_PASSWORD / POSTGRES_DB at first-boot); after that the data
           # dir is authoritative.
-          image: pgvector/pgvector:pg16
+          image: {{ .Deployment.Parameters.ManagedImage }}
           imagePullPolicy: IfNotPresent
           # Container-level security. Defense-in-depth on top of the
           # pod-level securityContext above. allowPrivilegeEscalation

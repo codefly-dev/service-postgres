@@ -93,7 +93,16 @@ const DatabaseName = "database-name"
 // like Mind's knowledge-graph migration (vector(1024) column) depend on it. The
 // nix runtime gets pgvector via nix/flake.nix; this keeps both runtimes at
 // parity. Override per-service via Settings.DockerImage (e.g. for PostGIS).
-var image = &resources.DockerImage{Name: "pgvector/pgvector", Tag: "pg17"}
+var image = &resources.DockerImage{
+	Name:   "pgvector/pgvector",
+	Tag:    "pg17",
+	Digest: "sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0",
+}
+
+type DeploymentTemplateParameters struct {
+	WithMigration bool
+	ManagedImage  string
+}
 
 // defaultExtensions are CREATE EXTENSION'd on every start (best-effort). They
 // all ship in the pgvector / postgres-contrib image, so they "just work" with
