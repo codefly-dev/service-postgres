@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +32,8 @@ import (
 	"time"
 
 	runners "github.com/codefly-dev/core/runners/base"
+	"github.com/codefly-dev/core/shared"
+	"github.com/lib/pq"
 )
 
 //go:embed nix/flake.nix
@@ -77,6 +81,9 @@ type nixPostgres struct {
 // of the same service reuses the same cluster (data persists like a Docker
 // volume) without ever touching the source tree.
 func newNixPostgres(ctx context.Context, baseDir string, port uint16, user, password, dbName, logLevel string, out io.Writer) (*nixPostgres, error) {
+	if strings.TrimSpace(password) == "" {
+		return nil, fmt.Errorf("postgres password is required for the native runtime")
+	}
 	runtimeRoot, err := nixRuntimeRoot(baseDir)
 	if err != nil {
 		return nil, err
@@ -98,13 +105,14 @@ func newNixPostgres(ctx context.Context, baseDir string, port uint16, user, pass
 	env.WithCacheDir(filepath.Join(runtimeRoot, ".nix-cache"))
 
 	// The unix socket path has a ~104-char limit, so it cannot live under a deep
-	// cache path. Give it a short, dedicated dir under /tmp keyed by the same
-	// service hash so concurrent services never collide. The agent connects over
-	// TCP (127.0.0.1), so the socket is only a postgres-internal detail — but it
-	// must still be a real, writable, out-of-tree directory.
-	socketDir := filepath.Join("/tmp", "cfpg-"+serviceHash(baseDir)[:8])
-	if err := os.MkdirAll(socketDir, 0o755); err != nil {
+	// cache path. Use an unpredictable, owner-only temporary directory: a stable
+	// /tmp name can be pre-created or symlinked by another local user.
+	socketDir, err := os.MkdirTemp("", "cfpg-"+serviceHash(baseDir)[:8]+"-")
+	if err != nil {
 		return nil, fmt.Errorf("create postgres socket dir: %w", err)
+	}
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		return nil, fmt.Errorf("secure postgres socket dir: %w", err)
 	}
 
 	return &nixPostgres{
@@ -161,6 +169,9 @@ func (n *nixPostgres) Init(ctx context.Context) error {
 	if err := n.waitReady(ctx); err != nil {
 		return err
 	}
+	if err := n.ensureAuthentication(ctx); err != nil {
+		return err
+	}
 	return n.ensureDatabase(ctx)
 }
 
@@ -202,8 +213,9 @@ func processAlive(pid int) bool {
 }
 
 // initdbIfNeeded creates the cluster the first time (PG_VERSION marks an
-// initialized data dir). Uses trust auth — this is a local dev runtime; the
-// connection password is still accepted (and ignored), matching the Docker path.
+// initialized data dir). Both local and TCP connections require SCRAM; the
+// bootstrap password is passed through an owner-only temporary file, never
+// argv or the environment.
 func (n *nixPostgres) initdbIfNeeded(ctx context.Context) error {
 	if _, err := os.Stat(filepath.Join(n.dataDir, "PG_VERSION")); err == nil {
 		return nil // already initialized
@@ -211,13 +223,12 @@ func (n *nixPostgres) initdbIfNeeded(ctx context.Context) error {
 	if err := os.MkdirAll(n.dataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
-	proc, err := n.env.NewProcess(filepath.Join(n.binDir, "initdb"),
-		"-D", n.dataDir,
-		"-U", n.user,
-		"--auth=trust",
-		"--no-locale",
-		"-E", "UTF8",
-	)
+	passwordFile, err := n.writeInitPasswordFile()
+	if err != nil {
+		return err
+	}
+	defer os.Remove(passwordFile)
+	proc, err := n.env.NewProcess(filepath.Join(n.binDir, "initdb"), n.initdbArgs(passwordFile)...)
 	if err != nil {
 		return err
 	}
@@ -228,6 +239,41 @@ func (n *nixPostgres) initdbIfNeeded(ctx context.Context) error {
 		return fmt.Errorf("initdb: %w", err)
 	}
 	return nil
+}
+
+func (n *nixPostgres) initdbArgs(passwordFile string) []string {
+	return []string{
+		"-D", n.dataDir,
+		"-U", n.user,
+		"--auth-local=scram-sha-256",
+		"--auth-host=scram-sha-256",
+		"--pwfile=" + passwordFile,
+		"--no-locale",
+		"-E", "UTF8",
+	}
+}
+
+func (n *nixPostgres) writeInitPasswordFile() (string, error) {
+	file, err := os.CreateTemp(filepath.Dir(n.dataDir), ".initdb-password-*")
+	if err != nil {
+		return "", fmt.Errorf("create initdb password file: %w", err)
+	}
+	path := file.Name()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("secure initdb password file: %w", err)
+	}
+	if _, err := io.WriteString(file, n.password+"\n"); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write initdb password file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close initdb password file: %w", err)
+	}
+	return path, nil
 }
 
 // startServer launches postgres listening on 127.0.0.1:port. Quietened to the
@@ -266,8 +312,43 @@ func (n *nixPostgres) startServer(ctx context.Context) error {
 }
 
 func (n *nixPostgres) adminDSN() string {
-	return fmt.Sprintf("postgresql://%s:%s@127.0.0.1:%d/postgres?sslmode=disable",
-		n.user, n.password, n.port)
+	u := &url.URL{
+		Scheme: "postgresql",
+		User:   url.UserPassword(n.user, n.password),
+		Host:   net.JoinHostPort("127.0.0.1", strconv.Itoa(int(n.port))),
+		Path:   "/postgres",
+	}
+	query := u.Query()
+	query.Set("sslmode", "disable")
+	u.RawQuery = query.Encode()
+	return u.String()
+}
+
+// ensureAuthentication upgrades legacy trust-initialized clusters in place
+// and pins pg_hba.conf to password authentication. Updating the role before
+// reloading the HBA keeps existing developer data while closing the old
+// unauthenticated local/TCP access.
+func (n *nixPostgres) ensureAuthentication(ctx context.Context) error {
+	db, err := sql.Open("postgres", n.adminDSN())
+	if err != nil {
+		return fmt.Errorf("open postgres for auth hardening: %w", err)
+	}
+	defer db.Close()
+	statement := fmt.Sprintf("ALTER ROLE %s WITH PASSWORD %s", pq.QuoteIdentifier(n.user), pq.QuoteLiteral(n.password))
+	if _, err := db.ExecContext(ctx, statement); err != nil {
+		return fmt.Errorf("set postgres role password: %w", err)
+	}
+	hba := []byte("local all all scram-sha-256\n" +
+		"host all all 127.0.0.1/32 scram-sha-256\n" +
+		"host all all ::1/128 scram-sha-256\n")
+	hbaPath := filepath.Join(n.dataDir, "pg_hba.conf")
+	if err := shared.WriteFileAtomic(ctx, hbaPath, hba, 0o600); err != nil {
+		return fmt.Errorf("write secure pg_hba.conf: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "SELECT pg_reload_conf()"); err != nil {
+		return fmt.Errorf("reload secure pg_hba.conf: %w", err)
+	}
+	return nil
 }
 
 // waitReady polls until the server accepts connections.
@@ -320,10 +401,12 @@ func (n *nixPostgres) Stop(ctx context.Context) error {
 	if n.serverCancel != nil {
 		n.serverCancel()
 	}
-	if n.proc == nil {
-		return nil
+	var stopErr error
+	if n.proc != nil {
+		stopErr = n.proc.Stop(ctx)
 	}
-	return n.proc.Stop(ctx)
+	removeErr := os.RemoveAll(n.socketDir)
+	return errors.Join(stopErr, removeErr)
 }
 
 // resolveBinDir locates the nix store bin dir that holds postgres 17's initdb,
