@@ -1,10 +1,12 @@
-# Welcome to the external postgres
+# Codefly Postgres
 
-This service helps with external postgres databases:
+This service provisions Postgres as two explicit runtime capabilities:
 
-- creation of connection string as configuration to dependent services
+- `postgres.read-only-connection`: a non-owner `NOBYPASSRLS` role with query-only grants and a read-only transaction default.
+- `postgres.read-write-connection`: a non-owner `NOBYPASSRLS` role with query and DML grants, but no schema creation, database creation, role management, or owner membership.
 
-- creation of migration jobs
+The migration owner is private to the Postgres service and its bootstrap job. It is never exported to dependent services. Owner, reader, and writer passwords are separate required secrets.
 
+The bootstrap job applies migrations and reconciles runtime roles and grants on every deployment. Local Docker and Nix runtimes enforce the same contract.
 
-This services also provides a local postgres database for development and testing purposes.
+For tenant isolation, application migrations must enable row-level security and define policies against transaction-local tenant/user settings. Go services should use `github.com/codefly-dev/sdk-go/postgres`, which resolves an authenticated principal from context and issues separate read-only/read-write stores without exposing raw pools.

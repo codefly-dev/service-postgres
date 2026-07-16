@@ -3,20 +3,20 @@ package main
 import (
 	"context"
 	"embed"
-	"fmt"
-	"github.com/codefly-dev/core/builders"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	"github.com/codefly-dev/core/templates"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"net/url"
 	"strings"
 
 	"github.com/codefly-dev/core/agents"
 	"github.com/codefly-dev/core/agents/services"
+	"github.com/codefly-dev/core/builders"
+	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
 	"github.com/codefly-dev/core/resources"
 	runnersbase "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/shared"
+	"github.com/codefly-dev/core/templates"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Agent version
@@ -54,6 +54,18 @@ type Settings struct {
 	// contrib set + vector. A missing extension is logged and skipped, never
 	// fatal. e.g. ["postgis", "hstore", "unaccent"].
 	Extensions []string `yaml:"extensions"`
+
+	// RuntimeSchemas is the explicit allow-list of schemas exposed through the
+	// non-owner runtime roles. Empty means ["public"]. Runtime roles never own
+	// objects and never receive CREATE on these schemas.
+	RuntimeSchemas []string `yaml:"runtime-schemas"`
+
+	// RuntimeReadWriteRoles is the explicit allow-list of application-defined
+	// NOLOGIN roles that the managed read-write principal may assume with
+	// SET ROLE. The roles must be created by migrations. This lets an
+	// application keep request, worker, and RLS capabilities in its own schema
+	// contract without exporting the database-owner credential.
+	RuntimeReadWriteRoles []string `yaml:"runtime-read-write-roles"`
 
 	// MigrationSources lets SEVERAL services share this ONE database while each
 	// owns its own migrations/ folder. Each source is applied with its own
@@ -100,7 +112,7 @@ var image = &resources.DockerImage{
 }
 
 type DeploymentTemplateParameters struct {
-	WithMigration bool
+	WithBootstrap bool
 	ManagedImage  string
 }
 
@@ -131,10 +143,12 @@ type Service struct {
 	// Settings
 	*Settings
 
-	postgresUser     string
-	postgresPassword string
-	connectionKey    string
-	connection       string
+	postgresUser      string
+	postgresPassword  string
+	readOnlyPassword  string
+	readWritePassword string
+	connectionKey     string
+	connection        string
 
 	TcpEndpoint *basev0.Endpoint
 }
@@ -154,10 +168,16 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 		ReadMe: readme,
 		Config: []*agentv0.ConfigurationValueDetail{
 			{
-				Name: "postgres", Description: "postgres credentials",
+				Name: "postgres", Description: "capability-scoped Postgres workload bindings",
 				Fields: []*agentv0.ConfigurationValueInformation{
 					{
-						Name: "connection", Description: "connection string",
+						Name: ownerConnectionKey, Description: "local migration-owner connection; never a toolbox binding or normal runtime credential",
+					},
+					{
+						Name: readOnlyConnectionKey, Description: "non-owner, read-only connection string",
+					},
+					{
+						Name: readWriteConnectionKey, Description: "non-owner, read-write connection string",
 					},
 				}},
 		},
@@ -181,10 +201,18 @@ func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configurat
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot get password")
 	}
-	return nil
+	s.readOnlyPassword, err = resources.GetConfigurationValue(ctx, conf, "postgres", "POSTGRES_READ_ONLY_PASSWORD")
+	if err != nil {
+		return s.Wool.Wrapf(err, "cannot get read-only runtime password")
+	}
+	s.readWritePassword, err = resources.GetConfigurationValue(ctx, conf, "postgres", "POSTGRES_READ_WRITE_PASSWORD")
+	if err != nil {
+		return s.Wool.Wrapf(err, "cannot get read-write runtime password")
+	}
+	return s.validateCredentials()
 }
 
-func (s *Service) createConnectionString(ctx context.Context, conf *basev0.Configuration, address string, withSSL bool) (string, error) {
+func (s *Service) createOwnerConnectionString(ctx context.Context, conf *basev0.Configuration, address string, withSSL bool) (string, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
@@ -193,20 +221,19 @@ func (s *Service) createConnectionString(ctx context.Context, conf *basev0.Confi
 		return "", s.Wool.Wrapf(err, "cannot get user and password")
 	}
 
-	conn := fmt.Sprintf("postgresql://%s:%s@%s/%s", s.postgresUser, s.postgresPassword, address, s.DatabaseName)
-	if !withSSL || strings.Contains(address, "localhost") || strings.Contains(address, "host.docker.internal") {
-		conn += "?sslmode=disable"
-	}
-	return conn, nil
+	return postgresConnectionString(address, s.DatabaseName, s.postgresUser, s.postgresPassword, withSSL), nil
 }
 
 func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev0.Configuration, instance *basev0.NetworkInstance, withSSL bool) (*basev0.Configuration, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	connection, err := s.createConnectionString(ctx, conf, instance.Address, withSSL)
-	if err != nil {
-		return nil, s.Wool.Wrapf(err, "cannot create connection string")
+	if err := s.LoadConfiguration(ctx, conf); err != nil {
+		return nil, s.Wool.Wrapf(err, "cannot load postgres credentials")
 	}
+	readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
+	ownerConnection := postgresConnectionString(instance.Address, s.DatabaseName, s.postgresUser, s.postgresPassword, withSSL)
+	readOnlyConnection := postgresConnectionString(instance.Address, s.DatabaseName, readOnlyRole, s.readOnlyPassword, withSSL)
+	readWriteConnection := postgresConnectionString(instance.Address, s.DatabaseName, readWriteRole, s.readWritePassword, withSSL)
 
 	outputConf := &basev0.Configuration{
 		Origin:         s.Base.Unique(),
@@ -214,12 +241,29 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 		Infos: []*basev0.ConfigurationInformation{
 			{Name: "postgres",
 				ConfigurationValues: []*basev0.ConfigurationValue{
-					{Key: "connection", Value: connection, Secret: true},
+					{Key: ownerConnectionKey, Value: ownerConnection, Secret: true},
+					{Key: readOnlyConnectionKey, Value: readOnlyConnection, Secret: true},
+					{Key: readWriteConnectionKey, Value: readWriteConnection, Secret: true},
 				},
 			},
 		},
 	}
 	return outputConf, nil
+}
+
+func postgresConnectionString(address, database, user, password string, withSSL bool) string {
+	query := url.Values{}
+	if !withSSL || strings.Contains(address, "localhost") || strings.Contains(address, "host.docker.internal") {
+		query.Set("sslmode", "disable")
+	}
+	connection := &url.URL{
+		Scheme:   "postgresql",
+		User:     url.UserPassword(user, password),
+		Host:     address,
+		Path:     "/" + database,
+		RawQuery: query.Encode(),
+	}
+	return connection.String()
 }
 
 func main() {

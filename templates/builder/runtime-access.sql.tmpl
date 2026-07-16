@@ -1,0 +1,106 @@
+\set ON_ERROR_STOP on
+\getenv owner_user POSTGRES_USER
+\getenv read_only_password POSTGRES_READ_ONLY_PASSWORD
+\getenv read_write_password POSTGRES_READ_WRITE_PASSWORD
+
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('codefly-runtime-access:' || current_database()));
+
+SELECT format('CREATE ROLE %I', '{{ .ReadOnlyRole }}')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ .ReadOnlyRole }}')
+\gexec
+SELECT format('CREATE ROLE %I', '{{ .ReadWriteRole }}')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ .ReadWriteRole }}')
+\gexec
+
+SELECT format(
+    'ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD %L',
+    '{{ .ReadOnlyRole }}', :'read_only_password')
+\gexec
+SELECT format(
+    'ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD %L',
+    '{{ .ReadWriteRole }}', :'read_write_password')
+\gexec
+SELECT format('ALTER ROLE %I SET default_transaction_read_only = on', '{{ .ReadOnlyRole }}')
+\gexec
+SELECT format('ALTER ROLE %I RESET default_transaction_read_only', '{{ .ReadWriteRole }}')
+\gexec
+
+SELECT format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I', current_database(), '{{ .ReadOnlyRole }}')
+\gexec
+SELECT format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I', current_database(), '{{ .ReadWriteRole }}')
+\gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), '{{ .ReadOnlyRole }}')
+\gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), '{{ .ReadWriteRole }}')
+\gexec
+
+{{- range .Schemas }}
+SELECT format('REVOKE CREATE ON SCHEMA %I FROM PUBLIC', '{{ . }}')
+\gexec
+SELECT format('REVOKE ALL PRIVILEGES ON SCHEMA %I FROM %I', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('REVOKE ALL PRIVILEGES ON SCHEMA %I FROM %I', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('GRANT USAGE ON SCHEMA %I TO %I', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('GRANT USAGE ON SCHEMA %I TO %I', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM %I', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM %I', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO %I', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO %I', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I REVOKE ALL ON TABLES FROM %I', :'owner_user', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I REVOKE ALL ON TABLES FROM %I', :'owner_user', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I REVOKE ALL ON SEQUENCES FROM %I', :'owner_user', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I REVOKE ALL ON SEQUENCES FROM %I', :'owner_user', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT ON TABLES TO %I', :'owner_user', '{{ . }}', '{{ $.ReadOnlyRole }}')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'owner_user', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', :'owner_user', '{{ . }}', '{{ $.ReadWriteRole }}')
+\gexec
+{{- end }}
+
+-- The managed login owns no application capabilities implicitly. Reconcile
+-- its SET ROLE allow-list from service configuration on every deployment.
+SELECT format('REVOKE %I FROM %I', granted.rolname, '{{ .ReadWriteRole }}')
+FROM pg_auth_members membership
+JOIN pg_roles granted ON granted.oid = membership.roleid
+JOIN pg_roles principal ON principal.oid = membership.member
+WHERE principal.rolname = '{{ .ReadWriteRole }}'
+\gexec
+
+{{- range .ReadWriteRoles }}
+DO $codefly$
+DECLARE
+    target pg_roles%ROWTYPE;
+BEGIN
+    SELECT * INTO target FROM pg_roles WHERE rolname = '{{ . }}';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'configured runtime read-write role % does not exist; create it in a migration', '{{ . }}';
+    END IF;
+    IF target.rolcanlogin OR target.rolsuper OR target.rolcreatedb OR target.rolcreaterole THEN
+        RAISE EXCEPTION 'configured runtime read-write role % must be NOLOGIN, NOSUPERUSER, NOCREATEDB, and NOCREATEROLE', '{{ . }}';
+    END IF;
+    EXECUTE format('GRANT %I TO %I', '{{ . }}', '{{ $.ReadWriteRole }}');
+END;
+$codefly$;
+{{- end }}
+
+COMMIT;

@@ -11,13 +11,13 @@ import (
 
 func TestDeploymentTemplatesWithMigration(t *testing.T) {
 	dir := agenttesting.AssertKustomizeTemplates(t, deploymentFS, DeploymentTemplateParameters{
-		WithMigration: true,
+		WithBootstrap: true,
 		ManagedImage:  image.FullName(),
 	})
 	assertMigrationResource(t, dir, true)
 }
 
-func TestDeploymentTemplatesWithoutMigration(t *testing.T) {
+func TestDeploymentTemplatesWithoutBootstrap(t *testing.T) {
 	dir := agenttesting.AssertKustomizeTemplates(t, deploymentFS, DeploymentTemplateParameters{
 		ManagedImage: image.FullName(),
 	})

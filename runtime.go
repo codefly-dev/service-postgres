@@ -113,12 +113,10 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 
 	}
 
-	s.connection, err = s.createConnectionString(ctx, s.Configuration, hostInstance.Address, false)
+	s.connection, err = s.createOwnerConnectionString(ctx, s.Configuration, hostInstance.Address, false)
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
-
-	w.Debug("connection string", wool.Field("connection", s.connection))
 
 	// Configuration (postgres user/password) is needed by both runtimes.
 	err = s.LoadConfiguration(ctx, s.Configuration)
@@ -215,10 +213,12 @@ func (s *Runtime) migrateOnInit(ctx context.Context) error {
 	if err := s.ensureExtensions(ctx); err != nil {
 		return err
 	}
-	if s.Settings.NoMigration {
-		return nil
+	if !s.Settings.NoMigration {
+		if err := s.applyMigration(ctx); err != nil {
+			return err
+		}
 	}
-	return s.applyMigration(ctx)
+	return s.ensureRuntimeAccess(ctx)
 }
 
 // ensureExtensions CREATE EXTENSION IF NOT EXISTS for the always-on defaults
@@ -278,7 +278,7 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
-	s.Wool.Debug("waiting for ready", wool.Field("connection", s.connection))
+	s.Wool.Debug("waiting for database readiness")
 
 	// One pool, opened once and reused for every probe. sql.Open is lazy
 	// (it doesn't dial until Ping), so a single *sql.DB pinged in a loop is
@@ -351,6 +351,9 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 			}
 		}
 	}
+	if err := s.ensureRuntimeAccess(ctx); err != nil {
+		return s.Runtime.StartError(err)
+	}
 	s.Wool.Debug("start done")
 	return s.Runtime.StartResponse()
 }
@@ -407,6 +410,10 @@ func (s *Runtime) EventHandler(event code.Change) error {
 		err := s.updateMigration(context.Background(), event.Path)
 		if err != nil {
 			s.Wool.Warn("cannot apply migration", wool.ErrField(err))
+			return nil
+		}
+		if err := s.ensureRuntimeAccess(context.Background()); err != nil {
+			s.Wool.Warn("cannot reconcile runtime access after migration", wool.ErrField(err))
 		}
 	}
 	return nil

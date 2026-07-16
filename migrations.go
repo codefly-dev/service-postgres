@@ -132,7 +132,7 @@ func (s *Runtime) applyMigration(ctx context.Context) error {
 		return nil
 	}
 
-	s.Wool.Debug("migrations", wool.Field("connection", s.connection), wool.Field("sources", len(sources)))
+	s.Wool.Debug("migrations", wool.Field("sources", len(sources)))
 	// One pool for the whole function — sql.Open is lazy and the *sql.DB is
 	// reused across every source and retry, so a single defer cleans it up on
 	// EVERY return path.

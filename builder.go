@@ -13,7 +13,6 @@ import (
 	"github.com/codefly-dev/core/wool"
 
 	"github.com/codefly-dev/core/agents/services"
-	"github.com/codefly-dev/core/agents/services/audit"
 	"github.com/codefly-dev/core/agents/services/upgrade"
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	"github.com/codefly-dev/core/shared"
@@ -74,11 +73,13 @@ func (s *Builder) Sync(ctx context.Context, req *builderv0.SyncRequest) (*builde
 func (s *Builder) Audit(ctx context.Context, req *builderv0.AuditRequest) (*builderv0.AuditResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	res, err := audit.Docker(ctx, s.dockerImage().FullName())
-	if err != nil {
-		return s.Builder.AuditError(err)
-	}
-	return s.Builder.AuditResponse(res.Findings, res.Outdated, res.Tool, res.Language)
+	return s.Builder.AuditContainer(ctx, req, s.dockerImage().FullName())
+}
+
+func (s *Builder) SBOM(ctx context.Context, _ *builderv0.SBOMRequest) (*builderv0.SBOMResponse, error) {
+	defer s.Wool.Catch()
+	ctx = s.Wool.Inject(ctx)
+	return s.Builder.SBOMContainer(ctx, s.dockerImage().FullName())
 }
 
 // Upgrade reports a tag bump from the current postgres image (e.g.
@@ -99,7 +100,12 @@ func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*
 }
 
 type DockerTemplating struct {
-	ConnectionStringKeyHolder string
+	MigrationConnectionKeyHolder string
+	WithMigration                bool
+	ReadOnlyRole                 string
+	ReadWriteRole                string
+	Schemas                      []string
+	ReadWriteRoles               []string
 }
 
 func (s *Builder) WithMigration() bool {
@@ -109,15 +115,7 @@ func (s *Builder) WithMigration() bool {
 func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*builderv0.BuildResponse, error) {
 	defer s.Wool.Catch()
 
-	if !s.WithMigration() {
-		s.Wool.Debug("build: no migration")
-		// Return a real (empty) success response, not (nil, nil): a nil gRPC
-		// response message fails to marshal on the wire and surfaces as an
-		// opaque RPC error to the caller.
-		return s.Builder.BuildResponse()
-	}
-
-	s.Wool.Debug("building migration docker image")
+	s.Wool.Debug("building database bootstrap image")
 
 	ctx = s.Wool.Inject(ctx)
 
@@ -132,8 +130,23 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		return s.Builder.BuildError(fmt.Errorf("invalid docker image name: %s", img.Name))
 	}
 
-	connectionKey := resources.ServiceSecretConfigurationKey(s.Base.Identity, "postgres", "connection")
-	docker := DockerTemplating{ConnectionStringKeyHolder: fmt.Sprintf("{%s}", connectionKey)}
+	readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
+	schemas, err := normalizedRuntimeSchemas(s.RuntimeSchemas)
+	if err != nil {
+		return s.Builder.BuildError(err)
+	}
+	readWriteRoles, err := normalizedRuntimeReadWriteRoles(s.RuntimeReadWriteRoles, readOnlyRole, readWriteRole)
+	if err != nil {
+		return s.Builder.BuildError(err)
+	}
+	docker := DockerTemplating{
+		MigrationConnectionKeyHolder: fmt.Sprintf("{%s}", migrationConnectionEnvironmentKey),
+		WithMigration:                s.WithMigration(),
+		ReadOnlyRole:                 readOnlyRole,
+		ReadWriteRole:                readWriteRole,
+		Schemas:                      schemas,
+		ReadWriteRoles:               readWriteRoles,
+	}
 
 	err = shared.DeleteFile(ctx, s.Local("builder/Dockerfile"))
 	if err != nil {
@@ -171,7 +184,7 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 		EnvironmentVariables: s.EnvironmentVariables,
 		Templates:            deploymentFS,
 		Parameters: DeploymentTemplateParameters{
-			WithMigration: s.WithMigration(),
+			WithBootstrap: true,
 			ManagedImage:  s.dockerImage().FullName(),
 		},
 		Prepare: func(ctx context.Context, deployment *services.KustomizeDeploymentContext) error {
@@ -183,6 +196,21 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 			if err != nil {
 				return err
 			}
+			ownerConnection, err := s.createOwnerConnectionString(ctx, req.GetConfiguration(), instance.Address, !s.Settings.WithoutSSL)
+			if err != nil {
+				return err
+			}
+			// These values are private to the Postgres StatefulSet/bootstrap Job.
+			// Only the capability-scoped configuration above is exported to
+			// dependent services.
+			deployment.AddSecrets(
+				resources.Env("POSTGRES_USER", s.postgresUser),
+				resources.Env("POSTGRES_PASSWORD", s.postgresPassword),
+				resources.Env("POSTGRES_DB", s.DatabaseName),
+				resources.Env("POSTGRES_READ_ONLY_PASSWORD", s.readOnlyPassword),
+				resources.Env("POSTGRES_READ_WRITE_PASSWORD", s.readWritePassword),
+				resources.Env(migrationConnectionEnvironmentKey, ownerConnection),
+			)
 			s.Wool.Debug("exporting configuration", wool.Field("conf", resources.MakeConfigurationSummary(configuration)))
 			return deployment.ExportConfiguration(ctx, configuration)
 		},

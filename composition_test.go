@@ -32,6 +32,12 @@ database-name: myapp
 hot-reload: true
 without-ssl: false
 no-migration: true
+runtime-schemas:
+  - app
+  - audit
+runtime-read-write-roles:
+  - app_tenant
+  - app_worker
 `)
 	var s Settings
 	if err := yaml.Unmarshal(src, &s); err != nil {
@@ -48,5 +54,11 @@ no-migration: true
 	}
 	if s.WithoutSSL {
 		t.Error("WithoutSSL should be false")
+	}
+	if len(s.RuntimeSchemas) != 2 || s.RuntimeSchemas[0] != "app" || s.RuntimeSchemas[1] != "audit" {
+		t.Errorf("RuntimeSchemas: got %v", s.RuntimeSchemas)
+	}
+	if len(s.RuntimeReadWriteRoles) != 2 || s.RuntimeReadWriteRoles[0] != "app_tenant" || s.RuntimeReadWriteRoles[1] != "app_worker" {
+		t.Errorf("RuntimeReadWriteRoles: got %v", s.RuntimeReadWriteRoles)
 	}
 }

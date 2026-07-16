@@ -6,8 +6,8 @@ resources:
   # and adds an ExternalName Service instead.
   - stateful-set.yaml
   - service.yaml
-{{- if .Deployment.Parameters.WithMigration }}
-  # Migration runner. The workload still deploys when migrations are disabled;
-  # only this one-shot Job is conditional.
+{{- if .Deployment.Parameters.WithBootstrap }}
+  # Database bootstrap runner: applies migrations when configured, then
+  # reconciles the capability-scoped runtime roles on every deployment.
   - job.yaml
 {{- end }}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
@@ -104,7 +103,9 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 			{Name: "postgres",
 				ConfigurationValues: []*basev0.ConfigurationValue{
 					{Key: "POSTGRES_USER", Value: "postgres"},
-					{Key: "POSTGRES_PASSWORD", Value: "password"},
+					{Key: "POSTGRES_PASSWORD", Value: "owner-password"},
+					{Key: "POSTGRES_READ_ONLY_PASSWORD", Value: "read-only-password"},
+					{Key: "POSTGRES_READ_WRITE_PASSWORD", Value: "read-write-password"},
 				},
 			},
 		},
@@ -131,16 +132,57 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	configurationOut, err := resources.ExtractConfiguration(init.RuntimeConfigurations, resources.NewRuntimeContextNative())
 	require.NoError(t, err)
 
-	// extract the connection string
-	connString, err := resources.GetConfigurationValue(ctx, configurationOut, "postgres", "connection")
+	readOnlyConnection, err := resources.GetConfigurationValue(ctx, configurationOut, "postgres", readOnlyConnectionKey)
+	require.NoError(t, err)
+	readWriteConnection, err := resources.GetConfigurationValue(ctx, configurationOut, "postgres", readWriteConnectionKey)
 	require.NoError(t, err)
 
-	// Do a SQL query
-	db, err := sql.Open("postgres", connString)
+	reader, err := openPostgresCapabilityProbe(ctx, readOnlyConnection)
 	require.NoError(t, err)
+	defer reader.Close()
+	writer, err := openPostgresCapabilityProbe(ctx, readWriteConnection)
+	require.NoError(t, err)
+	defer writer.Close()
 
-	err = db.Ping()
+	fixtureID := "00000000-0000-0000-0000-000000000001"
+	require.NoError(t, writer.AppendFixture(ctx, serviceName, fixtureID), "writer must mutate migrated application relations")
+	found, err := reader.HasFixture(ctx, serviceName, fixtureID)
+	require.NoError(t, err, "reader must query migrated application relations")
+	require.True(t, found)
+	require.Error(t, reader.AppendFixture(ctx, serviceName, "00000000-0000-0000-0000-000000000002"), "reader must not mutate data")
+	require.Error(t, reader.CreateRelation(ctx, "reader_escape"), "reader must not create schema objects")
+	require.Error(t, writer.CreateRelation(ctx, "writer_escape"), "writer must not create schema objects")
+	require.Error(t, writer.CreateLoginRole(ctx, "writer_escape_role"), "writer must not create roles")
+	require.Error(t, writer.AssumeRole(ctx, "postgres"), "writer must not assume the migration owner")
+
+	owner, err := openPostgresCapabilityProbe(ctx, runtime.connection)
 	require.NoError(t, err)
-	_, err = db.Exec("SELECT 1")
+	defer owner.Close()
+	tenantRelation := serviceName + "_tenant_scope"
+	require.NoError(t, owner.InstallTenantFixture(ctx, tenantRelation))
+
+	// An omitted authenticated scope fails closed at RLS, even with a valid
+	// runtime credential.
+	unscoped, err := reader.HasFixture(ctx, tenantRelation, fixtureID)
 	require.NoError(t, err)
+	require.False(t, unscoped)
+	require.Error(t, writer.AppendTenantFixture(ctx, tenantRelation, fixtureID, "unscoped"))
+
+	repository, closeRepository, err := newScopedFixtureRepository(ctx, readOnlyConnection, readWriteConnection, tenantRelation)
+	require.NoError(t, err)
+	defer closeRepository()
+	tenantA := contextWithDatabasePrincipal(ctx, "tenant-a", "user-a")
+	tenantB := contextWithDatabasePrincipal(ctx, "tenant-b", "user-b")
+	require.NoError(t, repository.Put(tenantA, "shared-id", "tenant-a-value"))
+	require.NoError(t, repository.Put(tenantB, "shared-id", "tenant-b-value"))
+	value, found, err := repository.Get(tenantA, "shared-id")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "tenant-a-value", value)
+	value, found, err = repository.Get(tenantB, "shared-id")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "tenant-b-value", value)
+	_, _, err = repository.Get(ctx, "shared-id")
+	require.Error(t, err, "repository access without an authenticated principal must fail before querying")
 }
