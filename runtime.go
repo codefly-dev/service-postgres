@@ -80,7 +80,13 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 		return s.Runtime.InitError(w.NewError("network mapping is nil"))
 	}
 
-	instance, err := resources.FindNetworkInstanceInNetworkMappings(ctx, s.NetworkMappings, s.TcpEndpoint, s.Runtime.NetworkAccess())
+	// ARCHITECTURE: the Postgres container publishes a port to the agent host,
+	// and migrations/runtime-role reconciliation execute in this host agent
+	// process. Always select the native mapping for those control-plane calls.
+	// A container mapping such as host.docker.internal is for a *consumer*
+	// running in another container; it is not a portable hostname on the host
+	// itself (notably on Linux and several macOS Docker backends).
+	instance, err := resources.FindNetworkInstanceInNetworkMappings(ctx, s.NetworkMappings, s.TcpEndpoint, resources.NewNativeNetworkAccess())
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
@@ -107,7 +113,7 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 
 	w.Debug("setting up connection string for migrations")
 	// Setup a connection string for migration
-	hostInstance, err := resources.FindNetworkInstanceInNetworkMappings(ctx, s.NetworkMappings, s.TcpEndpoint, s.Runtime.NetworkAccess())
+	hostInstance, err := resources.FindNetworkInstanceInNetworkMappings(ctx, s.NetworkMappings, s.TcpEndpoint, resources.NewNativeNetworkAccess())
 	if err != nil {
 		return s.Runtime.InitError(err)
 

@@ -12,6 +12,9 @@ import (
 	runners "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/core/wool"
+	scoped "github.com/codefly-dev/service-postgres/libs/go"
+	migrationtest "github.com/codefly-dev/service-postgres/libs/go/migrationtest"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 	"os"
 	"path"
@@ -22,10 +25,11 @@ import (
 // TODO: Add tests
 // - migrations: up/down
 
-// TestCreateToRunDocker runs the full agent lifecycle against the Docker
-// runtime (the default container backend).
+// TestCreateToRunDocker runs the full agent lifecycle against the explicitly
+// selected container backend. Using free here would only test backend
+// auto-selection and could silently fall back to Nix.
 func TestCreateToRunDocker(t *testing.T) {
-	testCreateToRun(t, resources.NewRuntimeContextFree())
+	testCreateToRun(t, resources.NewRuntimeContextContainer())
 }
 
 // TestCreateToRunNix runs the SAME full lifecycle against the nix runtime —
@@ -158,6 +162,60 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	owner, err := openPostgresCapabilityProbe(ctx, runtime.connection)
 	require.NoError(t, err)
 	defer owner.Close()
+	// The reusable migration control plane is exercised against this actual
+	// plugin instance, including isolated database lifecycle, runtime-access
+	// reconciliation, physical cloning, and reversible transactional DDL.
+	migrationControl, err := migrationtest.OpenControlPlane(ctx, runtime.connection)
+	require.NoError(t, err)
+	defer migrationControl.Close()
+	isolate, err := migrationControl.Create(ctx, "service_postgres_migration_test")
+	require.NoError(t, err)
+	defer isolate.Drop(context.Background())
+	isolateMigrations := []migrationtest.Migration{{
+		Version: 1,
+		Name:    "fixture",
+		UpSQL:   `CREATE TABLE migration_control_fixture (id UUID PRIMARY KEY);`,
+		DownSQL: `DROP TABLE migration_control_fixture;`,
+	}}
+	require.NoError(t, migrationtest.ApplyUp(ctx, isolate.DB, isolateMigrations))
+	require.NoError(t, isolate.ReconcileRuntimeAccess(ctx, readOnlyConnection, readWriteConnection))
+	require.NoError(t, isolate.Close())
+	clone, err := migrationControl.Clone(ctx, isolate.Name, "service_postgres_migration_clone")
+	require.NoError(t, err)
+	defer clone.Drop(context.Background())
+	var relationExists bool
+	require.NoError(t, clone.DB.QueryRowContext(ctx, `SELECT to_regclass('public.migration_control_fixture') IS NOT NULL`).Scan(&relationExists))
+	require.True(t, relationExists)
+	require.NoError(t, migrationtest.ApplyDown(ctx, clone.DB, isolateMigrations))
+	require.NoError(t, clone.DB.QueryRowContext(ctx, `SELECT to_regclass('public.migration_control_fixture') IS NOT NULL`).Scan(&relationExists))
+	require.False(t, relationExists)
+	// Migration ownership remains inside the plugin. A hot-reload migration is
+	// rolled down and back up here without ever exporting the owner connection
+	// to a dependent service.
+	migrationRelation := serviceName + "_migration_replay"
+	migrationDirectory := path.Join(tmpDir, "mod", service.Name, "migrations")
+	migrationUp := path.Join(migrationDirectory, "2_replay.up.sql")
+	migrationDown := path.Join(migrationDirectory, "2_replay.down.sql")
+	quotedMigrationRelation := pq.QuoteIdentifier(migrationRelation)
+	require.NoError(t, os.WriteFile(migrationUp, []byte("CREATE TABLE "+quotedMigrationRelation+" (id UUID PRIMARY KEY);"), 0o600))
+	require.NoError(t, os.WriteFile(migrationDown, []byte("DROP TABLE IF EXISTS "+quotedMigrationRelation+";"), 0o600))
+	require.NoError(t, runtime.updateMigration(ctx, migrationUp))
+	exists, err := owner.RelationExists(ctx, migrationRelation)
+	require.NoError(t, err)
+	require.True(t, exists)
+	replayFixtureID := "00000000-0000-0000-0000-000000000003"
+	require.NoError(t, owner.AppendFixture(ctx, migrationRelation, replayFixtureID))
+	require.NoError(t, runtime.updateMigration(ctx, migrationUp))
+	exists, err = owner.RelationExists(ctx, migrationRelation)
+	require.NoError(t, err)
+	require.True(t, exists)
+	found, err = owner.HasFixture(ctx, migrationRelation, replayFixtureID)
+	require.NoError(t, err)
+	require.False(t, found, "hot reload must execute down then up, rebuilding the migration-owned relation")
+	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
+	found, err = reader.HasFixture(ctx, migrationRelation, replayFixtureID)
+	require.NoError(t, err, "reader grants must be reconciled after migration replay")
+	require.False(t, found)
 	tenantRelation := serviceName + "_tenant_scope"
 	require.NoError(t, owner.InstallTenantFixture(ctx, tenantRelation))
 
@@ -168,7 +226,9 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	require.False(t, unscoped)
 	require.Error(t, writer.AppendTenantFixture(ctx, tenantRelation, fixtureID, "unscoped"))
 
-	repository, closeRepository, err := newScopedFixtureRepository(ctx, readOnlyConnection, readWriteConnection, tenantRelation)
+	workloadIssuer, err := scoped.NewWorkloadIssuer(contextAuthenticator{})
+	require.NoError(t, err)
+	repository, closeRepository, err := newScopedFixtureRepository(ctx, readOnlyConnection, readWriteConnection, tenantRelation, workloadIssuer)
 	require.NoError(t, err)
 	defer closeRepository()
 	tenantA := contextWithDatabasePrincipal(ctx, "tenant-a", "user-a")
@@ -185,4 +245,18 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	require.Equal(t, "tenant-b-value", value)
 	_, _, err = repository.Get(ctx, "shared-id")
 	require.Error(t, err, "repository access without an authenticated principal must fail before querying")
+
+	workloadA, err := workloadIssuer.Issue("tenant-a", "fixture-writer", true)
+	require.NoError(t, err)
+	workloadB, err := workloadIssuer.Issue("tenant-b", "fixture-reader", false)
+	require.NoError(t, err)
+	require.NoError(t, repository.Put(workloadA.Context(ctx), "workload-id", "tenant-a-workload"))
+	value, found, err = repository.Get(workloadA.Context(ctx), "workload-id")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "tenant-a-workload", value)
+	_, found, err = repository.Get(workloadB.Context(ctx), "workload-id")
+	require.NoError(t, err)
+	require.False(t, found, "tenant-b workload must not see tenant-a data")
+	require.Error(t, repository.Put(workloadB.Context(ctx), "blocked", "value"), "read-only workload must not obtain a writer")
 }

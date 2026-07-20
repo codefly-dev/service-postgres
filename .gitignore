@@ -5,5 +5,8 @@ dist
 
 dist/
 
+# Rust client build output.
+/libs/rust/target/
+
 # Compiled agent binary — never track binaries.
 /service-postgres

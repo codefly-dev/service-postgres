@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"unicode"
 
+	pgcontrol "github.com/codefly-dev/service-postgres/libs/go/controlplane"
 	"github.com/lib/pq"
 )
 
@@ -27,6 +29,22 @@ type runtimeAccess struct {
 	readWriteRole  string
 	schemas        []string
 	readWriteRoles []string
+}
+
+// deriveRuntimePassword deterministically upgrades legacy owner-only service
+// configurations to the scoped runtime-credential contract. HMAC makes this a
+// one-way derivation: possession of an exported reader or writer password does
+// not reveal the migration-owner secret or the sibling capability password.
+func deriveRuntimePassword(ownerPassword, database, capability string) string {
+	if strings.TrimSpace(ownerPassword) == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(ownerPassword))
+	_, _ = mac.Write([]byte("codefly/service-postgres/runtime-password/v1\x00"))
+	_, _ = mac.Write([]byte(database))
+	_, _ = mac.Write([]byte("\x00"))
+	_, _ = mac.Write([]byte(capability))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (s *Service) validateCredentials() error {
@@ -208,7 +226,15 @@ func (s *Runtime) ensureRuntimeAccess(ctx context.Context) error {
 	if err := ensureLoginRole(ctx, tx, access.readWriteRole, s.readWritePassword, false); err != nil {
 		return s.Wool.Wrapf(err, "cannot provision read-write runtime role")
 	}
-	if err := reconcileRuntimeGrants(ctx, tx, s.DatabaseName, s.postgresUser, access); err != nil {
+	if err := pgcontrol.ReconcileRuntimeAccess(ctx, tx, pgcontrol.RuntimeAccess{
+		Database:                          s.DatabaseName,
+		OwnerRole:                         s.postgresUser,
+		ReadOnlyRole:                      access.readOnlyRole,
+		ReadWriteRole:                     access.readWriteRole,
+		Schemas:                           access.schemas,
+		ReadWriteRoles:                    access.readWriteRoles,
+		ReconcileReadWriteRoleMemberships: true,
+	}); err != nil {
 		return s.Wool.Wrapf(err, "cannot reconcile runtime grants")
 	}
 	if err := tx.Commit(); err != nil {
@@ -238,108 +264,4 @@ func ensureLoginRole(ctx context.Context, tx *sql.Tx, role, password string, rea
 	}
 	_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` RESET default_transaction_read_only`)
 	return err
-}
-
-func reconcileRuntimeGrants(ctx context.Context, tx *sql.Tx, database, owner string, access runtimeAccess) error {
-	db := pq.QuoteIdentifier(database)
-	ownerRole := pq.QuoteIdentifier(owner)
-	ro := pq.QuoteIdentifier(access.readOnlyRole)
-	rw := pq.QuoteIdentifier(access.readWriteRole)
-
-	databaseStatements := []string{
-		`REVOKE ALL PRIVILEGES ON DATABASE ` + db + ` FROM ` + ro,
-		`REVOKE ALL PRIVILEGES ON DATABASE ` + db + ` FROM ` + rw,
-		`GRANT CONNECT ON DATABASE ` + db + ` TO ` + ro,
-		`GRANT CONNECT ON DATABASE ` + db + ` TO ` + rw,
-	}
-	for _, statement := range databaseStatements {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return err
-		}
-	}
-
-	for _, schemaName := range access.schemas {
-		schema := pq.QuoteIdentifier(schemaName)
-		statements := []string{
-			`REVOKE CREATE ON SCHEMA ` + schema + ` FROM PUBLIC`,
-			`REVOKE ALL PRIVILEGES ON SCHEMA ` + schema + ` FROM ` + ro,
-			`REVOKE ALL PRIVILEGES ON SCHEMA ` + schema + ` FROM ` + rw,
-			`GRANT USAGE ON SCHEMA ` + schema + ` TO ` + ro,
-			`GRANT USAGE ON SCHEMA ` + schema + ` TO ` + rw,
-			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA ` + schema + ` FROM ` + ro,
-			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA ` + schema + ` FROM ` + rw,
-			`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ` + schema + ` FROM ` + ro,
-			`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ` + schema + ` FROM ` + rw,
-			`GRANT SELECT ON ALL TABLES IN SCHEMA ` + schema + ` TO ` + ro,
-			`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + schema + ` TO ` + rw,
-			`GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA ` + schema + ` TO ` + rw,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + ownerRole + ` IN SCHEMA ` + schema + ` REVOKE ALL ON TABLES FROM ` + ro,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + ownerRole + ` IN SCHEMA ` + schema + ` REVOKE ALL ON TABLES FROM ` + rw,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + ownerRole + ` IN SCHEMA ` + schema + ` REVOKE ALL ON SEQUENCES FROM ` + ro,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + ownerRole + ` IN SCHEMA ` + schema + ` REVOKE ALL ON SEQUENCES FROM ` + rw,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + ownerRole + ` IN SCHEMA ` + schema + ` GRANT SELECT ON TABLES TO ` + ro,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + ownerRole + ` IN SCHEMA ` + schema + ` GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ` + rw,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + ownerRole + ` IN SCHEMA ` + schema + ` GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ` + rw,
-		}
-		for _, statement := range statements {
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return err
-			}
-		}
-	}
-	return reconcileRuntimeRoleMemberships(ctx, tx, access.readWriteRole, access.readWriteRoles)
-}
-
-func reconcileRuntimeRoleMemberships(ctx context.Context, tx *sql.Tx, member string, configured []string) error {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT granted.rolname
-		FROM pg_auth_members membership
-		JOIN pg_roles granted ON granted.oid = membership.roleid
-		JOIN pg_roles principal ON principal.oid = membership.member
-		WHERE principal.rolname = $1`, member)
-	if err != nil {
-		return err
-	}
-	var current []string
-	for rows.Next() {
-		var role string
-		if err := rows.Scan(&role); err != nil {
-			rows.Close()
-			return err
-		}
-		current = append(current, role)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, role := range current {
-		if _, err := tx.ExecContext(ctx, `REVOKE `+pq.QuoteIdentifier(role)+` FROM `+pq.QuoteIdentifier(member)); err != nil {
-			return err
-		}
-	}
-
-	for _, role := range configured {
-		var canLogin, superuser, createDB, createRole bool
-		err := tx.QueryRowContext(ctx, `
-			SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole
-			FROM pg_roles
-			WHERE rolname = $1`, role).Scan(&canLogin, &superuser, &createDB, &createRole)
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("configured runtime read-write role %q does not exist; create it in a migration", role)
-		}
-		if err != nil {
-			return err
-		}
-		if canLogin || superuser || createDB || createRole {
-			return fmt.Errorf("configured runtime read-write role %q must be NOLOGIN, NOSUPERUSER, NOCREATEDB, and NOCREATEROLE", role)
-		}
-		if _, err := tx.ExecContext(ctx, `GRANT `+pq.QuoteIdentifier(role)+` TO `+pq.QuoteIdentifier(member)); err != nil {
-			return err
-		}
-	}
-	return nil
 }

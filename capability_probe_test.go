@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 
-	scoped "github.com/codefly-dev/sdk-go/postgres"
+	scoped "github.com/codefly-dev/service-postgres/libs/go"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lib/pq"
@@ -50,6 +50,12 @@ func (p *postgresCapabilityProbe) HasFixture(ctx context.Context, relation, id s
 	return exists, err
 }
 
+func (p *postgresCapabilityProbe) RelationExists(ctx context.Context, relation string) (bool, error) {
+	var exists bool
+	err := p.db.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, relation).Scan(&exists)
+	return exists, err
+}
+
 func (p *postgresCapabilityProbe) CreateRelation(ctx context.Context, relation string) error {
 	_, err := p.db.ExecContext(ctx, `CREATE TABLE `+pq.QuoteIdentifier(relation)+` (id UUID PRIMARY KEY)`)
 	return err
@@ -90,7 +96,7 @@ type scopedFixtureRepository struct {
 	relation string
 }
 
-func newScopedFixtureRepository(ctx context.Context, readerConnection, writerConnection, relation string) (*scopedFixtureRepository, func(), error) {
+func newScopedFixtureRepository(ctx context.Context, readerConnection, writerConnection, relation string, authenticator scoped.Authenticator) (*scopedFixtureRepository, func(), error) {
 	readerPool, err := pgxpool.New(ctx, readerConnection)
 	if err != nil {
 		return nil, nil, err
@@ -100,7 +106,7 @@ func newScopedFixtureRepository(ctx context.Context, readerConnection, writerCon
 		readerPool.Close()
 		return nil, nil, err
 	}
-	factory, err := scoped.NewFactory(readerPool, writerPool, contextAuthenticator{})
+	factory, err := scoped.NewFactory(readerPool, writerPool, authenticator)
 	if err != nil {
 		readerPool.Close()
 		writerPool.Close()

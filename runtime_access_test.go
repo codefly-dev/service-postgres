@@ -61,8 +61,6 @@ func TestCredentialsFailClosed(t *testing.T) {
 		writer string
 	}{
 		{name: "missing owner", reader: "reader", writer: "writer"},
-		{name: "missing reader", owner: "owner", writer: "writer"},
-		{name: "missing writer", owner: "owner", reader: "reader"},
 		{name: "owner equals reader", owner: "same", reader: "same", writer: "writer"},
 		{name: "owner equals writer", owner: "same", reader: "reader", writer: "same"},
 		{name: "reader equals writer", owner: "owner", reader: "same", writer: "same"},
@@ -75,6 +73,36 @@ func TestCredentialsFailClosed(t *testing.T) {
 				t.Fatal("invalid credentials were accepted")
 			}
 		})
+	}
+}
+
+func TestLegacyOwnerOnlyCredentialsDeriveStableScopedPasswords(t *testing.T) {
+	first := newTestPostgresService()
+	first.DatabaseName = "accounts"
+	if err := first.LoadConfiguration(context.Background(), testPostgresConfiguration("migration-owner", "owner-secret", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	second := newTestPostgresService()
+	second.DatabaseName = "accounts"
+	if err := second.LoadConfiguration(context.Background(), testPostgresConfiguration("migration-owner", "owner-secret", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if first.readOnlyPassword == "" || first.readWritePassword == "" {
+		t.Fatal("derived runtime credentials are empty")
+	}
+	if first.readOnlyPassword == first.postgresPassword || first.readWritePassword == first.postgresPassword || first.readOnlyPassword == first.readWritePassword {
+		t.Fatal("derived runtime credentials are not capability-scoped")
+	}
+	if first.readOnlyPassword != second.readOnlyPassword || first.readWritePassword != second.readWritePassword {
+		t.Fatal("derived runtime credentials are not stable")
+	}
+	otherDatabase := newTestPostgresService()
+	otherDatabase.DatabaseName = "billing"
+	if err := otherDatabase.LoadConfiguration(context.Background(), testPostgresConfiguration("migration-owner", "owner-secret", "", "")); err != nil {
+		t.Fatal(err)
+	}
+	if first.readOnlyPassword == otherDatabase.readOnlyPassword || first.readWritePassword == otherDatabase.readWritePassword {
+		t.Fatal("derived runtime credentials are not database-scoped")
 	}
 }
 

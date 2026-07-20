@@ -5,8 +5,8 @@ This service provisions Postgres as two explicit runtime capabilities:
 - `postgres.read-only-connection`: a non-owner `NOBYPASSRLS` role with query-only grants and a read-only transaction default.
 - `postgres.read-write-connection`: a non-owner `NOBYPASSRLS` role with query and DML grants, but no schema creation, database creation, role management, or owner membership.
 
-The migration owner is private to the Postgres service and its bootstrap job. It is never exported to dependent services. Owner, reader, and writer passwords are separate required secrets.
+The migration owner is private to the Postgres service and its bootstrap job. It is never exported to dependent services. Newly generated services receive separate owner, reader, and writer secrets. Legacy owner-only services derive stable, domain-separated reader and writer credentials inside the agent so isolated checkouts start without copying developer-local configuration; explicit runtime secrets always take precedence.
 
 The bootstrap job applies migrations and reconciles runtime roles and grants on every deployment. Local Docker and Nix runtimes enforce the same contract.
 
-For tenant isolation, application migrations must enable row-level security and define policies against transaction-local tenant/user settings. Go services should use `github.com/codefly-dev/sdk-go/postgres`, which resolves an authenticated principal from context and issues separate read-only/read-write stores without exposing raw pools.
+For tenant isolation, application migrations must enable row-level security and define policies against transaction-local tenant/user settings. Go services should use the service-owned library at `github.com/codefly-dev/service-postgres/libs/go`, which resolves an authenticated principal from context, issues separate read-only/read-write stores without exposing raw pools, and provides tenant-scoped transaction advisory locks without exposing tenant identity to repository code.

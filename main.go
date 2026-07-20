@@ -209,6 +209,18 @@ func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configurat
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot get read-write runtime password")
 	}
+	// ARCHITECTURE: older generated services only carry the migration-owner
+	// secret. Keep those services bootable without copying developer-local
+	// configuration into isolated worktrees by deriving capability passwords
+	// from that owner secret. The one-way, domain-separated derivation keeps
+	// the exported credentials distinct and stable; newly generated services
+	// still receive independent explicit secrets from the factory template.
+	if strings.TrimSpace(s.readOnlyPassword) == "" {
+		s.readOnlyPassword = deriveRuntimePassword(s.postgresPassword, s.DatabaseName, readOnlyConnectionKey)
+	}
+	if strings.TrimSpace(s.readWritePassword) == "" {
+		s.readWritePassword = deriveRuntimePassword(s.postgresPassword, s.DatabaseName, readWriteConnectionKey)
+	}
 	return s.validateCredentials()
 }
 
