@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
 
@@ -150,6 +152,10 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		ReadWriteRoles:               readWriteRoles,
 	}
 
+	if outputDirectory := req.GetOutputDirectory(); outputDirectory != "" {
+		return s.buildRecipe(ctx, outputDirectory, img, docker)
+	}
+
 	err = shared.DeleteFile(ctx, s.Local("builder/Dockerfile"))
 	if err != nil {
 		return s.Builder.BuildError(err)
@@ -177,6 +183,72 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	s.Builder.WithDockerImages(img)
 
 	return s.Builder.BuildResponse()
+}
+
+// buildRecipe renders the bootstrap image's Dockerfile and build context into the
+// caller-owned output directory and returns a reproducible build plan instead of
+// running docker itself. The CLI builds the emitted recipe multi-arch and pushes
+// a manifest list, so a consumer can rebuild the image without the agent
+// toolchain. The context is the recipe tree itself: the rendered builder/ files
+// plus the migrations the image applies at bootstrap.
+func (s *Builder) buildRecipe(ctx context.Context, outputDirectory string, img *resources.DockerImage, docker DockerTemplating) (*builderv0.BuildResponse, error) {
+	// The plan inventories the whole output directory and the recipe context is
+	// its root, so any pre-existing content the caller left here would be
+	// digested into the plan and copied into the image. Empty the directory the
+	// agent fully owns before rendering, as the deployment emitter does.
+	if err := shared.EmptyDir(ctx, outputDirectory); err != nil {
+		return s.Builder.BuildError(err)
+	}
+
+	if err := s.Templates(ctx, docker, services.WithBuilder(builderFS).WithDestination("%s", filepath.Join(outputDirectory, "builder"))); err != nil {
+		return s.Builder.BuildError(err)
+	}
+
+	if s.WithMigration() {
+		// The Dockerfile's COPY migrations needs the directory to exist even when
+		// no migrations are authored yet, so create it before copying rather than
+		// letting copyTree leave it absent for an empty source.
+		migrationsDirectory := filepath.Join(outputDirectory, "migrations")
+		if err := os.MkdirAll(migrationsDirectory, 0o755); err != nil {
+			return s.Builder.BuildError(err)
+		}
+		if err := copyTree(ctx, s.Local("migrations"), migrationsDirectory); err != nil {
+			return s.Builder.BuildError(err)
+		}
+	}
+
+	plan, err := services.BuildDockerBuildPlan(outputDirectory, []*builderv0.DockerBuildRecipe{{
+		Name:       "bootstrap",
+		Dockerfile: "builder/Dockerfile",
+		Context:    ".",
+		Image:      img.FullName(),
+		Platforms:  []string{"linux/amd64", "linux/arm64"},
+	}})
+	if err != nil {
+		return s.Builder.BuildError(err)
+	}
+
+	s.Builder.WithBuildPlan(plan)
+	return s.Builder.BuildResponse()
+}
+
+// copyTree copies every regular file under from into to, preserving the relative
+// layout. Directory entries themselves are not created here; the caller
+// provisions any directory a build step requires to exist.
+func copyTree(ctx context.Context, from, to string) error {
+	return filepath.WalkDir(from, func(entryPath string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(from, entryPath)
+		if err != nil {
+			return err
+		}
+		return shared.CopyFile(ctx, entryPath, filepath.Join(to, relative))
+	})
 }
 
 func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) (*builderv0.DeploymentResponse, error) {
