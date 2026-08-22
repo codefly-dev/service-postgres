@@ -181,11 +181,23 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 
 func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) (*builderv0.DeploymentResponse, error) {
 	defer s.Wool.Catch()
+	walBudget, err := s.effectiveWALBudget()
+	if err != nil {
+		return s.Builder.DeployError(err)
+	}
+	if err = validateWALBudgetStorage(walBudget, managedPostgresStorage()); err != nil {
+		return s.Builder.DeployError(err)
+	}
+	reportWALBudget(s.Wool.In("builder::deploy"), walBudget)
 
 	parameters := &DeploymentTemplateParameters{
-		WithBootstrap: true,
-		ManagedImage:  s.dockerImage().FullName(),
-		DatabaseName:  s.DatabaseName,
+		WithBootstrap:         true,
+		ManagedImage:          s.dockerImage().FullName(),
+		PostgresArguments:     append([]string{"postgres"}, walBudget.postgresArguments()...),
+		WALBudgetMaxSizeMB:    walBudget.maxSizeMB,
+		WALStoragePercent:     maximumWALStoragePercent,
+		ManagedStorageSizeGiB: managedPostgresStorageMB / 1024,
+		DatabaseName:          s.DatabaseName,
 	}
 	var restrictedConfiguration *v0.Configuration
 	response, err := s.Builder.DeployKustomize(ctx, req, services.KustomizeDeployment{

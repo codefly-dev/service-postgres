@@ -49,7 +49,10 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test ./... -skip '^TestCreateToRunDocker$'
+        run: go test ./... -skip '^(TestCreateToRunDocker|TestSustainedWALBudgetDocker)$'
+
+      - name: Qualify sustained WAL budget
+        run: go test . -run '^TestSustainedWALBudgetDocker$' -count=1 -timeout=3m
 
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .

@@ -27,8 +27,12 @@ func (m *recordingPersistentCacheMounter) WithPersistentCacheMount(
 func TestMountPersistentPostgresDataUsesCodeflyOwnedScope(t *testing.T) {
 	mounter := &recordingPersistentCacheMounter{}
 
-	if err := mountPersistentPostgresData(context.Background(), mounter); err != nil {
+	path, err := mountPersistentPostgresData(context.Background(), mounter)
+	if err != nil {
 		t.Fatalf("mount persistent postgres data: %v", err)
+	}
+	if path != "/codefly/runtime-cache/test/postgres-data" {
+		t.Fatalf("cache path = %q", path)
 	}
 	if mounter.callCount != 1 {
 		t.Fatalf("mount calls = %d, want 1", mounter.callCount)
@@ -45,7 +49,7 @@ func TestMountPersistentPostgresDataPropagatesFailure(t *testing.T) {
 	want := errors.New("cache unavailable")
 	mounter := &recordingPersistentCacheMounter{err: want}
 
-	if err := mountPersistentPostgresData(context.Background(), mounter); !errors.Is(err, want) {
+	if _, err := mountPersistentPostgresData(context.Background(), mounter); !errors.Is(err, want) {
 		t.Fatalf("mount error = %v, want %v", err, want)
 	}
 }

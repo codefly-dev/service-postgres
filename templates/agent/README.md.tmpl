@@ -11,6 +11,24 @@ The bootstrap job applies migrations and reconciles runtime roles and grants on 
 
 Local database state survives ordinary stop/start and container recreation. In Docker mode, the agent mounts the official image's data directory from a Codefly-owned persistent runtime directory scoped by workspace, service, and naming scope. Stable and development scopes therefore keep independent databases even when they run from the same checkout.
 
+## WAL budget
+
+The agent starts local Docker, Nix, and generated Kubernetes Postgres instances with the same WAL/checkpoint budget. The deterministic default is `max_wal_size=4096MB` and `checkpoint_timeout=900s`; it is the production semantic-ingestion profile and needs no application-side command or `postgresql.conf` edit. PostgreSQL treats `max_wal_size` as a soft budget, so WAL can temporarily exceed it under heavy load.
+
+The agent-backed qualification generates three 16 MiB WAL segments per second, matching the fastest warning cadence observed in production. It continues until PostgreSQL records the production profile's WAL-requested checkpoint, then proves that checkpoint occurs outside the 30-second `checkpoint_warning` window and that Postgres emits no frequency warning.
+
+Override either numeric value in `service.codefly.yaml` when a smaller workload needs a smaller budget:
+
+```yaml
+wal-budget:
+  max-size-mb: 2048
+  checkpoint-timeout-seconds: 600
+```
+
+`max-size-mb` must be at least 80. `checkpoint-timeout-seconds` must be between 30 and 86400. Omitted or zero values select the defaults. For local Docker and Nix, the agent inspects the persistent filesystem immediately before database startup and requires the WAL budget to fit both the currently available space and 40% of total capacity. This allows larger budgets on larger stores while rejecting a default budget on a near-full store. Kubernetes keeps its managed 10 GiB claim, so render-time validation caps its WAL budget at 4096 MiB; an init container checks the mounted claim's live capacity and available space before Postgres starts. The agent reports the effective values in the `effective postgres WAL budget` lifecycle event.
+
+When `docker-image` is overridden, the image must preserve the official PostgreSQL entrypoint contract and accept `postgres` plus server arguments. The agent deliberately owns that command so the WAL settings are effective from first startup; images whose custom `CMD` is an independent wrapper are outside this interface. Official-derived extension images such as `postgis/postgis:17-3.5` retain the required contract.
+
 ## External-identity mode
 
 Set `auth-mode: external-identity` for managed cloud Postgres with password authentication disabled. Login principals are created out-of-band by the cloud identity provider (Entra ID / Cloud SQL IAM); the service generates, requires, and exports no passwords. The deploy build promotes no credential `secretKeyRef`s, and the exported `owner-connection`, `read-only-connection`, and `read-write-connection` strings are passwordless DSNs (`postgresql://<principal>@host/db`) that carry the principal but no secret.

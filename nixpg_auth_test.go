@@ -13,7 +13,7 @@ import (
 )
 
 func TestNewNixPostgresRejectsEmptyPasswordBeforeProvisioning(t *testing.T) {
-	if _, err := newNixPostgres(context.Background(), t.TempDir(), 5432, "postgres", "", "postgres", "", nil); err == nil {
+	if _, err := newNixPostgres(context.Background(), t.TempDir(), 5432, "postgres", "", "postgres", "", postgresWALBudget{}, nil); err == nil {
 		t.Fatal("native postgres accepted an empty password")
 	}
 }

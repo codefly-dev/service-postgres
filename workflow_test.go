@@ -40,6 +40,10 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 
 	unitTests := findWorkflowStep(t, workflow.Jobs["image"], "Run unit tests")
 	require.Empty(t, unitTests.If)
+	qualification := findWorkflowStep(t, workflow.Jobs["image"], "Qualify sustained WAL budget")
+	require.Empty(t, qualification.If)
+	require.Contains(t, qualification.Run, "-run '^TestSustainedWALBudgetDocker$'")
+	require.Contains(t, qualification.Run, "-count=1")
 
 	smoke := findWorkflowStep(t, workflow.Jobs["image"], "Smoke test runtime image")
 	require.Contains(t, smoke.Run, "--read-only")
