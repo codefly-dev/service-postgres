@@ -30,6 +30,46 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: validate-wal-storage
+          image: {{ .Deployment.Parameters.ManagedImage }}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              set -- $(df -Pk /var/lib/postgresql/data | awk 'NR == 2 { print $2, $4 }')
+              total_kb="$1"
+              available_kb="$2"
+              wal_kb=$(({{ .Deployment.Parameters.WALBudgetMaxSizeMB }} * 1024))
+              storage_safe_kb=$((total_kb * {{ .Deployment.Parameters.WALStoragePercent }} / 100))
+              if [ "$wal_kb" -gt "$storage_safe_kb" ]; then
+                echo "wal-budget.max-size-mb exceeds {{ .Deployment.Parameters.WALStoragePercent }}% of mounted storage capacity" >&2
+                exit 1
+              fi
+              if [ "$wal_kb" -gt "$available_kb" ]; then
+                echo "wal-budget.max-size-mb exceeds currently available mounted storage" >&2
+                exit 1
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 70
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
       containers:
         - name: postgres
           # Supplied by main.go's managed-image declaration (or the service
@@ -40,6 +80,10 @@ spec:
           # dir is authoritative.
           image: {{ .Deployment.Parameters.ManagedImage }}
           imagePullPolicy: IfNotPresent
+          args:
+{{- range .Deployment.Parameters.PostgresArguments }}
+            - {{ printf "%q" . }}
+{{- end }}
           # Container-level security. Defense-in-depth on top of the
           # pod-level securityContext above. allowPrivilegeEscalation
           # = false stops setuid binaries from gaining root inside
@@ -133,4 +177,4 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 10Gi
+            storage: {{ .Deployment.Parameters.ManagedStorageSizeGiB }}Gi
