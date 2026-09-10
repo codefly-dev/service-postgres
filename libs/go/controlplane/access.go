@@ -208,7 +208,29 @@ func ensureGroupRole(ctx context.Context, tx *sql.Tx, role string) error {
 			return err
 		}
 	}
-	_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`)
+	// Reasserting NOSUPERUSER (even when already false) requires a superuser.
+	// Managed administrators must not need protected attributes just to reconcile
+	// already-safe groups. Only change attributes which actually differ; an
+	// elevated existing group still requires authority to remove those privileges.
+	var login, superuser, createDB, createRole, inherit, replication, bypassRLS bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit, rolreplication, rolbypassrls
+		FROM pg_roles WHERE rolname = $1`, role).Scan(&login, &superuser, &createDB, &createRole, &inherit, &replication, &bypassRLS); err != nil {
+		return err
+	}
+	var changes []string
+	for _, attribute := range []struct {
+		set   bool
+		clear string
+	}{{login, "NOLOGIN"}, {superuser, "NOSUPERUSER"}, {createDB, "NOCREATEDB"}, {createRole, "NOCREATEROLE"}, {inherit, "NOINHERIT"}, {replication, "NOREPLICATION"}, {bypassRLS, "NOBYPASSRLS"}} {
+		if attribute.set {
+			changes = append(changes, attribute.clear)
+		}
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` WITH `+strings.Join(changes, " "))
 	return err
 }
 

@@ -1,0 +1,38 @@
+name: controlplane
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "libs/go/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/qualify-controlplane.py"
+      - ".github/workflows/controlplane.yml"
+  push:
+    branches: [main]
+    paths:
+      - "libs/go/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/qualify-controlplane.py"
+      - ".github/workflows/controlplane.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  restricted-postgres16:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      POSTGRES_TEST_IMAGE: postgres@sha256:fe03a7605299a34ddf5e4f285dff78c3d7190a576b3c6b46f2fcff69f4bffd54
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go vet ./libs/go/controlplane
+      - run: docker pull "$POSTGRES_TEST_IMAGE"
+      - run: python3 scripts/qualify-controlplane.py
