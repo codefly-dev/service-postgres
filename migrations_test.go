@@ -91,6 +91,14 @@ func TestMigrationSources_Resolution(t *testing.T) {
 	}
 }
 
+// mustMkdir creates a bare directory: no migration in it.
+func mustMkdir(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", p, err)
+	}
+}
+
 // mustMigrationDir creates a migrations directory holding one real, correctly
 // named migration, the shape a declared source is required to have.
 func mustMigrationDir(t *testing.T, p string) {
@@ -208,5 +216,39 @@ func mustWrite(t *testing.T, p string, body string) {
 	t.Helper()
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatalf("write %s: %v", p, err)
+	}
+}
+
+// TestCountMigrationsAgreesWithTheSourceDriver keeps schema validation and the
+// migration engine on ONE definition of a migration filename. If the resolver
+// counted fewer files than the driver exposes, a lineage the driver applies
+// perfectly well would be rejected as holding no migration — a .pgsql-only
+// lineage is the case that bites. The corpus is the driver test's, deliberately.
+func TestCountMigrationsAgreesWithTheSourceDriver(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"1_init.up.sql":         "CREATE TABLE one ();",
+		"1_init.down.sql":       "DROP TABLE one;",
+		"2_pending.up.sql":      "CREATE TABLE two ();",
+		"2_pending.down.sql":    "DROP TABLE two;",
+		"3_flavored.up.pgsql":   "CREATE TABLE three ();",
+		"3_flavored.down.pgsql": "DROP TABLE three;",
+		"2_pending.up.sql~":     "CREATE TABLE stale ();",
+		"2_pending.up.sql.bak":  "CREATE TABLE stale ();",
+		"2_pending.up.sql.orig": "CREATE TABLE stale ();",
+		".2_pending.up.sql.swp": "binary",
+		"#2_pending.up.sql#":    "CREATE TABLE stale ();",
+		"README.md":             "not a migration",
+	} {
+		mustWrite(t, filepath.Join(dir, name), body)
+	}
+	mustMkdir(t, filepath.Join(dir, "archive"))
+
+	count, err := countMigrations(dir)
+	if err != nil {
+		t.Fatalf("the resolver rejected a lineage the driver accepts: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("countMigrations = %d, want 3 — every up migration the driver exposes, whatever its extension", count)
 	}
 }

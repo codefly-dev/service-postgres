@@ -63,6 +63,15 @@ const migrationFileNamePattern = `^([0-9]+)_.+\.(up|down)\.[A-Za-z0-9]+$`
 
 var migrationFileName = regexp.MustCompile(migrationFileNamePattern)
 
+// migrationLikeName matches a file that carries a conventional direction AND a
+// plain extension — it claims to be a migration — but that migrationFileName
+// rejects, which leaves only one reason: no leading <version>_. Such a file is
+// never applied and never reported, so it is an authoring mistake rather than a
+// leftover. Editor leftovers cannot match: their extension is what disqualifies
+// them (sql~, sql.bak, sql.orig, sql.swp), and this pattern requires a plain one
+// too. Kept beside migrationFileName so the pair cannot drift apart.
+var migrationLikeName = regexp.MustCompile(`\.(up|down)\.[A-Za-z0-9]+$`)
+
 // migrationFS serves golang-migrate ONE snapshot of the migration files, taken
 // by openSource. Handing over a precomputed listing rather than re-reading the
 // directory keeps the conflict check and the exposed set from disagreeing when a

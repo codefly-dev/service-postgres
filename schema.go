@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/codefly-dev/core/wool"
-	"github.com/golang-migrate/migrate/v4/source"
 )
 
 // migrationTablePrefix names the golang-migrate tracking table of a declared
@@ -192,11 +191,15 @@ func (s *Service) migrationDirectory(name, path string) string {
 	return filepath.Clean(path)
 }
 
-// countMigrations reports how many forward migrations a directory holds and
-// rejects a layout golang-migrate would silently ignore: its source driver skips
-// every file that does not parse as <version>_<title>.<up|down>.sql, so one typo
-// in a filename drops a migration without a trace. Non-SQL files (the scaffolded
-// README) are not migrations and are left alone.
+// countMigrations reports how many forward migrations a directory holds, using
+// the same definition of a migration filename the source driver is built from,
+// so this count cannot disagree with what actually gets applied. Editor
+// leftovers and non-migration files (the scaffolded README) are ignored, exactly
+// as the driver ignores them.
+//
+// A file that claims to be a migration but carries no version is rejected: the
+// driver would drop it silently, which is the whole failure this validation
+// exists to prevent.
 func countMigrations(dir string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -204,16 +207,19 @@ func countMigrations(dir string) (int, error) {
 	}
 	up := 0
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+		if entry.IsDir() {
 			continue
 		}
-		migration, err := source.Parse(entry.Name())
-		if err != nil {
-			return 0, fmt.Errorf(
-				"migration file %s is ignored by the migration engine: name it <version>_<title>.up.sql or <version>_<title>.down.sql",
-				filepath.Join(dir, entry.Name()))
+		match := migrationFileName.FindStringSubmatch(entry.Name())
+		if match == nil {
+			if migrationLikeName.MatchString(entry.Name()) {
+				return 0, fmt.Errorf(
+					"migration file %s is ignored by the migration engine: name it <version>_<title>.up.sql or <version>_<title>.down.sql",
+					filepath.Join(dir, entry.Name()))
+			}
+			continue
 		}
-		if migration.Direction == source.Up {
+		if match[2] == "up" {
 			up++
 		}
 	}

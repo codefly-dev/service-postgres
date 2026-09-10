@@ -377,7 +377,7 @@ func assertStrayMigrationFilesDoNotBlockLineage(
 		defer os.Remove(strayPath)
 	}
 
-	require.NoError(t, runtime.applyMigration(ctx), "startup migrations must ignore editor leftovers")
+	require.NoError(t, applyMigrations(t, ctx, runtime), "startup migrations must ignore editor leftovers")
 
 	// A save that writes a backup emits a change event for that file too. Acting
 	// on it would replay the version it shadows — down then up — and destroy the
@@ -408,7 +408,7 @@ func assertStrayMigrationFilesDoNotBlockLineage(
 	conflictPath := path.Join(migrationDirectory, "2_conflict.up.sql")
 	require.NoError(t, os.WriteFile(conflictPath, []byte("SELECT 1;"), 0o600))
 	defer os.Remove(conflictPath)
-	err = runtime.applyMigration(ctx)
+	err = applyMigrations(t, ctx, runtime)
 	require.ErrorContains(t, err, "2_conflict.up.sql")
 	require.ErrorContains(t, err, "2_replay.up.sql")
 }
