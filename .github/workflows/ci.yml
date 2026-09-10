@@ -6,9 +6,13 @@ on:
   pull_request:
     branches: [ main ]
 
+# A push to main is the only run that moves the shared runtime tag, so it must not
+# be cancelled by the next merge: a cancelled run leaves the tag on the previous
+# digest and nothing retries it until someone pushes again. Pull requests stay
+# cancellable — they move no tag, so a superseded run is pure waste.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -25,6 +29,9 @@ jobs:
       contents: read
       packages: write
     runs-on: ubuntu-latest
+    # Pushes to main queue rather than cancel, so a hung registry read would stall
+    # every later merge until GitHub's six-hour default rather than just itself.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -201,8 +208,18 @@ jobs:
             image --quiet --format table --severity HIGH,CRITICAL \
             --exit-code 1 --input /image.tar
 
+      # The tag string is read from runtime-image.json, so every branch resolves
+      # the same one. A PR build that moved it would race every other PR on that
+      # single tag, and would repoint what releases consume while still unmerged,
+      # with nothing to move it back if the PR is closed. The candidate publish
+      # above keeps the wider guard: it pushes by digest and moves no tag.
+      #
+      # Every step above gates this one, so a commit that relocks the digest and
+      # then fails the scan leaves the tag on the older digest until a later push
+      # to main goes green. That is the point — an image that fails a CRITICAL
+      # scan must not become what a plain `docker pull` of the tag returns.
       - name: Tag verified runtime image
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'push'
         env:
           EXPECTED_DIGEST: ${{ steps.runtime.outputs.digest }}
           RUNTIME_IMAGE: ${{ steps.runtime.outputs.reference }}
