@@ -33,6 +33,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go vet ./libs/go/controlplane
+      - run: go vet ./libs/go ./libs/go/controlplane
       - run: docker pull "$POSTGRES_TEST_IMAGE"
       - run: python3 scripts/qualify-controlplane.py

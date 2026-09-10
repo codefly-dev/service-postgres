@@ -51,6 +51,31 @@ multiple queries. It affects readers only; writers keep their existing isolation
 semantics and application-owned row locking. Failed callbacks roll back as in the
 existing scoped Factory. Without this option, existing read isolation is unchanged.
 
+## Restricted sessions
+
+`WithRestrictedSession("background_jobs")` is an optional policy for `Open` and
+`OpenMaintenance`. It rejects the login or current role if either has direct or
+transitive membership in a named forbidden role, a privileged role (including
+BYPASSRLS, CREATEROLE or CREATEDB), or the current database owner. A missing named
+role fails closed. With no arguments it still checks privileged and owner roles.
+The policy uses read-only catalog queries on every new physical connection and
+every pool checkout, adding a catalog round trip to checkout. A newly forbidden
+connection is discarded before the application transaction begins. Errors do not
+expose the denied role names or credentials.
+
+This does not grant privileges, change RLS, audit table/function grants or replace
+separate process credentials. It cannot fence a concurrent GRANT after checkout;
+operators must drain affected sessions before changing role memberships. PostgreSQL
+object grants, safe search paths and application RLS remain separately qualified.
+Caller-owned pools passed to `NewFactory` or `NewMaintenance` are not rewired by
+this option; their owners must enforce the equivalent connection policy.
+Existing consumers that omit this option retain the same behavior.
+
+The isolated regression below also exercises safe sessions, direct/transitive
+membership denial, privileged/owner denial, permission changes on pooled sessions,
+reconnection after revoke and composition with maintenance validation. It uses
+fixture-only roles and no cloud identities.
+
 ## External-identity role administration
 
 `controlplane.ReconcileRuntimeAccess` is the privileged role-engine boundary for

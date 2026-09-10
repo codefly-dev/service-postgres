@@ -1,4 +1,4 @@
-"""Qualify role reconciliation on a disposable, loopback-only Docker fixture."""
+"""Qualify role reconciliation and session restrictions on an isolated fixture."""
 
 import json
 import os
@@ -72,7 +72,15 @@ def main():
         env["SERVICE_POSTGRES_CONTROLPLANE_TEST_DSN"] = (
             f"postgres://postgres@127.0.0.1:{int(binding['HostPort'])}/postgres"
         )
+        env["SESSION_POLICY_TEST_DSN"] = env["SERVICE_POSTGRES_CONTROLPLANE_TEST_DSN"]
         print(f"Fixture image: {image}", flush=True)
+        subprocess.run(
+            ["go", "test", "-race", "-count=1", "-v", "./libs/go", "-run", "^TestRestrictedSession"],
+            cwd=ROOT,
+            env=env,
+            check=True,
+            timeout=120,
+        )
         subprocess.run(
             [
                 "go",
