@@ -161,6 +161,9 @@ func (s *Runtime) applyMigration(ctx context.Context, sources []migrationSource)
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
+	s.controlPlane.Lock()
+	defer s.controlPlane.Unlock()
+
 	s.Wool.Debug("migrations", wool.Field("sources", len(sources)))
 	for _, src := range sources {
 		if err := s.applySource(ctx, src); err != nil {

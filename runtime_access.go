@@ -240,6 +240,10 @@ func (s *Runtime) ensureRuntimeAccess(ctx context.Context) error {
 	if s.externalIdentity() {
 		return s.Wool.NewError("self-hosted runtime cannot reconcile runtime access in external-identity mode: login principals are provisioned by the cloud identity provider")
 	}
+
+	s.controlPlane.Lock()
+	defer s.controlPlane.Unlock()
+
 	schemas, err := normalizedRuntimeSchemas(s.Settings.RuntimeSchemas)
 	if err != nil {
 		return err

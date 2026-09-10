@@ -81,6 +81,17 @@ type Runtime struct {
 	// separate statements, so two reloads at once would both plan from the same
 	// version.
 	migrationReload sync.Mutex
+
+	// controlPlane serializes this agent's database control-plane mutations:
+	// migration application and runtime-access reconciliation. They reach the
+	// database from unrelated goroutines — the hot-reload watcher runs on its
+	// own goroutine while Init and Start drive the rest from RPC handlers — and
+	// Postgres does not serialize them for us: REVOKE/GRANT ON ALL TABLES
+	// rewrites the pg_class row of every table in the schema, each lineage's
+	// golang-migrate tracking table included, while taking no lock on the table
+	// itself, so it collides with the TRUNCATE golang-migrate uses to record a
+	// version and one side aborts with "tuple concurrently updated".
+	controlPlane sync.Mutex
 }
 
 func NewRuntime() *Runtime {
