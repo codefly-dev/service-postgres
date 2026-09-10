@@ -11,6 +11,13 @@ on:
         required: true
         type: string
 
+# Releases share the runtime tag read from runtime-image.json, so two of them
+# publishing at once can each see the other's digest on it. They queue rather
+# than cancel: cancelling would abandon a half-published release.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -21,6 +28,9 @@ jobs:
       contents: read
       packages: write
     runs-on: ubuntu-latest
+    # The publish step waits on registry propagation, so bound the job rather
+    # than leave a hung read to GitHub's six-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 

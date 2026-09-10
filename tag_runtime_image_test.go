@@ -110,14 +110,30 @@ func TestTagRuntimeImagePublishesEveryTagInOneCreate(t *testing.T) {
 	require.Len(t, calls, 3, "every tag is read back, not just the first")
 }
 
-// The first tag having propagated by the time it is read says nothing about the
-// second, which is read later but lags on its own schedule.
-func TestTagRuntimeImageSpendsTheReadBackBudgetOnEveryTag(t *testing.T) {
+// Every tag is retried, not just the first one.
+func TestTagRuntimeImageRetriesEveryTagNotJustTheFirst(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "docker.log")
 	output, err := runTagRuntimeImage(t, log, registry{failedReads: 2, digest: taggedDigest}, releaseTag, taggedTag)
 
 	require.NoErrorf(t, err, "output: %s", output)
 	require.Len(t, readCalls(t, log), 7, "one create, then three reads of each tag")
+}
+
+// The delay schedule is spent across the tags, not restarted for each: by the
+// time a later tag is first read, the waiting already done for the earlier ones
+// has given it exactly that long to propagate. Restarting per tag would grow
+// the worst case with the tag count while buying nothing.
+func TestTagRuntimeImageSpendsOneScheduleAcrossEveryTag(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "docker.log")
+	output, err := runTagRuntimeImage(t, log,
+		registry{failedReads: 3, digest: taggedDigest, unreadableTag: taggedTag}, releaseTag, taggedTag)
+
+	require.Error(t, err)
+	require.Contains(t, output, taggedTag+" was published but did not resolve to a digest")
+	// Four reads resolve the first tag, spending three delays; the second tag
+	// inherits the cursor and so gets the four that remain, not a fresh seven.
+	require.Len(t, readCalls(t, log), 10,
+		"the second tag must inherit the schedule the first one spent")
 }
 
 func TestTagRuntimeImageNamesTheLaterTagThatNeverResolves(t *testing.T) {
@@ -130,6 +146,17 @@ func TestTagRuntimeImageNamesTheLaterTagThatNeverResolves(t *testing.T) {
 	require.NotContains(t, output, releaseTag+" was published")
 	require.Len(t, readCalls(t, log), readBackBudget+2,
 		"one create, one read of the tag that resolved, then the full budget on the one that did not")
+}
+
+// An empty later tag reached docker as --tag "" because the guard only covered
+// the first argument, leaving the check asymmetric with the loop it guards.
+func TestTagRuntimeImageRefusesAnEmptyLaterTag(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "docker.log")
+	output, err := runTagRuntimeImage(t, log, registry{digest: taggedDigest}, releaseTag, "")
+
+	require.Error(t, err)
+	require.Contains(t, output, "tag arguments must not be empty")
+	require.NoFileExists(t, log, "nothing may be published once an argument is rejected")
 }
 
 func TestTagRuntimeImageRefusesToPublishNothing(t *testing.T) {

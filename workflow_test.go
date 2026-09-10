@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,13 +14,20 @@ import (
 
 type workflowDefinition struct {
 	Permissions map[string]string      `yaml:"permissions"`
+	Concurrency workflowConcurrency    `yaml:"concurrency"`
 	Jobs        map[string]workflowJob `yaml:"jobs"`
 }
 
+type workflowConcurrency struct {
+	Group            string `yaml:"group"`
+	CancelInProgress bool   `yaml:"cancel-in-progress"`
+}
+
 type workflowJob struct {
-	Permissions map[string]string `yaml:"permissions"`
-	Steps       []workflowStep    `yaml:"steps"`
-	Uses        string            `yaml:"uses"`
+	Permissions    map[string]string `yaml:"permissions"`
+	TimeoutMinutes int               `yaml:"timeout-minutes"`
+	Steps          []workflowStep    `yaml:"steps"`
+	Uses           string            `yaml:"uses"`
 }
 
 type workflowStep struct {
@@ -142,10 +152,15 @@ func TestReleaseWorkflowRetagsLockedImageWithLeastPrivilege(t *testing.T) {
 	publish := findWorkflowStep(t, imageJob, "Publish release image tags")
 	require.NotContains(t, publish.Run, "docker buildx imagetools",
 		"the release must not read a tag back on its own")
-	require.Contains(t, publish.Run, "export EXPECTED_DIGEST RUNTIME_IMAGE")
-	require.Contains(t, publish.Run,
-		`.github/scripts/tag-runtime-image.sh "$name:$RELEASE_TAG" "$name:$tag"`)
-	require.Equal(t, map[string]string{"RELEASE_TAG": "${{ github.ref_name }}"}, publish.Env)
+	require.Equal(t, "${{ github.ref_name }}", publish.Env["RELEASE_TAG"])
+
+	// Two releases publishing at once each see the other's digest on the shared
+	// runtime tag, and the read-back retry holds that window open for minutes.
+	require.Equal(t, "${{ github.workflow }}", workflow.Concurrency.Group)
+	require.False(t, workflow.Concurrency.CancelInProgress,
+		"cancelling would abandon a half-published release")
+	require.NotZero(t, imageJob.TimeoutMinutes,
+		"a hung registry read must not run to GitHub's six-hour default")
 	buildx := findWorkflowAction(t, imageJob, "docker/setup-buildx-action")
 	require.Equal(t,
 		"image=moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec",
@@ -219,4 +234,46 @@ func findWorkflowAction(t *testing.T, job workflowJob, action string) workflowSt
 	}
 	t.Fatalf("workflow action %q not found", action)
 	return workflowStep{}
+}
+
+// releaser.yml's image job only runs on a v* tag push, so nothing else exercises
+// this step before a real release. Running its own shell against a fake registry
+// covers the wiring the string assertions cannot: that the tags it derives from
+// the lock are the ones published, that a lagging read is retried rather than
+// fatal, and that the script is invoked the way the step actually invokes it.
+func TestReleaseStepPublishesBothLockedTagsPastALaggingRead(t *testing.T) {
+	var lock struct {
+		Name   string `json:"name"`
+		Tag    string `json:"tag"`
+		Digest string `json:"digest"`
+	}
+	content, err := os.ReadFile("runtime-image.json")
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(content, &lock))
+
+	imageJob := readWorkflow(t, ".github/workflows/releaser.yml").Jobs["image"]
+	publish := findWorkflowStep(t, imageJob, "Publish release image tags")
+	log := filepath.Join(t.TempDir(), "docker.log")
+	command := exec.Command("bash", "-c", publish.Run)
+	command.Env = append(os.Environ(),
+		"PATH="+fakeDocker(t)+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"DOCKER_LOG="+log,
+		"DOCKER_FAILED_READS=1",
+		"DOCKER_STALE_READS=0",
+		"DOCKER_STALE_DIGEST="+staleDigest,
+		"DOCKER_DIGEST="+lock.Digest,
+		"DOCKER_UNREADABLE_TAG=",
+		"RELEASE_TAG=v0.0.130",
+	)
+	output, err := command.CombinedOutput()
+
+	require.NoErrorf(t, err, "output: %s", output)
+	calls := readCalls(t, log)
+	require.Equal(t,
+		"buildx imagetools create --tag "+lock.Name+":v0.0.130 --tag "+lock.Name+":"+lock.Tag+
+			" "+lock.Name+"@"+lock.Digest+" ",
+		calls[0],
+		"the release publishes exactly the two references the lock describes",
+	)
+	require.Len(t, calls, 5, "one create, then each tag read past its 404")
 }

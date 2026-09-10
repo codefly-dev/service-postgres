@@ -12,12 +12,13 @@ readonly PROPAGATION_DELAYS=(2 4 8 16 30 30 30)
 # six-hour default, once per attempt.
 readonly READ_TIMEOUT=60
 
-# Every tag gets its own budget: one tag having propagated says nothing about
-# the next, which was published by the same call but is read afterwards.
+# One create publishes every tag, so they share one propagation clock and spend
+# one schedule between them. A tag first read after the earlier ones have waited
+# has already had that long to propagate, so restarting the schedule per tag
+# would buy nothing and would grow the worst case with the tag count.
 verify_tag() {
   local tag=$1
   local tagged_digest=""
-  local attempt=0
   while :; do
     # The fallback keeps a failed read from aborting the script under errexit
     # before the diagnosis below can run.
@@ -56,10 +57,12 @@ fi
 
 tag_flags=()
 for tag in "$@"; do
+  : "${tag:?tag arguments must not be empty}"
   tag_flags+=(--tag "$tag")
 done
 docker buildx imagetools create "${tag_flags[@]}" "$RUNTIME_IMAGE"
 
+attempt=0
 for tag in "$@"; do
   verify_tag "$tag"
 done
