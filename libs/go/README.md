@@ -50,3 +50,45 @@ identities must be provisioned by the platform when that isolation is required.
 multiple queries. It affects readers only; writers keep their existing isolation
 semantics and application-owned row locking. Failed callbacks roll back as in the
 existing scoped Factory. Without this option, existing read isolation is unchanged.
+
+## External-identity role administration
+
+`controlplane.ReconcileRuntimeAccess` is the privileged role-engine boundary for
+managed database compositions. Callers own the transaction and per-database
+advisory lock, and must roll back on any error. Identity providers create login
+principals; the engine never sets their passwords. It creates and hardens NOLOGIN
+groups and reconciles runtime grants and external membership separately.
+
+Group hardening changes only attributes that differ from the required safe
+values. PostgreSQL requires elevated authority for protected `ALTER ROLE`
+attributes even if their current value already matches. Avoiding those redundant
+updates allows a CREATEROLE administrator to reconcile ordinary groups; it does
+not authorize that administrator to repair an elevated role. Existing unsafe
+attributes are still hardened when authorized, or cause the transaction to fail.
+See [PostgreSQL's ALTER ROLE permission rules](https://www.postgresql.org/docs/16/sql-alterrole.html).
+
+The administrator also needs ownership/grant authority over the selected
+database, schema, existing objects and migration owner's default privileges.
+On PostgreSQL 16, role administration requires the appropriate ADMIN OPTION;
+the regression checks that the creator's administration-only membership remains
+available over repeated reconciliation. Login IAM alone supplies none of these
+SQL privileges. Exact managed-provider administration must be qualified separately.
+Keep the reconciliation identity stable. Switching the grantor can encounter
+dependent membership grants on PostgreSQL 16; this change does not implement
+administrator rotation, cascade revocation or privilege reassignment.
+
+Run the isolated regression with a locally available, digest-pinned official
+PostgreSQL fixture (the workflow pins the tested image):
+
+```sh
+POSTGRES_TEST_IMAGE=postgres@sha256:fe03a7605299a34ddf5e4f285dff78c3d7190a576b3c6b46f2fcff69f4bffd54 \
+  python3 scripts/qualify-controlplane.py
+```
+
+The harness binds a disposable, trust-authenticated container to a random
+loopback port, uses temporary storage and removes only that container on exit.
+It loads no cloud credentials and accepts no managed endpoint. The dedicated
+`controlplaneintegration` tag fails if this fixture is missing. Tests cover
+restricted-admin replay and membership replacement, existing/default table and
+sequence grants, runtime DDL denial, preserved external passwords/unrelated
+memberships, rollback, elevated-role rejection and authorized hardening.
