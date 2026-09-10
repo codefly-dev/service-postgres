@@ -27,6 +27,7 @@ func TestBootstrapImageAlwaysReconcilesRuntimeAccess(t *testing.T) {
 			parameters := DockerTemplating{
 				MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 				WithMigration:                test.withMigrations,
+				ReadinessTimeoutSeconds:      300,
 				ReadOnlyRole:                 "codefly_app_ro",
 				ReadWriteRole:                "codefly_app_rw",
 				Schemas:                      []string{"public", "audit"},
@@ -38,11 +39,18 @@ func TestBootstrapImageAlwaysReconcilesRuntimeAccess(t *testing.T) {
 			if !strings.Contains(dockerfile, "psql \"${"+migrationConnectionEnvironmentKey+"}\"") {
 				t.Fatal("bootstrap image does not always reconcile runtime roles")
 			}
-			if !strings.Contains(
-				dockerfile,
-				"until pg_isready -d \"${"+migrationConnectionEnvironmentKey+"}\" >/dev/null 2>&1; do sleep 2; done",
-			) {
+			if !strings.Contains(dockerfile, "pg_isready -q -d \"${"+migrationConnectionEnvironmentKey+"}\"") {
 				t.Fatal("bootstrap image does not wait for Postgres readiness")
+			}
+			for _, required := range []string{
+				"readiness_deadline=$(($(date +%s) + 300))",
+				"did not accept connections within 300s",
+				"exit 1",
+				"exit 78",
+			} {
+				if !strings.Contains(dockerfile, required) {
+					t.Fatalf("bootstrap readiness wait is not bounded: missing %q", required)
+				}
 			}
 			for _, required := range []string{
 				"ARG TARGETARCH",
@@ -95,6 +103,7 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 	root := t.TempDir()
 	parameters := DockerTemplating{
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
+		ReadinessTimeoutSeconds:      defaultBootstrapReadinessSeconds,
 	}
 	if err := os.WriteFile(
 		filepath.Join(root, "Dockerfile"),

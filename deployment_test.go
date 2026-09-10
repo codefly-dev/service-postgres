@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,18 +19,21 @@ import (
 
 func TestDeploymentTemplatesWithMigration(t *testing.T) {
 	dir := agenttesting.AssertKustomizeTemplates(t, deploymentFS, DeploymentTemplateParameters{
-		WithBootstrap:    true,
-		ManagedImage:     image.FullName(),
-		BootstrapJobName: "postgres-aaaaaaaaaaaa",
+		WithBootstrap:               true,
+		ManagedImage:                image.FullName(),
+		BootstrapJobName:            "postgres-aaaaaaaaaaaa",
+		BootstrapJobDeadlineSeconds: 240,
 	})
 	assertMigrationResource(t, dir, true)
 	assertEphemeralSecret(t, dir)
+	assertBootstrapJobDeadline(t, dir, 240)
 }
 
 func TestDeploymentTemplatesWithoutBootstrap(t *testing.T) {
 	dir := agenttesting.AssertKustomizeTemplates(t, deploymentFS, DeploymentTemplateParameters{
-		ManagedImage:     image.FullName(),
-		BootstrapJobName: "postgres-aaaaaaaaaaaa",
+		ManagedImage:                image.FullName(),
+		BootstrapJobName:            "postgres-aaaaaaaaaaaa",
+		BootstrapJobDeadlineSeconds: 240,
 	})
 	assertMigrationResource(t, dir, false)
 }
@@ -160,6 +164,35 @@ func TestEphemeralDeploymentRetainsValueBasedConfigurationAndSecret(t *testing.T
 	job := readDeploymentFile(t, destination, "base", "job.yaml")
 	require.Contains(t, job, "registry.example.com/module/postgres")
 	require.Regexp(t, `^postgres-[0-9a-f]{12}$`, bootstrapJobResourceName(t, job))
+	// A service that configures no budget still deploys a Job bounded in
+	// elapsed time.
+	require.Contains(t, job, fmt.Sprintf("activeDeadlineSeconds: %d", defaultBootstrapJobSeconds))
+}
+
+// assertBootstrapJobDeadline pins the elapsed-time bound on the Job itself.
+// backoffLimit counts failed pods and cannot stop a container that is still
+// running, so it is not a substitute.
+func assertBootstrapJobDeadline(t *testing.T, dir string, expected int) {
+	t.Helper()
+	content := readDeploymentFile(t, dir, "base", "job.yaml")
+	var job struct {
+		Spec struct {
+			ActiveDeadlineSeconds *int `yaml:"activeDeadlineSeconds"`
+			BackoffLimit          *int `yaml:"backoffLimit"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(content), &job); err != nil {
+		t.Fatal(err)
+	}
+	if job.Spec.ActiveDeadlineSeconds == nil {
+		t.Fatalf("bootstrap Job has no activeDeadlineSeconds:\n%s", content)
+	}
+	if *job.Spec.ActiveDeadlineSeconds != expected {
+		t.Fatalf("activeDeadlineSeconds = %d, want %d", *job.Spec.ActiveDeadlineSeconds, expected)
+	}
+	if job.Spec.BackoffLimit == nil {
+		t.Fatalf("bootstrap Job lost its backoffLimit:\n%s", content)
+	}
 }
 
 func assertMigrationResource(t *testing.T, dir string, expected bool) {

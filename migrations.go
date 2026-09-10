@@ -224,26 +224,38 @@ func (s *Runtime) applyMigration(ctx context.Context) error {
 }
 
 // applySource brings ONE migration lineage up to date against the shared db,
-// using that source's dedicated tracking table. Retries the driver handshake a
-// few times (the pool may still be warming up); a dirty lineage fails closed.
+// using that source's dedicated tracking table. Retries the driver handshake
+// (the pool may still be warming up); a dirty lineage fails closed.
+//
+// The handshake takes golang-migrate's advisory lock, so a peer already
+// migrating this lineage is exactly the wait the lock budget bounds. The
+// retries share that one budget rather than each getting their own: three
+// attempts against a lock held by someone else would otherwise wait three
+// times as long as the configured lock budget.
 func (s *Runtime) applySource(ctx context.Context, src migrationSource) error {
-	maxRetry := 3
+	budget := s.Settings.Timeouts.migrationLock()
+	deadline, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
 	var lastErr error
-	for range maxRetry {
-		handle, err := s.openMigration(ctx, src)
-		if err != nil {
-			lastErr = err
-			select {
-			case <-ctx.Done():
-				return errors.Join(lastErr, ctx.Err())
-			case <-time.After(time.Second):
-			}
-			continue
+	for {
+		handle, err := s.openMigration(deadline, src)
+		if err == nil {
+			return errors.Join(s.runUp(handle.migration, src), handle.Close())
 		}
-		return errors.Join(s.runUp(handle.migration, src), handle.Close())
+		lastErr = err
+		select {
+		case <-deadline.Done():
+			return s.Wool.Wrapf(errors.Join(lastErr, deadline.Err()),
+				"cannot prepare migration for source %q within %s", src.label(), budget)
+		case <-time.After(migrationOpenRetryInterval):
+		}
 	}
-	return s.Wool.Wrapf(lastErr, "cannot prepare migration for source %q after %d attempts", src.label(), maxRetry)
 }
+
+// migrationOpenRetryInterval paces the driver-handshake retries; how many of
+// them happen is whatever the lock budget affords.
+const migrationOpenRetryInterval = time.Second
 
 // migrationHandle owns every resource golang-migrate opens for one migration
 // lineage. The postgres driver reserves a dedicated *sql.Conn; closing only the
@@ -294,9 +306,21 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 			wrapMigrationCloseError("SQL pool after connection failure", pool.Close()),
 		)
 	}
+	if err = s.boundMigrationSession(ctx, conn); err != nil {
+		return nil, errors.Join(
+			err,
+			wrapMigrationCloseError("database connection after budget failure", conn.Close()),
+			wrapMigrationCloseError("SQL pool after budget failure", pool.Close()),
+		)
+	}
 	driver, err := postgres.WithConnection(ctx, conn, &postgres.Config{
 		DatabaseName:    s.Settings.DatabaseName,
 		MigrationsTable: src.table, // "" → schema_migrations (default)
+		// The driver's own statement budget is a client-side deadline. Give it
+		// a grace period over the server-side one so the backend wins the race
+		// and reports "canceling statement due to statement timeout" instead of
+		// a bare context deadline.
+		StatementTimeout: s.Settings.Timeouts.migrationStatement() + migrationStatementGrace,
 	})
 	if err != nil {
 		return nil, errors.Join(
@@ -323,6 +347,35 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 	}
 	return &migrationHandle{migration: migration, pool: pool}, nil
 }
+
+// boundMigrationSession puts the lock and statement budgets on the connection
+// golang-migrate is about to take ownership of. They have to be server-side
+// GUCs: the driver acquires its advisory lock, reads and writes the version
+// row, and drops tables under context.Background(), so no caller context ever
+// reaches those statements. lock_timeout bounds the advisory-lock wait, and
+// statement_timeout bounds every statement including that wait.
+func (s *Runtime) boundMigrationSession(ctx context.Context, conn *sql.Conn) error {
+	budgets := []struct {
+		setting string
+		budget  time.Duration
+	}{
+		{setting: "lock_timeout", budget: s.Settings.Timeouts.migrationLock()},
+		{setting: "statement_timeout", budget: s.Settings.Timeouts.migrationStatement()},
+	}
+	for _, b := range budgets {
+		// Neither GUC can be parameterized; both values are whole seconds from
+		// validated settings, rendered as integer milliseconds.
+		statement := fmt.Sprintf("SET %s = %d", b.setting, b.budget.Milliseconds())
+		if _, err := conn.ExecContext(ctx, statement); err != nil {
+			return s.Wool.Wrapf(err, "cannot bound migration %s", b.setting)
+		}
+	}
+	return nil
+}
+
+// migrationStatementGrace separates the driver's client-side statement deadline
+// from the server-side statement_timeout carrying the same budget.
+const migrationStatementGrace = 15 * time.Second
 
 // runUp brings one lineage up to date. A dirty ledger fails closed: golang-migrate's
 // Drop deletes every base table in the schema — including the other services sharing

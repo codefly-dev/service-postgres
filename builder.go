@@ -107,6 +107,7 @@ type DockerTemplating struct {
 	MigrationConnectionKeyHolder string
 	WithMigration                bool
 	MigrationFileNamePattern     string // rendered so the image prunes exactly what the runtime filter hides
+	ReadinessTimeoutSeconds      int
 	ReadOnlyRole                 string
 	ReadWriteRole                string
 	Schemas                      []string
@@ -151,10 +152,14 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	if err != nil {
 		return s.Builder.BuildError(err)
 	}
+	if err = s.Settings.Timeouts.validate(); err != nil {
+		return s.Builder.BuildError(err)
+	}
 	docker := DockerTemplating{
 		MigrationConnectionKeyHolder: fmt.Sprintf("{%s}", migrationConnectionEnvironmentKey),
 		WithMigration:                s.WithMigration(),
 		MigrationFileNamePattern:     migrationFileNamePattern,
+		ReadinessTimeoutSeconds:      s.Settings.Timeouts.BootstrapReadinessSeconds(),
 		ReadOnlyRole:                 readOnlyRole,
 		ReadWriteRole:                readWriteRole,
 		Schemas:                      schemas,
@@ -293,10 +298,14 @@ func copyTree(ctx context.Context, from, to string) error {
 func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) (*builderv0.DeploymentResponse, error) {
 	defer s.Wool.Catch()
 
+	if err := s.Settings.Timeouts.validate(); err != nil {
+		return s.Builder.DeployError(err)
+	}
 	parameters := &DeploymentTemplateParameters{
-		WithBootstrap: true,
-		ManagedImage:  s.dockerImage().FullName(),
-		DatabaseName:  s.DatabaseName,
+		WithBootstrap:               true,
+		ManagedImage:                s.dockerImage().FullName(),
+		DatabaseName:                s.DatabaseName,
+		BootstrapJobDeadlineSeconds: s.Settings.Timeouts.BootstrapJobSeconds(),
 	}
 	var restrictedConfiguration *v0.Configuration
 	response, err := s.Builder.DeployKustomize(ctx, req, services.KustomizeDeployment{
@@ -564,6 +573,7 @@ func (s *Builder) Communicate(stream builderv0.Builder_CommunicateServer) error 
 
 // all: so the scaffolded .gitignore (a dotfile go:embed skips by default) is
 // carried into the factory tree and rendered into new services.
+//
 //go:embed all:templates/factory
 var factoryFS embed.FS
 

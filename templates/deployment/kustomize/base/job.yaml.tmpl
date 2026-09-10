@@ -7,6 +7,9 @@ metadata:
     codefly.dev/bootstrap-service: {{ .Service.Name.DNSCase }}
 spec:
   backoffLimit: 4
+  # backoffLimit counts failed pods; it cannot stop a container that is still
+  # running, so the elapsed-time bound has to be its own field.
+  activeDeadlineSeconds: {{ .Deployment.Parameters.BootstrapJobDeadlineSeconds }}
   template:
     metadata:
       labels:
