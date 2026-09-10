@@ -72,6 +72,16 @@ Set `auth-mode: external-identity` for managed cloud Postgres with password auth
 
 Consumers acquire a short-lived token at connect time rather than reading a password from the DSN. The primary path is in-process token acquisition with `azidentity` wired into pgx's `BeforeConnect` hook, which sets the per-connection password to a freshly minted token (see `module-saas-starter#154`). The passwordless DSN supplies the host, database, and principal; the token supplies the credential.
 
+**Bootstrap build limitation:** external-identity deployment metadata is supported,
+but bootstrap image/recipe generation is currently rejected in this mode. The
+existing generated runtime-access program rewrites password-authenticated login
+roles, which is incompatible with cloud-managed identities. Rejection occurs
+before staged output is changed or Docker runs. Do not switch to password mode
+or patch the emitted SQL to get a managed deployment through this gate; a
+primitive-owned external-identity bootstrap must integrate the canonical managed
+role contract first. The shared schema-plan packaging does not itself establish
+that compatibility.
+
 For tenant isolation, application migrations must enable row-level security and define policies against transaction-local tenant/user settings. Go services should use the service-owned library at `github.com/codefly-dev/service-postgres/libs/go`, which resolves an authenticated principal from context, issues separate read-only/read-write stores without exposing raw pools, and provides tenant-scoped transaction advisory locks without exposing tenant identity to repository code.
 
 ## Operation budgets
