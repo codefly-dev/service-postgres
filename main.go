@@ -48,6 +48,14 @@ type Settings struct {
 	WithoutSSL  bool `yaml:"without-ssl"`  // Default to SSL
 	NoMigration bool `yaml:"no-migration"` // Developer only
 
+	// KeepRunning makes Stop leave this service's postgres running so the next
+	// invocation reuses the warm server instead of paying for a cold start.
+	// Off by default: Stop releases the postmaster (nix) or the container
+	// (docker) and retains the data either way, so warm reuse is something a
+	// workspace asks for by name rather than something one backend does
+	// silently. Destroy still tears the server down.
+	KeepRunning bool `yaml:"keep-running"`
+
 	// LogLevel controls postgres server log verbosity. When set, the
 	// agent passes `-c log_min_messages=<lvl>` plus a handful of
 	// quietening knobs to suppress per-statement / per-connection
