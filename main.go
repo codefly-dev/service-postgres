@@ -19,6 +19,7 @@ import (
 	runnersbase "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/core/templates"
+	"github.com/codefly-dev/core/wool"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -292,6 +293,23 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 	readOnlyConnection := postgresConnectionString(instance.Address, s.DatabaseName, readOnlyRole, s.readOnlyPassword, withSSL, passwordless)
 	readWriteConnection := postgresConnectionString(instance.Address, s.DatabaseName, readWriteRole, s.readWritePassword, withSSL, passwordless)
 
+	// With runtime-read-write-roles configured, the managed read-write principal
+	// holds no table privileges of its own: ReconcileRuntimeAccess revokes them and
+	// grants only membership of the application role, and the principal is
+	// NOINHERIT — so its write authority is reachable solely by selecting that role
+	// on the session. Hand the credential out already selecting it (a `role`
+	// startup parameter), otherwise every consumer that uses the secret as-is
+	// fails its first query with "permission denied" (#94).
+	runtimeRoles, err := normalizedRuntimeReadWriteRoles(s.RuntimeReadWriteRoles, readOnlyRole, readWriteRole)
+	if err != nil {
+		return nil, s.Wool.Wrapf(err, "invalid runtime read-write roles")
+	}
+	if role := selectedRuntimeReadWriteRole(runtimeRoles); role != "" {
+		readWriteConnection = withSelectedRole(readWriteConnection, role)
+	} else if len(runtimeRoles) > 1 {
+		s.Wool.Warn("several runtime read-write roles are configured; the read-write connection selects none — consumers must SET ROLE", wool.Field("roles", runtimeRoles))
+	}
+
 	outputConf := &basev0.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
@@ -347,6 +365,37 @@ func postgresConnectionString(address, database, user, password string, withSSL,
 		RawQuery: query.Encode(),
 	}
 	return connection.String()
+}
+
+// selectedRuntimeReadWriteRole is the application role the read-write connection
+// selects on the session: the configured runtime read-write role when there is
+// exactly one. With several, no single choice is right for every consumer, so
+// none is selected and consumers SET ROLE themselves.
+func selectedRuntimeReadWriteRole(roles []string) string {
+	if len(roles) == 1 {
+		return roles[0]
+	}
+	return ""
+}
+
+// withSelectedRole appends the libpq `options` startup parameter that makes the
+// session run as role — `options=-c role=<role>` — to a connection string,
+// keeping its existing query. The space is percent-encoded rather than `+`:
+// libpq takes `+` in a URI query literally, while pgx and libpq both decode
+// `%20`, so this form works for every consumer. role has already passed
+// validSQLIdentifier, so it needs no quoting.
+func withSelectedRole(connection, role string) string {
+	parsed, err := url.Parse(connection)
+	if err != nil {
+		return connection
+	}
+	option := strings.ReplaceAll(url.QueryEscape("-c role="+role), "+", "%20")
+	if parsed.RawQuery == "" {
+		parsed.RawQuery = "options=" + option
+	} else {
+		parsed.RawQuery += "&options=" + option
+	}
+	return parsed.String()
 }
 
 func main() {
