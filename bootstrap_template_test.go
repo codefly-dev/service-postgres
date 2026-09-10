@@ -137,6 +137,7 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 		WithMigration:                true,
 		MigrationFileNamePattern:     migrationFileNamePattern,
+		ReadinessTimeoutSeconds:      defaultBootstrapReadinessSeconds,
 	}
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", parameters)
 	// One definition of a migration filename: a prune that drifts from the
@@ -270,7 +271,9 @@ func startBootstrapPostgres(t *testing.T) string {
 		t.Fatalf("start disposable postgres: %v\n%s", err, output)
 	}
 	for range 60 {
-		if exec.Command("docker", "exec", name, "pg_isready", "--username", "postgres").Run() == nil {
+		// The bootstrap connects over TCP; the initialization server can accept
+		// Unix-socket connections before the final TCP listener is available.
+		if exec.Command("docker", "exec", name, "pg_isready", "--host", "127.0.0.1", "--username", "postgres").Run() == nil {
 			return name
 		}
 		time.Sleep(time.Second)

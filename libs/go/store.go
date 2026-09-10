@@ -152,6 +152,7 @@ type config struct {
 	tenantSetting       string
 	userSetting         string
 	operationTimeout    time.Duration
+	readIsolation       pgx.TxIsoLevel
 	accessTokenProvider AccessTokenProvider
 }
 
@@ -244,7 +245,7 @@ func (f *Factory) Reader(ctx context.Context) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Reader{beginner: f.reader, scope: scope, operationTimeout: f.config.operationTimeout}, nil
+	return &Reader{beginner: f.reader, scope: scope, operationTimeout: f.config.operationTimeout, isolation: f.config.readIsolation}, nil
 }
 
 // Writer resolves the authenticated principal and requires an explicit
@@ -314,8 +315,10 @@ func (f *Factory) principal(ctx context.Context) (Principal, transactionScope, e
 	}, nil
 }
 
-// Reader is an authenticated, principal-bound read capability.
+// Reader is a transaction-scoped read capability, bound to an authenticated
+// principal by Factory or to an explicit service-owned Maintenance capability.
 type Reader struct {
+	isolation        pgx.TxIsoLevel
 	beginner         transactionBeginner
 	scope            transactionScope
 	operationTimeout time.Duration
@@ -327,7 +330,7 @@ func (r *Reader) InTransaction(ctx context.Context, fn func(context.Context, Rea
 	if fn == nil {
 		return errors.New("read transaction callback is required")
 	}
-	return runTransaction(ctx, r.beginner, r.scope, r.operationTimeout, pgx.ReadOnly, func(ctx context.Context, tx transaction) error {
+	return runTransaction(ctx, r.beginner, r.scope, r.operationTimeout, pgx.ReadOnly, r.isolation, func(ctx context.Context, tx transaction) error {
 		return fn(ctx, readTx{tx: tx})
 	})
 }
@@ -345,7 +348,7 @@ func (w *Writer) InTransaction(ctx context.Context, fn func(context.Context, Wri
 	if fn == nil {
 		return errors.New("write transaction callback is required")
 	}
-	return runTransaction(ctx, w.beginner, w.scope, w.operationTimeout, pgx.ReadWrite, func(ctx context.Context, tx transaction) error {
+	return runTransaction(ctx, w.beginner, w.scope, w.operationTimeout, pgx.ReadWrite, "", func(ctx context.Context, tx transaction) error {
 		return fn(ctx, writeTx{tx: tx, tenantSetting: w.scope.tenantSetting})
 	})
 }
@@ -463,6 +466,7 @@ func runTransaction(
 	scope transactionScope,
 	operationTimeout time.Duration,
 	accessMode pgx.TxAccessMode,
+	isolation pgx.TxIsoLevel,
 	callback func(context.Context, transaction) error,
 ) error {
 	if ctx == nil {
@@ -473,7 +477,7 @@ func runTransaction(
 		ctx, cancel = context.WithTimeout(ctx, operationTimeout)
 		defer cancel()
 	}
-	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{AccessMode: accessMode})
+	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{AccessMode: accessMode, IsoLevel: isolation})
 	if err != nil {
 		return fmt.Errorf("begin scoped Postgres transaction: %w", err)
 	}
