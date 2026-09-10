@@ -201,8 +201,13 @@ jobs:
             image --quiet --format table --severity HIGH,CRITICAL \
             --exit-code 1 --input /image.tar
 
+      # The tag string is read from runtime-image.json, so every branch resolves
+      # the same one. A PR build that moved it would race every other PR on that
+      # single tag, and would repoint what releases consume while still unmerged,
+      # with nothing to move it back if the PR is closed. The candidate publish
+      # above keeps the wider guard: it pushes by digest and moves no tag.
       - name: Tag verified runtime image
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name == 'push'
         env:
           EXPECTED_DIGEST: ${{ steps.runtime.outputs.digest }}
           RUNTIME_IMAGE: ${{ steps.runtime.outputs.reference }}

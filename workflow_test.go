@@ -131,6 +131,24 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	)
 }
 
+// The runtime tag string is read from runtime-image.json, so every branch
+// resolves the same one and the ref-keyed concurrency group does not serialize
+// branches against each other. Only a push may move it: a PR build that did
+// would race every other PR on that single tag, and would repoint what releases
+// consume before merging. The candidate publish keeps the wider guard — it
+// pushes by digest, moves no tag, and the verification below it needs that push
+// for a same-repo PR that relocks the digest.
+func TestCIWorkflowMovesTheSharedRuntimeTagOnlyOnPush(t *testing.T) {
+	imageJob := readWorkflow(t, ".github/workflows/ci.yml").Jobs["image"]
+
+	tag := findWorkflowStep(t, imageJob, "Tag verified runtime image")
+	require.Equal(t, "github.event_name == 'push'", tag.If)
+
+	candidate := findWorkflowStep(t, imageJob, "Publish runtime image candidate")
+	require.Contains(t, candidate.If,
+		"github.event.pull_request.head.repo.full_name == github.repository")
+}
+
 func TestReleaseWorkflowRetagsLockedImageWithLeastPrivilege(t *testing.T) {
 	workflow := readWorkflow(t, ".github/workflows/releaser.yml")
 	require.Equal(t, map[string]string{"contents": "read"}, workflow.Permissions)
