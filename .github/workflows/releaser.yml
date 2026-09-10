@@ -62,6 +62,13 @@ jobs:
     permissions:
       contents: read
     uses: codefly-dev/core/.github/workflows/go-service-release.yml@f16e045805dbd213cdbebf98d5f7cbe802496d7c
+    with:
+      # The bootstrap-image tests build linux/arm64 and refuse to run without
+      # emulation registered ("CI must register emulation"). ci.yml gets it from
+      # docker/setup-qemu-action; the shared release workflow has no such step,
+      # so every release failed at `release / test` and goreleaser never ran (#104).
+      # binfmt registration is the same thing setup-qemu-action does.
+      setup-run: docker run --privileged --rm tonistiigi/binfmt --install arm64
     secrets: inherit
 
   backfill:
