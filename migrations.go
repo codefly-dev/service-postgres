@@ -49,14 +49,14 @@ func (m migrationSource) fileURL() string {
 	return u.String()
 }
 
-// defaultMigrationsTable mirrors the postgres driver default applied when
-// postgres.Config.MigrationsTable is empty.
-const defaultMigrationsTable = "schema_migrations"
+// dirtyRecoveryRunbook is the manual reconciliation procedure a dirty-lineage
+// error points the operator at.
+const dirtyRecoveryRunbook = "docs/dirty-migrations.md"
 
 // trackingTable is the golang-migrate version table this lineage records into.
 func (m migrationSource) trackingTable() string {
 	if m.table == "" {
-		return defaultMigrationsTable
+		return postgres.DefaultMigrationsTable
 	}
 	return m.table
 }
@@ -246,29 +246,6 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 	return &migrationHandle{migration: migration, pool: pool}, nil
 }
 
-// DirtyMigrationError reports one migration lineage left in golang-migrate's
-// dirty state by an interrupted run. It carries the lineage identity and the
-// version the ledger is stuck on, and it unwraps to migrate.ErrDirty so callers
-// can still classify the failure with errors.As.
-type DirtyMigrationError struct {
-	Source  string
-	Table   string
-	Version int
-	Dirty   migrate.ErrDirty
-}
-
-func (e *DirtyMigrationError) Error() string {
-	return fmt.Sprintf(
-		"migration lineage %q is dirty at version %d (tracking table %s): an earlier migration run was interrupted, "+
-			"so the schema no longer matches the ledger. Automatic recovery is disabled because a dirty marker does not say "+
-			"what happened — the SQL may have committed before the marker was cleared, the migration may span several "+
-			"transactions, or the interrupted operation may have been a downgrade. Inspect, back up, and reconcile the lineage "+
-			"by hand; see docs/dirty-migrations.md",
-		e.Source, e.Version, e.Table)
-}
-
-func (e *DirtyMigrationError) Unwrap() error { return e.Dirty }
-
 // runUp brings one lineage up to date. A dirty ledger fails closed: golang-migrate's
 // Drop deletes every base table in the schema — including the other services sharing
 // this database — and forcing version-1 assumes both that the interrupted migration
@@ -286,12 +263,13 @@ func (s *Runtime) runUp(m *migrate.Migrate, src migrationSource) error {
 			wool.Field("source", src.label()),
 			wool.Field("tracking_table", src.trackingTable()),
 			wool.Field("dirty_version", dirty.Version))
-		return &DirtyMigrationError{
-			Source:  src.label(),
-			Table:   src.trackingTable(),
-			Version: dirty.Version,
-			Dirty:   dirty,
-		}
+		// Wrap rather than replace: this keeps errors.As(err, &migrate.ErrDirty{})
+		// working for callers that classify the failure. The ambiguity of a dirty
+		// marker, and the reconciliation steps, live in the runbook.
+		return s.Wool.Wrapf(err,
+			"migration lineage %q is dirty at version %d (tracking table %s); an interrupted run left the schema "+
+				"out of step with the ledger and automatic recovery cannot be done safely — reconcile it by hand, see %s",
+			src.label(), dirty.Version, src.trackingTable(), dirtyRecoveryRunbook)
 	}
 	return s.Wool.Wrapf(err, "can't apply migration")
 }

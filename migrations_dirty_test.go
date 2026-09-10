@@ -17,11 +17,39 @@ import (
 	dockerrun "github.com/codefly-dev/core/runners/dockerrun"
 	migrationtest "github.com/codefly-dev/service-postgres/libs/go/migrationtest"
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
 const disposableOwnerPassword = "dirty-migration-owner"
+
+// testRuntimeImageEnv names the postgres image the real-infrastructure tests run
+// against. CI sets it to the image built from this repo's Dockerfile, so the
+// regression needs no registry access. Setting it ALSO makes the prerequisite
+// mandatory: a run that declares an image must never report success by skipping.
+const testRuntimeImageEnv = "SERVICE_POSTGRES_TEST_IMAGE"
+
+func testRuntimeImage(t *testing.T) *resources.DockerImage {
+	t.Helper()
+	override := strings.TrimSpace(os.Getenv(testRuntimeImageEnv))
+	if override == "" {
+		return image
+	}
+	parsed := resources.NewDockerImage(override)
+	require.NotNil(t, parsed, "%s=%q is not a name:tag reference", testRuntimeImageEnv, override)
+	return parsed
+}
+
+// dockerDaemonUnavailable reports whether err is the runner's "no usable docker
+// daemon" diagnostic. Every other construction failure — a missing image, a
+// registry rejection, a rate limit — is a real failure: reporting it as a missing
+// prerequisite would silently stop enforcing this regression while CI stays green.
+func dockerDaemonUnavailable(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "not reachable") ||
+		strings.Contains(message, "cannot create docker client")
+}
 
 // disposableServer is a throwaway postgres instance shared by the dirty-state
 // acceptance tests. Every test case runs against its own database created and
@@ -46,9 +74,13 @@ func startDisposablePostgres(t *testing.T) *disposableServer {
 	ctx = runtime.Wool.Inject(ctx)
 
 	port := freeTCPPort(t)
-	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, image, fmt.Sprintf("dirty-migration-%d", time.Now().UnixNano()))
+	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, testRuntimeImage(t), fmt.Sprintf("dirty-migration-%d", time.Now().UnixNano()))
 	if err != nil {
-		t.Skipf("real postgres prerequisite unavailable: %v", err)
+		mandatory := os.Getenv(testRuntimeImageEnv) != ""
+		if mandatory || !dockerDaemonUnavailable(err) {
+			require.NoError(t, err, "real postgres prerequisite must be available, not skipped")
+		}
+		t.Skipf("no docker daemon on this host: %v", err)
 	}
 	runner.WithEphemeral()
 	runner.WithPortMapping(ctx, port, 5432)
@@ -56,7 +88,8 @@ func startDisposablePostgres(t *testing.T) *disposableServer {
 		resources.Env("POSTGRES_USER", "postgres"),
 		resources.Env("POSTGRES_PASSWORD", disposableOwnerPassword),
 		resources.Env("POSTGRES_DB", "postgres"))
-	require.NoError(t, runner.Init(ctx))
+	// Registered BEFORE Init: Init is what creates the container, so a failure
+	// part-way through it would otherwise leave the container behind untracked.
 	t.Cleanup(func() {
 		// Removal uses a fixed client-side timeout that a loaded docker daemon can
 		// exceed after the whole suite's containers. The environment is ephemeral,
@@ -66,6 +99,7 @@ func startDisposablePostgres(t *testing.T) *disposableServer {
 			t.Logf("disposable postgres shutdown: %v", err)
 		}
 	})
+	require.NoError(t, runner.Init(ctx))
 
 	server := &disposableServer{address: fmt.Sprintf("localhost:%d", port)}
 	control := waitForControlPlane(t, ctx, server.dsn("postgres"))
@@ -170,19 +204,15 @@ func countRows(t *testing.T, db *sql.DB, table string) int {
 	return count
 }
 
-// requireDirty asserts the failure is the fail-closed dirty report: it names the
-// lineage, its tracking table and the stuck version, still classifies as
-// migrate.ErrDirty for callers, and never leaks the owner password.
+// requireDirty asserts the failure is the fail-closed dirty report: it still
+// classifies as migrate.ErrDirty for callers, names the lineage, its tracking
+// table, the stuck version and the runbook, and never leaks the owner password.
 func requireDirty(t *testing.T, err error, source, table string, version int) {
 	t.Helper()
 	require.Error(t, err)
 
-	var reported *DirtyMigrationError
-	require.True(t, errors.As(err, &reported), "expected a DirtyMigrationError, got %v", err)
-	require.Equal(t, source, reported.Source)
-	require.Equal(t, table, reported.Table)
-	require.Equal(t, version, reported.Version)
-
+	// The wrap must not cost callers their ability to classify the failure, and
+	// the version it reports must be the version the ledger is actually stuck on.
 	var dirty migrate.ErrDirty
 	require.True(t, errors.As(err, &dirty), "dirty classification must survive wrapping: %v", err)
 	require.Equal(t, version, dirty.Version)
@@ -190,6 +220,7 @@ func requireDirty(t *testing.T, err error, source, table string, version int) {
 	require.Contains(t, err.Error(), source)
 	require.Contains(t, err.Error(), table)
 	require.Contains(t, err.Error(), fmt.Sprintf("%d", version))
+	require.Contains(t, err.Error(), dirtyRecoveryRunbook, "the error must point the operator at the runbook")
 	require.NotContains(t, err.Error(), disposableOwnerPassword)
 }
 
@@ -230,7 +261,7 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		require.Equal(t, 1, countRows(t, database.DB, "lineage_a"))
 		require.False(t, relationPresent(t, database.DB, "lineage_b"), "the dirty lineage must not be applied")
 
-		version, dirty := readLedger(t, database.DB, defaultMigrationsTable)
+		version, dirty := readLedger(t, database.DB, postgres.DefaultMigrationsTable)
 		require.Equal(t, int64(1), version)
 		require.False(t, dirty, "the clean lineage's ledger must be untouched")
 
@@ -256,14 +287,14 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		runtime := migrationRuntime(t, server, database.Name, root)
 		require.NoError(t, runtime.applyMigration(ctx))
 
-		markLedgerDirty(t, database.DB, defaultMigrationsTable, 5)
-		requireDirty(t, runtime.applyMigration(ctx), "store", defaultMigrationsTable, 5)
+		markLedgerDirty(t, database.DB, postgres.DefaultMigrationsTable, 5)
+		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, 5)
 
 		for version := 1; version <= 5; version++ {
 			require.True(t, relationPresent(t, database.DB, fmt.Sprintf("step_%d", version)),
 				"no already-applied migration may be dropped")
 		}
-		version, dirty := readLedger(t, database.DB, defaultMigrationsTable)
+		version, dirty := readLedger(t, database.DB, postgres.DefaultMigrationsTable)
 		require.Equal(t, int64(5), version, "the version pointer must not be rewritten")
 		require.True(t, dirty)
 	})
@@ -283,12 +314,12 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		require.NoError(t, runtime.applyMigration(ctx))
 		require.True(t, relationPresent(t, database.DB, "stamped_second"))
 
-		markLedgerDirty(t, database.DB, defaultMigrationsTable, second)
-		requireDirty(t, runtime.applyMigration(ctx), "store", defaultMigrationsTable, int(second))
+		markLedgerDirty(t, database.DB, postgres.DefaultMigrationsTable, second)
+		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, int(second))
 
 		require.True(t, relationPresent(t, database.DB, "stamped_first"))
 		require.True(t, relationPresent(t, database.DB, "stamped_second"))
-		version, dirty := readLedger(t, database.DB, defaultMigrationsTable)
+		version, dirty := readLedger(t, database.DB, postgres.DefaultMigrationsTable)
 		require.Equal(t, second, version)
 		require.True(t, dirty)
 	})
@@ -306,14 +337,14 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 
 		_, err := database.DB.ExecContext(ctx, `CREATE TABLE committed_effect (id int PRIMARY KEY); INSERT INTO committed_effect VALUES (7);`)
 		require.NoError(t, err)
-		markLedgerDirty(t, database.DB, defaultMigrationsTable, 1)
+		markLedgerDirty(t, database.DB, postgres.DefaultMigrationsTable, 1)
 
 		runtime := migrationRuntime(t, server, database.Name, root)
-		requireDirty(t, runtime.applyMigration(ctx), "store", defaultMigrationsTable, 1)
+		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, 1)
 
 		require.True(t, relationPresent(t, database.DB, "committed_effect"))
 		require.Equal(t, 1, countRows(t, database.DB, "committed_effect"), "the committed migration must not be replayed")
-		version, dirty := readLedger(t, database.DB, defaultMigrationsTable)
+		version, dirty := readLedger(t, database.DB, postgres.DefaultMigrationsTable)
 		require.Equal(t, int64(1), version)
 		require.True(t, dirty)
 	})
@@ -334,11 +365,11 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		var dirty migrate.ErrDirty
 		require.False(t, errors.As(err, &dirty), "an SQL error is not a dirty-state report: %v", err)
 
-		requireDirty(t, runtime.applyMigration(ctx), "store", defaultMigrationsTable, 2)
+		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, 2)
 
 		require.True(t, relationPresent(t, database.DB, "kept"))
 		require.Equal(t, 1, countRows(t, database.DB, "kept"))
-		version, isDirty := readLedger(t, database.DB, defaultMigrationsTable)
+		version, isDirty := readLedger(t, database.DB, postgres.DefaultMigrationsTable)
 		require.Equal(t, int64(2), version)
 		require.True(t, isDirty)
 	})
@@ -376,11 +407,11 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 
 		own := newLineage(t, root, "store")
 		own.write(t, 1, "a", `CREATE TABLE init_lineage (id int PRIMARY KEY);`, `DROP TABLE init_lineage;`)
-		markLedgerDirty(t, database.DB, defaultMigrationsTable, 1)
+		markLedgerDirty(t, database.DB, postgres.DefaultMigrationsTable, 1)
 
 		runtime := migrationRuntime(t, server, database.Name, root)
 		err := runtime.migrateOnInit(ctx)
-		requireDirty(t, err, "store", defaultMigrationsTable, 1)
+		requireDirty(t, err, "store", postgres.DefaultMigrationsTable, 1)
 
 		response, initErr := runtime.Runtime.InitError(err)
 		require.NoError(t, initErr)
@@ -405,40 +436,61 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		require.True(t, relationPresent(t, database.DB, "clean_b"))
 
 		require.NoError(t, runtime.applyMigration(ctx), "an already-current database must succeed")
-		version, dirty := readLedger(t, database.DB, defaultMigrationsTable)
+		version, dirty := readLedger(t, database.DB, postgres.DefaultMigrationsTable)
 		require.Equal(t, int64(1), version)
 		require.False(t, dirty)
 	})
 }
 
-// TestRunUpNeverRecoversAutomatically locks the source-level property the audit
-// asked for: the startup migration path contains no Drop, Force or Steps call.
-func TestRunUpNeverRecoversAutomatically(t *testing.T) {
+// TestStartupPathHasNoAutomaticRecovery locks the source-level property the audit
+// asked for. It scans the WHOLE file rather than runUp's body, so moving a Drop or
+// Force into a helper reached from startup cannot slip past it; the hot-reload
+// path (updateMigration) is the one place these calls are still expected.
+func TestStartupPathHasNoAutomaticRecovery(t *testing.T) {
 	body, err := os.ReadFile("migrations.go")
 	require.NoError(t, err)
 	source := string(body)
 
-	start := strings.Index(source, "func (s *Runtime) runUp(")
-	require.NotEqual(t, -1, start)
-	end := strings.Index(source[start:], "\nfunc ")
-	require.NotEqual(t, -1, end)
-	runUp := source[start : start+end]
+	hotReload := functionBody(t, source, "func (s *Runtime) updateMigration(")
+	require.Contains(t, hotReload, "m.Force(", "sanity: updateMigration is the expected home of Force")
 
-	for _, forbidden := range []string{"m.Drop()", "m.Force(", "m.Down()", "m.Steps("} {
-		require.NotContains(t, runUp, forbidden, "runUp must not recover automatically from a dirty lineage")
+	startup := strings.Replace(source, hotReload, "", 1)
+	require.NotEqual(t, source, startup, "hot-reload body must have been excluded")
+
+	for _, forbidden := range []string{"m.Drop()", ".Force(", ".Steps(", "m.Down()"} {
+		require.NotContains(t, startup, forbidden,
+			"the startup migration path must not recover automatically from a dirty lineage")
 	}
 }
 
-// TestDirtyMigrationErrorNamesTheRecoveryRunbook keeps the actionable error and
-// the runbook it points at in step.
-func TestDirtyMigrationErrorNamesTheRecoveryRunbook(t *testing.T) {
-	err := &DirtyMigrationError{Source: "billing", Table: "schema_migrations_billing", Version: 7}
-	require.Contains(t, err.Error(), `"billing"`)
-	require.Contains(t, err.Error(), "schema_migrations_billing")
-	require.Contains(t, err.Error(), "version 7")
+// functionBody returns the source text of the function whose declaration starts
+// with prefix, from its declaration to the next top-level declaration or EOF.
+func functionBody(t *testing.T, source, prefix string) string {
+	t.Helper()
+	start := strings.Index(source, prefix)
+	require.NotEqual(t, -1, start, "cannot find %q", prefix)
+	rest := source[start+len(prefix):]
+	end := strings.Index(rest, "\nfunc ")
+	if end == -1 {
+		return source[start:]
+	}
+	return source[start : start+len(prefix)+end]
+}
 
-	const runbook = "docs/dirty-migrations.md"
-	require.Contains(t, err.Error(), runbook)
-	_, statErr := os.Stat(runbook)
-	require.NoError(t, statErr, "the error must point at a runbook that exists")
+// TestDirtyRecoveryRunbookExists keeps the pointer in the dirty-lineage error and
+// the document it names in step with each other.
+func TestDirtyRecoveryRunbookExists(t *testing.T) {
+	_, err := os.Stat(dirtyRecoveryRunbook)
+	require.NoError(t, err, "the dirty-lineage error must point at a runbook that exists")
+
+	body, err := os.ReadFile(dirtyRecoveryRunbook)
+	require.NoError(t, err)
+	runbook := string(body)
+
+	// The audited case is a lineage dirty at its FIRST migration, where there is
+	// no earlier version to reconcile against. The runbook must cover it.
+	require.Contains(t, runbook, "DELETE FROM schema_migrations",
+		"the runbook must tell the operator how to reconcile a lineage dirty at its first migration")
+	require.Contains(t, runbook, "destroys every lineage in the database",
+		"the reset recipe must warn that it takes every co-tenant lineage with it")
 }

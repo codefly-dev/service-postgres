@@ -69,7 +69,7 @@ the agent.
 4. **Decide whether it actually applied.** Compare the file against the live
    schema — `\d+ <table>`, `information_schema.columns`,
    `SELECT indexname FROM pg_indexes`, and row counts for any data migration.
-   The three outcomes are:
+   The possible outcomes are:
 
    - **Fully applied.** The schema already matches the migration. Clear the
      marker without re-running anything:
@@ -78,9 +78,10 @@ the agent.
      UPDATE schema_migrations_billing SET dirty = false WHERE version = 7;
      ```
 
-   - **Not applied at all.** No object or row from the file is present.
-     Point the ledger at the previous version *that exists in this lineage* —
-     read it off the directory listing, do not assume `version - 1`:
+   - **Not applied at all, and an earlier version exists.** No object or row
+     from the file is present. Point the ledger at the previous version *that
+     exists in this lineage* — read it off the directory listing, do not assume
+     `version - 1`:
 
      ```sql
      UPDATE schema_migrations_billing SET version = 6, dirty = false;
@@ -88,9 +89,20 @@ the agent.
 
      The next startup re-applies version 7 onward.
 
+   - **Not applied at all, and it is the lineage's FIRST migration.** There is
+     no earlier version to point at, and there is no "version 0" — do not
+     invent one, because a version number you make up is a version the ledger
+     will report as applied. The correct "nothing applied" state is an *empty*
+     table: the driver reports an empty tracking table as the nil version and
+     the next startup applies the lineage from its first migration.
+
+     ```sql
+     DELETE FROM schema_migrations_billing;
+     ```
+
    - **Partially applied.** Finish or undo the remainder by hand in one
-     transaction, so the schema matches exactly one of the two states above,
-     then apply the matching ledger update.
+     transaction, so the schema matches either "fully applied" or "not applied
+     at all", then apply that case's ledger update.
 
 5. **If the interrupted run was a downgrade,** the target is the version the
    operator was moving *to*, not `version - 1`. Reconcile against that
@@ -108,6 +120,14 @@ sandbox or a CI job — drop and recreate it explicitly, outside the agent:
 ```sh
 dropdb --force app && createdb app
 ```
+
+> **This destroys every lineage in the database, not just the dirty one.** A
+> database with `migration-sources` configured is shared: dropping it deletes
+> the other services' tables, rows, and migration ledgers as well — the exact
+> blast radius the fail-closed behaviour above exists to prevent. Confirm that
+> *every* service sharing this database can afford to lose its data before
+> running it, and never run it against a database you did not create yourself
+> for this purpose.
 
 For tests, `libs/go/migrationtest` creates and drops uniquely named throwaway
 databases rather than mutating an existing one.
