@@ -48,12 +48,16 @@ type Settings struct {
 	WithoutSSL  bool `yaml:"without-ssl"`  // Default to SSL
 	NoMigration bool `yaml:"no-migration"` // Developer only
 
-	// KeepRunning makes Stop leave this service's postgres running so the next
-	// invocation reuses the warm server instead of paying for a cold start.
-	// Off by default: Stop releases the postmaster (nix) or the container
-	// (docker) and retains the data either way, so warm reuse is something a
-	// workspace asks for by name rather than something one backend does
-	// silently. Destroy still tears the server down.
+	// KeepRunning makes Stop leave this service's postgres container running so
+	// the next invocation reuses the warm server instead of paying for a cold
+	// start. Off by default: Stop otherwise releases the postmaster (nix) or the
+	// container (docker) and retains the data either way, so warm reuse is
+	// something a workspace asks for by name rather than something one backend
+	// does silently. Destroy still tears the server down.
+	//
+	// Docker only. The nix runtime cannot reattach to a running postmaster, so
+	// it stops anyway (warning as it does) rather than leave one that would make
+	// the next Init fail on a locked data directory.
 	KeepRunning bool `yaml:"keep-running"`
 
 	// LogLevel controls postgres server log verbosity. When set, the

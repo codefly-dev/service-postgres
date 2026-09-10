@@ -184,20 +184,34 @@ func assertLifecycleContract(t *testing.T, runtimeContext *basev0.RuntimeContext
 	fixture := newPostgresFixture(t, ctx, runtimeContext)
 
 	runtime, _ := fixture.start(t, ctx)
+	// Positive control. requireNoListener treats every dial error as proof the
+	// port was released, so it passes vacuously against an address that was
+	// never reachable — and the sentinel assertions would not notice, because
+	// they connect through a separately derived connection string.
+	requireListener(t, fixture.address)
 	const sentinel = "00000000-0000-0000-0000-0000000000aa"
 	writeSentinel(t, ctx, runtime.connection, fixture.serviceName, sentinel)
 	retained := runtime.retainedDataPath
 	require.NotEmpty(t, retained, "init must record where the database state lives")
 
+	// keep-running is the one row of the contract that is backend-specific: only
+	// docker can reattach to a live server, so nix must refuse to leave one
+	// rather than hand the next Init a locked data directory.
 	runtime.Settings.KeepRunning = true
 	kept, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
 	require.NoError(t, err)
 	require.Equal(t, runtimev0.StopStatus_SUCCESS, kept.GetStatus().GetState(), kept.GetStatus().GetMessage())
-	require.Contains(t, kept.GetStatus().GetMessage(), "kept postgres running")
-	require.True(t,
-		hasSentinel(t, ctx, runtime.connection, fixture.serviceName, sentinel),
-		"keep-running must leave a healthy, reusable server behind",
-	)
+	if runtimeContext.Kind == resources.RuntimeContextNix {
+		require.Contains(t, kept.GetStatus().GetMessage(), "stopped native postgres")
+		requireNoListener(t, fixture.address)
+		require.True(t, runtime.released, "a nix stop must release even when keep-running is set")
+	} else {
+		require.Contains(t, kept.GetStatus().GetMessage(), "kept postgres running")
+		require.True(t,
+			hasSentinel(t, ctx, runtime.connection, fixture.serviceName, sentinel),
+			"keep-running must leave a healthy, reusable server behind",
+		)
+	}
 
 	runtime.Settings.KeepRunning = false
 	stopped, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
@@ -250,7 +264,54 @@ func TestStopOwnsNothingWithoutInit(t *testing.T) {
 	require.Equal(t, "no postgres owned by this invocation; database state retained", stopped.GetStatus().GetMessage())
 }
 
-// TestStopAfterFailedInitOwnsNothing covers the other half: an Init that fails
+// TestKeepRunningIsRefusedOnNix pins the one row of the contract that is
+// backend-specific. The nix runtime always launches a NEW postmaster and
+// deliberately leaves a live owner's lock file alone, so a postmaster retained
+// by keep-running makes the next Init start a second one against the same data
+// directory and port — which postgres refuses. Stopping is the only answer
+// there, and the data is retained either way.
+func TestKeepRunningIsRefusedOnNix(t *testing.T) {
+	runtime := NewRuntime()
+	runtime.Runtime.WithContext(resources.NewRuntimeContextNix())
+	runtime.Settings.KeepRunning = true
+
+	stopped, err := runtime.Stop(context.Background(), &runtimev0.StopRequest{})
+	require.NoError(t, err)
+	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.NotContains(t, stopped.GetStatus().GetMessage(), "kept postgres running",
+		"nix cannot reattach to a live postmaster, so keep-running must not retain one")
+}
+
+// TestKeepRunningIsHonouredOnDocker is the other side of that gate: the
+// container backend does reattach by name, so the setting still means what it
+// says there.
+func TestKeepRunningIsHonouredOnDocker(t *testing.T) {
+	runtime := NewRuntime()
+	runtime.Runtime.WithContext(resources.NewRuntimeContextContainer())
+	runtime.Settings.KeepRunning = true
+
+	stopped, err := runtime.Stop(context.Background(), &runtimev0.StopRequest{})
+	require.NoError(t, err)
+	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Contains(t, stopped.GetStatus().GetMessage(), "kept postgres running")
+}
+
+// TestStartAfterStopFailsFast: Start probes the database for ninety seconds
+// before giving up, which is a long way to discover that the server it waits
+// for was deliberately stopped and only Init can bring back.
+func TestStartAfterStopFailsFast(t *testing.T) {
+	runtime := NewRuntime()
+	runtime.released = true
+
+	begun := time.Now()
+	started, err := runtime.Start(context.Background(), &runtimev0.StartRequest{})
+	require.NoError(t, err)
+	require.Equal(t, runtimev0.StartStatus_ERROR, started.GetStatus().GetState())
+	require.Contains(t, started.GetStatus().GetMessage(), "run Init before Start")
+	require.Less(t, time.Since(begun), 5*time.Second, "start must refuse immediately, not probe a stopped server")
+}
+
+// TestStopAfterFailedInitOwnsNothing covers the other half:// TestStopAfterFailedInitOwnsNothing covers the other half: an Init that fails
 // before it starts anything must leave stop bounded — no backend call, no
 // error, nothing released.
 func TestStopAfterFailedInitOwnsNothing(t *testing.T) {
@@ -313,6 +374,15 @@ func hasSentinel(t *testing.T, ctx context.Context, connection, relation, id str
 	require.NoError(t, db.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM `+pq.QuoteIdentifier(relation)+` WHERE id = $1)`, id).Scan(&exists))
 	return exists
+}
+
+// requireListener proves the address under test is genuinely reachable while
+// postgres is up, so requireNoListener's later silence means something.
+func requireListener(t *testing.T, address string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+	require.NoErrorf(t, err, "%s must accept connections while postgres is running", address)
+	require.NoError(t, conn.Close())
 }
 
 // requireNoListener proves the execution resource is gone, not merely asked to
