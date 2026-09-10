@@ -10,15 +10,21 @@ import (
 )
 
 // TestConcurrentControlPlaneStaysConsistent pins the serialization of this
-// agent's database control-plane mutations. Migration application and
-// runtime-access reconciliation reach the database from unrelated goroutines —
-// the hot-reload watcher runs on its own goroutine while Init and Start drive
-// the rest from RPC handlers — and Postgres does not serialize them for us:
-// REVOKE/GRANT ON ALL TABLES rewrites the pg_class row of every table in the
-// schema, each lineage's golang-migrate tracking table included, while taking
-// no lock on the table itself. It therefore collides with the TRUNCATE
-// golang-migrate uses to record a version, and one side aborts with "tuple
-// concurrently updated".
+// agent's database control-plane mutations. The rationale — why Postgres does
+// not serialize these for us — lives once, on Runtime.controlPlane; it is not
+// repeated here.
+//
+// Migration application and runtime-access reconciliation are driven against
+// one database together, which is what reproduces the collision: REVOKE/GRANT
+// ON ALL TABLES rewrites the tracking table's pg_class row while golang-migrate
+// TRUNCATEs it, and one side aborts with "tuple concurrently updated".
+//
+// What this does NOT pin is the in-process acquisition, and that was measured
+// rather than assumed: deleting it leaves this green, because openMigration
+// takes the runtime-access advisory lock inside the database and that alone
+// serializes these two. The in-process lock earns its place elsewhere — it
+// makes extensions, migrations and grants ONE transition (see migrateOnInit),
+// which no single database lock spans.
 //
 // Everything here is the production path against a real, disposable database.
 func TestConcurrentControlPlaneStaysConsistent(t *testing.T) {

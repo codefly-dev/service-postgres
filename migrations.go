@@ -157,12 +157,16 @@ func validSourceName(name string) bool {
 // applyMigration brings every resolved lineage up to date. The sources have
 // already been validated against the declaration, so this only fails on a real
 // migration failure.
+//
+// The caller MUST hold the control plane: this runs inside applySchema, which
+// migrateOnInit and Start already take one acquisition around. controlPlaneLock
+// is NOT reentrant, so acquiring here would deadlock the whole lifecycle
+// against itself. Cross-process exclusion against a concurrent grants run does
+// not depend on that acquisition anyway — openMigration takes the
+// runtime-access advisory lock inside the database.
 func (s *Runtime) applyMigration(ctx context.Context, sources []migrationSource) error {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-
-	s.controlPlane.Lock()
-	defer s.controlPlane.Unlock()
 
 	s.Wool.Debug("migrations", wool.Field("sources", len(sources)))
 	for _, src := range sources {
@@ -215,17 +219,27 @@ const migrationOpenRetryInterval = time.Second
 type migrationHandle struct {
 	migration *migrate.Migrate
 	pool      *sql.DB
+	// conn is the driver's dedicated connection, retained so the control-plane
+	// advisory lock taken on it can be released before it goes back to the pool.
+	conn *sql.Conn
 }
 
 // Close releases the migration source, its dedicated database connection, and
 // the parent pool, preserving every cleanup failure for the caller.
 func (h *migrationHandle) Close() error {
-	if h == nil || h.migration == nil || h.pool == nil {
+	if h == nil || h.migration == nil || h.pool == nil || h.conn == nil {
 		return errors.New("migration handle is incomplete")
 	}
+	// Release the control-plane lock BEFORE the driver closes the connection: a
+	// session advisory lock outlives sql.Conn.Close(), which only returns the
+	// connection to the pool, so a later borrower would inherit the lock and
+	// wedge every other control-plane mutation against this database.
+	_, unlockErr := h.conn.ExecContext(context.Background(),
+		`SELECT pg_advisory_unlock(`+runtimeAccessLockID+`)`)
 	sourceErr, databaseErr := h.migration.Close()
 	poolErr := h.pool.Close()
 	return errors.Join(
+		wrapMigrationCloseError("control-plane advisory lock", unlockErr),
 		wrapMigrationCloseError("source", sourceErr),
 		wrapMigrationCloseError("database connection", databaseErr),
 		wrapMigrationCloseError("SQL pool", poolErr),
@@ -263,6 +277,26 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 			wrapMigrationCloseError("SQL pool after budget failure", pool.Close()),
 		)
 	}
+	// Join the runtime-access lock domain BEFORE golang-migrate touches the
+	// tracking table. golang-migrate's own lock is on a different key, so
+	// without this a GRANT ... ON ALL TABLES from another process — the
+	// bootstrap job's runtime-access.sql, or a second agent — rewrites the
+	// tracking table's pg_class row while this connection TRUNCATEs it, and one
+	// side aborts with "tuple concurrently updated". An aborted migration
+	// leaves the lineage dirty, which runUp fails closed on.
+	//
+	// Taken AFTER boundMigrationSession so the wait inherits that session's
+	// lock_timeout: a peer holding this lock makes the migration fail inside
+	// its budget instead of blocking forever. Session-scoped, so it covers
+	// every statement golang-migrate runs on this handle.
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(`+runtimeAccessLockID+`)`); err != nil {
+		return nil, errors.Join(
+			s.Wool.Wrapf(err, "cannot acquire control-plane lock for migration"),
+			wrapMigrationCloseError("database connection after lock failure", conn.Close()),
+			wrapMigrationCloseError("SQL pool after lock failure", pool.Close()),
+		)
+	}
+
 	driver, err := postgres.WithConnection(ctx, conn, &postgres.Config{
 		DatabaseName:    s.Settings.DatabaseName,
 		MigrationsTable: src.table, // "" → schema_migrations (default)
@@ -295,7 +329,7 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 			wrapMigrationCloseError("SQL pool after migration failure", pool.Close()),
 		)
 	}
-	return &migrationHandle{migration: migration, pool: pool}, nil
+	return &migrationHandle{migration: migration, pool: pool, conn: conn}, nil
 }
 
 // boundMigrationSession puts the lock and statement budgets on the connection

@@ -226,6 +226,20 @@ func validSQLIdentifier(value string) bool {
 	return true
 }
 
+// runtimeAccessLockID is THE advisory-lock identifier every database
+// control-plane mutation takes: this agent's migrations and grants, and the
+// bootstrap job's runtime-access.sql alike. golang-migrate takes its OWN
+// advisory lock in a DIFFERENT key space, which is precisely why a migration's
+// TRUNCATE of the tracking table and a GRANT ... ON ALL TABLES rewriting that
+// table's pg_class row could run concurrently and abort each other with "tuple
+// concurrently updated". Putting both sides on this one key closes that across
+// processes, which a Go mutex cannot do.
+//
+// It is computed from current_database() inside the database rather than from a
+// Go-side name, so the agent and the SQL script cannot drift onto different
+// keys and silently stop excluding each other.
+const runtimeAccessLockID = `hashtext('codefly-runtime-access:' || current_database())`
+
 // ensureRuntimeAccess reconciles the least-privilege runtime credentials
 // exported to dependent services. Both roles are non-owner, non-superuser,
 // NOBYPASSRLS principals.
@@ -233,6 +247,18 @@ func validSQLIdentifier(value string) bool {
 // only in generic mode; delegated mode grants it only explicit SET ROLE
 // memberships. Neither role has schema CREATE or role-management authority.
 func (s *Runtime) ensureRuntimeAccess(ctx context.Context) error {
+	release, err := s.controlPlane.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	return s.ensureRuntimeAccessLocked(ctx)
+}
+
+// ensureRuntimeAccessLocked is ensureRuntimeAccess's body. The caller MUST hold
+// the control plane.
+func (s *Runtime) ensureRuntimeAccessLocked(ctx context.Context) error {
 	// The self-hosted runtime provisions password-authenticated LOGIN roles
 	// (ensureLoginRole). External-identity login principals are created
 	// out-of-band by the cloud identity provider, so running this path would
@@ -240,9 +266,6 @@ func (s *Runtime) ensureRuntimeAccess(ctx context.Context) error {
 	if s.externalIdentity() {
 		return s.Wool.NewError("self-hosted runtime cannot reconcile runtime access in external-identity mode: login principals are provisioned by the cloud identity provider")
 	}
-
-	s.controlPlane.Lock()
-	defer s.controlPlane.Unlock()
 
 	schemas, err := normalizedRuntimeSchemas(s.Settings.RuntimeSchemas)
 	if err != nil {
@@ -278,7 +301,7 @@ func (s *Runtime) ensureRuntimeAccess(ctx context.Context) error {
 
 	// Serializes concurrent reconcilers for the same database while still
 	// allowing unrelated Codefly Postgres services to initialize in parallel.
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "codefly-runtime-access:"+s.DatabaseName); err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(`+runtimeAccessLockID+`)`); err != nil {
 		return s.Wool.Wrapf(err, "cannot lock runtime access reconciliation")
 	}
 	if err := ensureLoginRole(ctx, tx, access.readOnlyRole, s.readOnlyPassword, true); err != nil {

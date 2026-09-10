@@ -49,7 +49,14 @@ RUN find /app/migrations -maxdepth 1 -type f | while read -r file; do \
     done
 {{- end }}
 COPY runtime-access.sql /app/runtime-access.sql
+COPY bootstrap.sql /app/bootstrap.sql
 
+# The bootstrap is ONE psql session over bootstrap.sql: it takes the
+# runtime-access advisory lock, runs `migrate up` as a child process while still
+# holding it, then includes runtime-access.sql for the grants. migrate used to
+# run here as its own process, which left the two steps in different lock
+# domains -- see bootstrap.sql for the collision that allowed between concurrent
+# bootstrap pods.
 CMD set -eu; \
     readiness_deadline=$(($(date +%s) + {{ .ReadinessTimeoutSeconds }})); \
     while :; do \
@@ -66,5 +73,4 @@ CMD set -eu; \
       fi; \
       sleep 2; \
     done; \
-{{ if .WithMigration }}    /usr/local/bin/migrate -path /app/migrations -database "${{.MigrationConnectionKeyHolder}}" up; \
-{{ end }}    psql "${{.MigrationConnectionKeyHolder}}" --no-psqlrc --set=ON_ERROR_STOP=1 --file=/app/runtime-access.sql
+    psql "${{.MigrationConnectionKeyHolder}}" --no-psqlrc --set=ON_ERROR_STOP=1 --file=/app/bootstrap.sql
