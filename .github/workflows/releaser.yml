@@ -41,20 +41,10 @@ jobs:
           set -euo pipefail
           name=$(jq -er '.name' runtime-image.json)
           tag=$(jq -er '.tag' runtime-image.json)
-          digest=$(jq -er '.digest' runtime-image.json)
-          RUNTIME_IMAGE="$name@$digest"
-          docker buildx imagetools create \
-            --tag "$name:$RELEASE_TAG" \
-            --tag "$name:$tag" \
-            "$RUNTIME_IMAGE"
-          for published_tag in "$name:$RELEASE_TAG" "$name:$tag"; do
-            published_digest=$(docker buildx imagetools inspect "$published_tag" |
-              awk '$1 == "Digest:" { print $2; exit }')
-            if [[ "$published_digest" != "$digest" ]]; then
-              echo "$published_tag resolves to $published_digest, want $digest" >&2
-              exit 1
-            fi
-          done
+          EXPECTED_DIGEST=$(jq -er '.digest' runtime-image.json)
+          RUNTIME_IMAGE="$name@$EXPECTED_DIGEST"
+          export EXPECTED_DIGEST RUNTIME_IMAGE
+          .github/scripts/tag-runtime-image.sh "$name:$RELEASE_TAG" "$name:$tag"
 
   release:
     if: github.event_name == 'push'

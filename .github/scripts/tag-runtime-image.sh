@@ -12,9 +12,40 @@ readonly PROPAGATION_DELAYS=(2 4 8 16 30 30 30)
 # six-hour default, once per attempt.
 readonly READ_TIMEOUT=60
 
+# Every tag gets its own budget: one tag having propagated says nothing about
+# the next, which was published by the same call but is read afterwards.
+verify_tag() {
+  local tag=$1
+  local tagged_digest=""
+  local attempt=0
+  while :; do
+    # The fallback keeps a failed read from aborting the script under errexit
+    # before the diagnosis below can run.
+    tagged_digest=$(timeout "$READ_TIMEOUT" docker buildx imagetools inspect "$tag" |
+      awk '$1 == "Digest:" { print $2; exit }') || tagged_digest=""
+    if [[ "$tagged_digest" == "$EXPECTED_DIGEST" ]]; then
+      return 0
+    fi
+    if ((attempt >= ${#PROPAGATION_DELAYS[@]})); then
+      break
+    fi
+    sleep "${PROPAGATION_DELAYS[attempt]}"
+    attempt=$((attempt + 1))
+  done
+
+  if [[ -z "$tagged_digest" ]]; then
+    echo "$tag was published but did not resolve to a digest" >&2
+  else
+    echo "$tag resolves to $tagged_digest, want $EXPECTED_DIGEST" >&2
+  fi
+  return 1
+}
+
 : "${EXPECTED_DIGEST:?EXPECTED_DIGEST is required}"
 : "${RUNTIME_IMAGE:?RUNTIME_IMAGE is required}"
-: "${RUNTIME_TAG:?RUNTIME_TAG is required}"
+# Without this a caller that lost its tag arguments would publish nothing and
+# still exit 0, because the verification below would have nothing to walk.
+: "${1:?at least one tag is required}"
 
 # Checked up front because the read below turns any failure into another
 # retry, which would report a missing timeout as an unresolvable tag.
@@ -23,28 +54,12 @@ if ! command -v timeout >/dev/null; then
   exit 1
 fi
 
-docker buildx imagetools create --tag "$RUNTIME_TAG" "$RUNTIME_IMAGE"
-
-tagged_digest=""
-attempt=0
-while :; do
-  # The fallback keeps a failed read from aborting the script under errexit
-  # before the diagnosis below can run.
-  tagged_digest=$(timeout "$READ_TIMEOUT" docker buildx imagetools inspect "$RUNTIME_TAG" |
-    awk '$1 == "Digest:" { print $2; exit }') || tagged_digest=""
-  if [[ "$tagged_digest" == "$EXPECTED_DIGEST" ]]; then
-    exit 0
-  fi
-  if ((attempt >= ${#PROPAGATION_DELAYS[@]})); then
-    break
-  fi
-  sleep "${PROPAGATION_DELAYS[attempt]}"
-  attempt=$((attempt + 1))
+tag_flags=()
+for tag in "$@"; do
+  tag_flags+=(--tag "$tag")
 done
+docker buildx imagetools create "${tag_flags[@]}" "$RUNTIME_IMAGE"
 
-if [[ -z "$tagged_digest" ]]; then
-  echo "$RUNTIME_TAG was published but did not resolve to a digest" >&2
-else
-  echo "$RUNTIME_TAG resolves to $tagged_digest, want $EXPECTED_DIGEST" >&2
-fi
-exit 1
+for tag in "$@"; do
+  verify_tag "$tag"
+done

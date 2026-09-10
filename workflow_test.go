@@ -107,7 +107,7 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	require.Equal(t, false, candidate.With["sbom"])
 	require.Contains(t, verifyCandidate.Run, `"$ACTUAL_DIGEST" != "$EXPECTED_DIGEST"`)
 	require.Contains(t, scan.Run, `docker save --output /tmp/service-postgres-image.tar "$RUNTIME_IMAGE"`)
-	require.Equal(t, ".github/scripts/tag-runtime-image.sh", strings.TrimSpace(tag.Run))
+	require.Equal(t, `.github/scripts/tag-runtime-image.sh "$RUNTIME_TAG"`, strings.TrimSpace(tag.Run))
 	require.Equal(t, map[string]string{
 		"EXPECTED_DIGEST": "${{ steps.runtime.outputs.digest }}",
 		"RUNTIME_IMAGE":   "${{ steps.runtime.outputs.reference }}",
@@ -136,9 +136,16 @@ func TestReleaseWorkflowRetagsLockedImageWithLeastPrivilege(t *testing.T) {
 	for _, step := range imageJob.Steps {
 		require.NotContains(t, step.Uses, "docker/build-push-action")
 	}
+	// The release publishes two tags and reads both back, which is the same
+	// propagation race the CI step hit, so it has to go through the same
+	// retrying script rather than its own create-then-inspect.
 	publish := findWorkflowStep(t, imageJob, "Publish release image tags")
-	require.Contains(t, publish.Run, `"$RUNTIME_IMAGE"`)
-	require.Contains(t, publish.Run, "docker buildx imagetools create")
+	require.NotContains(t, publish.Run, "docker buildx imagetools",
+		"the release must not read a tag back on its own")
+	require.Contains(t, publish.Run, "export EXPECTED_DIGEST RUNTIME_IMAGE")
+	require.Contains(t, publish.Run,
+		`.github/scripts/tag-runtime-image.sh "$name:$RELEASE_TAG" "$name:$tag"`)
+	require.Equal(t, map[string]string{"RELEASE_TAG": "${{ github.ref_name }}"}, publish.Env)
 	buildx := findWorkflowAction(t, imageJob, "docker/setup-buildx-action")
 	require.Equal(t,
 		"image=moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec",
