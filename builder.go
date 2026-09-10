@@ -106,6 +106,7 @@ func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*
 type DockerTemplating struct {
 	MigrationConnectionKeyHolder string
 	WithMigration                bool
+	MigrationFileNamePattern     string // rendered so the image prunes exactly what the runtime filter hides
 	ReadOnlyRole                 string
 	ReadWriteRole                string
 	Schemas                      []string
@@ -146,6 +147,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	docker := DockerTemplating{
 		MigrationConnectionKeyHolder: fmt.Sprintf("{%s}", migrationConnectionEnvironmentKey),
 		WithMigration:                s.WithMigration(),
+		MigrationFileNamePattern:     migrationFileNamePattern,
 		ReadOnlyRole:                 readOnlyRole,
 		ReadWriteRole:                readWriteRole,
 		Schemas:                      schemas,

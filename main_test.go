@@ -390,6 +390,21 @@ func assertStrayMigrationFilesDoNotBlockLineage(
 	}
 
 	require.NoError(t, runtime.applyMigration(ctx), "startup migrations must ignore editor leftovers")
+
+	// A save that writes a backup emits a change event for that file too. Acting
+	// on it would replay the version it shadows — down then up — and destroy the
+	// rows in the table that migration owns.
+	survivorID := "00000000-0000-0000-0000-000000000010"
+	require.NoError(t, owner.AppendFixture(ctx, relation, survivorID))
+	require.NoError(
+		t,
+		runtime.updateMigration(ctx, path.Join(migrationDirectory, "2_replay.up.sql.bak")),
+		"a change event for a non-migration file must be ignored",
+	)
+	survived, err := owner.HasFixture(ctx, relation, survivorID)
+	require.NoError(t, err)
+	require.True(t, survived, "an editor backup must not trigger a destructive migration replay")
+
 	require.NoError(t, runtime.updateMigration(ctx, migrationUp), "hot reload must ignore editor leftovers")
 	exists, err := owner.RelationExists(ctx, relation)
 	require.NoError(t, err)

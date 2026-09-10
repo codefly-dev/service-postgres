@@ -114,23 +114,28 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 	}
 }
 
-// TestBootstrapImageDropsStrayMigrationFiles proves the deployed bootstrap runs
-// migrate over the same filtered set the local runtime applies: an editor backup
-// that keeps a migration's prefix must not reach the image.
-func TestBootstrapImageDropsStrayMigrationFiles(t *testing.T) {
+// TestBootstrapImageAppliesOnlyRealMigrations drives the deployed bootstrap end
+// to end against a disposable Postgres: the image must prune exactly what the
+// runtime filter hides — nothing more — and then apply every real migration,
+// whatever extension it carries.
+func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Fatal(err)
 	}
-	root := t.TempDir()
 	parameters := DockerTemplating{
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 		WithMigration:                true,
+		MigrationFileNamePattern:     migrationFileNamePattern,
 	}
-	if err := os.WriteFile(
-		filepath.Join(root, "Dockerfile"),
-		[]byte(renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", parameters)),
-		0o644,
-	); err != nil {
+	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", parameters)
+	// One definition of a migration filename: a prune that drifts from the
+	// runtime filter deletes files the runtime would have applied.
+	if !strings.Contains(dockerfile, migrationFileNamePattern) {
+		t.Fatalf("bootstrap prune does not use the runtime filename pattern %q", migrationFileNamePattern)
+	}
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "runtime-access.sql"), []byte("SELECT 1;\n"), 0o644); err != nil {
@@ -140,27 +145,50 @@ func TestBootstrapImageDropsStrayMigrationFiles(t *testing.T) {
 	if err := os.MkdirAll(migrations, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	kept := []string{"1_init.up.sql", "1_init.down.sql", "2_add_index.up.sql", "2_add_index.down.sql"}
-	stray := []string{"2_add_index.up.sql~", "2_add_index.up.sql.bak", "2_add_index.up.sql.orig", ".2_add_index.up.sql.swp"}
-	for _, name := range append(append([]string{}, kept...), stray...) {
-		if err := os.WriteFile(filepath.Join(migrations, name), []byte("SELECT 1;\n"), 0o644); err != nil {
+	// Version 3 deliberately uses a non-.sql extension: golang-migrate applies it,
+	// so pruning it would leave the bootstrap reporting success over an
+	// unmigrated database.
+	kept := map[string]string{
+		"1_init.up.sql":         "CREATE TABLE deployed_one (id INT PRIMARY KEY);",
+		"1_init.down.sql":       "DROP TABLE deployed_one;",
+		"2_add_index.up.sql":    "CREATE INDEX deployed_one_id_idx ON deployed_one (id);",
+		"2_add_index.down.sql":  "DROP INDEX deployed_one_id_idx;",
+		"3_flavored.up.pgsql":   "CREATE TABLE deployed_three (id INT PRIMARY KEY);",
+		"3_flavored.down.pgsql": "DROP TABLE deployed_three;",
+	}
+	stray := []string{
+		"2_add_index.up.sql~",
+		"2_add_index.up.sql.bak",
+		"2_add_index.up.sql.orig",
+		".2_add_index.up.sql.swp",
+		"3_flavored.up.pgsql~",
+	}
+	for name, body := range kept {
+		if err := os.WriteFile(filepath.Join(migrations, name), []byte(body+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range stray {
+		body := "CREATE TABLE stray_must_not_apply (id INT);\n"
+		if err := os.WriteFile(filepath.Join(migrations, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	tag := fmt.Sprintf("service-postgres-bootstrap-stray-test:%d", time.Now().UnixNano())
+	tag := fmt.Sprintf("service-postgres-bootstrap-migrations-test:%d", time.Now().UnixNano())
 	t.Cleanup(func() {
 		_ = exec.Command("docker", "image", "rm", tag).Run()
 	})
 	if output, err := exec.Command("docker", "build", "--tag", tag, root).CombinedOutput(); err != nil {
 		t.Fatalf("bootstrap image build failed: %v\n%s", err, output)
 	}
+
 	output, err := exec.Command("docker", "run", "--rm", tag, "ls", "-A", "/app/migrations").CombinedOutput()
 	if err != nil {
 		t.Fatalf("list packaged migrations: %v\n%s", err, output)
 	}
 	packaged := strings.Fields(string(output))
-	for _, name := range kept {
+	for name := range kept {
 		if !slices.Contains(packaged, name) {
 			t.Errorf("bootstrap image dropped migration %q: %v", name, packaged)
 		}
@@ -170,6 +198,87 @@ func TestBootstrapImageDropsStrayMigrationFiles(t *testing.T) {
 			t.Errorf("bootstrap image packaged stray file %q, which blocks the whole lineage", name)
 		}
 	}
+
+	database := startDisposablePostgres(t)
+	bootstrap := exec.Command(
+		"docker", "run", "--rm",
+		"--network", "container:"+database,
+		"--env", migrationConnectionEnvironmentKey+"=postgres://postgres:bootstrap-test@127.0.0.1:5432/postgres?sslmode=disable",
+		tag,
+	)
+	if output, err := bootstrap.CombinedOutput(); err != nil {
+		t.Fatalf("bootstrap job failed against a real database: %v\n%s", err, output)
+	}
+
+	// psql renders booleans as t/f.
+	for relation, want := range map[string]string{
+		"public.deployed_one":         "t",
+		"public.deployed_three":       "t",
+		"public.stray_must_not_apply": "f",
+	} {
+		got := queryDisposablePostgres(t, database, fmt.Sprintf("SELECT to_regclass('%s') IS NOT NULL", relation))
+		if got != want {
+			t.Errorf("relation %s present = %q, want %q", relation, got, want)
+		}
+	}
+	// Concatenation casts the boolean to text, so dirty reads "false" here.
+	if ledger := queryDisposablePostgres(t, database, "SELECT version || '/' || dirty FROM schema_migrations"); ledger != "3/false" {
+		t.Errorf("migration ledger = %q, want %q", ledger, "3/false")
+	}
+}
+
+// startDisposablePostgres runs the Postgres image this repository already pins
+// for its runtime and returns the container name, ready for connections.
+func startDisposablePostgres(t *testing.T) string {
+	t.Helper()
+	dockerfile, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var image string
+	for _, line := range strings.Split(string(dockerfile), "\n") {
+		if rest, found := strings.CutPrefix(line, "ARG POSTGRES_IMAGE="); found {
+			image = strings.TrimSpace(rest)
+			break
+		}
+	}
+	if image == "" {
+		t.Fatal("no pinned POSTGRES_IMAGE in Dockerfile")
+	}
+
+	name := fmt.Sprintf("service-postgres-bootstrap-db-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_ = exec.Command("docker", "rm", "--force", name).Run()
+	})
+	run := exec.Command(
+		"docker", "run", "--detach", "--name", name,
+		"--env", "POSTGRES_PASSWORD=bootstrap-test",
+		image,
+	)
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("start disposable postgres: %v\n%s", err, output)
+	}
+	for range 60 {
+		if exec.Command("docker", "exec", name, "pg_isready", "--username", "postgres").Run() == nil {
+			return name
+		}
+		time.Sleep(time.Second)
+	}
+	logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
+	t.Fatalf("disposable postgres never became ready\n%s", logs)
+	return ""
+}
+
+func queryDisposablePostgres(t *testing.T, container string, query string) string {
+	t.Helper()
+	output, err := exec.Command(
+		"docker", "exec", container,
+		"psql", "--username", "postgres", "--no-align", "--tuples-only", "--command", query,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("query %q: %v\n%s", query, err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func TestRuntimeAccessTemplateUsesDelegatedRolesAsExclusiveWriteAuthority(t *testing.T) {
