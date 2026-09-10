@@ -49,10 +49,20 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test ./... -skip '^TestCreateToRunDocker$'
+        run: go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker)$'
 
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
+
+      # Real-database regression for the dirty-migration fail-closed path
+      # (codefly-dev/service-postgres#76). Runs against the image just built, so
+      # it needs no registry access; SERVICE_POSTGRES_TEST_IMAGE also makes the
+      # prerequisite mandatory, so a missing docker daemon fails instead of
+      # silently skipping the regression.
+      - name: Migration fail-closed regression
+        env:
+          SERVICE_POSTGRES_TEST_IMAGE: service-postgres:test
+        run: go test . -run '^TestDirtyMigrationFailsClosed$' -timeout 20m
 
       - name: Smoke test runtime image
         shell: bash
@@ -161,6 +171,9 @@ jobs:
             ["linux/amd64", "linux/arm64"]
           ' <<< "$manifest"
           docker --config "$anonymous_docker_config" pull "$RUNTIME_IMAGE"
+
+      - name: Run runtime lifecycle tests
+        run: go test . -run '^TestLifecycleContractDocker$' -count=1
 
       - name: Scan published runtime image
         env:

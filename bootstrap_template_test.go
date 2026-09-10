@@ -199,7 +199,7 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 		}
 	}
 
-	database := startDisposablePostgres(t)
+	database := startBootstrapPostgres(t)
 	bootstrap := exec.Command(
 		"docker", "run", "--rm",
 		"--network", "container:"+database,
@@ -216,20 +216,20 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 		"public.deployed_three":       "t",
 		"public.stray_must_not_apply": "f",
 	} {
-		got := queryDisposablePostgres(t, database, fmt.Sprintf("SELECT to_regclass('%s') IS NOT NULL", relation))
+		got := queryBootstrapPostgres(t, database, fmt.Sprintf("SELECT to_regclass('%s') IS NOT NULL", relation))
 		if got != want {
 			t.Errorf("relation %s present = %q, want %q", relation, got, want)
 		}
 	}
 	// Concatenation casts the boolean to text, so dirty reads "false" here.
-	if ledger := queryDisposablePostgres(t, database, "SELECT version || '/' || dirty FROM schema_migrations"); ledger != "3/false" {
+	if ledger := queryBootstrapPostgres(t, database, "SELECT version || '/' || dirty FROM schema_migrations"); ledger != "3/false" {
 		t.Errorf("migration ledger = %q, want %q", ledger, "3/false")
 	}
 }
 
-// startDisposablePostgres runs the Postgres image this repository already pins
+// startBootstrapPostgres runs the Postgres image this repository already pins
 // for its runtime and returns the container name, ready for connections.
-func startDisposablePostgres(t *testing.T) string {
+func startBootstrapPostgres(t *testing.T) string {
 	t.Helper()
 	dockerfile, err := os.ReadFile("Dockerfile")
 	if err != nil {
@@ -269,7 +269,7 @@ func startDisposablePostgres(t *testing.T) string {
 	return ""
 }
 
-func queryDisposablePostgres(t *testing.T, container string, query string) string {
+func queryBootstrapPostgres(t *testing.T, container string, query string) string {
 	t.Helper()
 	output, err := exec.Command(
 		"docker", "exec", container,
