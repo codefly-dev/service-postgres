@@ -20,6 +20,7 @@ import (
 	"github.com/codefly-dev/core/templates"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gopkg.in/yaml.v3"
 )
 
 // Agent version
@@ -76,9 +77,16 @@ type Settings struct {
 	// Extensions are CREATE EXTENSION IF NOT EXISTS'd at startup, on top of the
 	// always-on defaults (defaultExtensions). The extension's shared library
 	// must exist in the image; the default pgvector image ships the standard
-	// contrib set + vector. A missing extension is logged and skipped, never
-	// fatal. e.g. ["postgis", "hstore", "unaccent"].
-	Extensions []string `yaml:"extensions"`
+	// contrib set + vector. A declared extension is REQUIRED: if it cannot be
+	// created — absent library, or a migration owner without the privilege —
+	// startup fails. Point Settings.Image at an image that ships it, or declare
+	// the extension optional.
+	//
+	//   extensions:
+	//     - postgis                    # required
+	//     - name: pg_stat_statements
+	//       optional: true             # reported as skipped when unavailable
+	Extensions []Extension `yaml:"extensions"`
 
 	// RuntimeSchemas is the explicit allow-list of schemas exposed through the
 	// non-owner runtime roles. Empty means ["public"]. Runtime roles never own
@@ -111,8 +119,9 @@ type Settings struct {
 	//     - name: billing
 	//       path: ../billing/db/migrations
 	//
-	// Paths are relative to this service's directory (or absolute). A source
-	// whose directory is missing is skipped with a warning.
+	// Paths are relative to this service's directory (or absolute). A declared
+	// source is REQUIRED: a missing or empty directory fails before the database
+	// is touched, unless the source declares `optional: true`.
 	MigrationSources []MigrationSource `yaml:"migration-sources"`
 
 	// Timeouts bounds every wait this agent performs or renders: readiness
@@ -125,12 +134,41 @@ type Settings struct {
 // the shared database. See Settings.MigrationSources.
 type MigrationSource struct {
 	// Name identifies the lineage and names its tracking table
-	// (schema_migrations_<name>). Must be a safe SQL identifier ([A-Za-z0-9_]).
+	// (schema_migrations_<name>). Must be a safe SQL identifier ([A-Za-z0-9_])
+	// short enough for that table to fit PostgreSQL's 63-byte identifier limit,
+	// and distinct from every other declared name.
 	Name string `yaml:"name"`
 	// Path is the migrations directory, relative to this service's directory or
 	// absolute. Empty defaults to ../<name>/migrations (the sibling-service
 	// layout used inside a module).
 	Path string `yaml:"path"`
+	// Optional turns an absent or empty directory into a reported skip instead
+	// of a startup failure — for a service that declares this database before it
+	// ships any migration. A directory that exists but is unreadable or holds a
+	// misnamed migration file still fails.
+	Optional bool `yaml:"optional"`
+}
+
+// Extension declares one PostgreSQL extension to create at startup. It accepts
+// either a bare name or a mapping carrying `optional`.
+type Extension struct {
+	Name     string `yaml:"name"`
+	Optional bool   `yaml:"optional"`
+}
+
+// UnmarshalYAML accepts the bare-name form alongside the mapping form, so
+// `extensions: [postgis, hstore]` keeps working unchanged.
+func (e *Extension) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&e.Name)
+	}
+	type extension Extension
+	var declared extension
+	if err := value.Decode(&declared); err != nil {
+		return err
+	}
+	*e = Extension(declared)
+	return nil
 }
 
 const HotReload = "hot-reload"
@@ -181,9 +219,11 @@ type DeploymentTemplateParameters struct {
 	BootstrapJobSecretReferences map[string]*builderv0.KubernetesSecretKeyReference
 }
 
-// defaultExtensions are CREATE EXTENSION'd on every start (best-effort). They
-// all ship in the pgvector / postgres-contrib image, so they "just work" with
-// zero config; Settings.Extensions adds more on top.
+// defaultExtensions are CREATE EXTENSION'd on every start. They are convenience
+// defaults nobody asked for, so they stay best-effort: one that the configured
+// image does not ship is reported as skipped, never fatal. Settings.Extensions
+// adds required declarations on top — and naming a default there makes it
+// required.
 var defaultExtensions = []string{
 	"vector",    // pgvector — embeddings / similarity search
 	"pgcrypto",  // gen_random_uuid(), digests, crypt()

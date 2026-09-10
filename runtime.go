@@ -280,56 +280,69 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 // applyMigration; with the schema already current it is an idempotent no-op
 // (migrate.ErrNoChange).
 func (s *Runtime) migrateOnInit(ctx context.Context) error {
+	// Resolve the declared prerequisites BEFORE waiting on the database: a typo
+	// in a source path, a duplicate lineage, or an unsafe name must fail without
+	// touching a schema.
+	prerequisites, err := s.resolveSchemaPrerequisites(ctx)
+	if err != nil {
+		return err
+	}
 	if err := s.WaitForReady(ctx); err != nil {
 		return err
 	}
-	// Extensions are not migrations — ensure them even when NoMigration is set,
-	// so "port reachable" also implies "configured extensions available".
-	if err := s.ensureExtensions(ctx); err != nil {
+	if err := s.applySchema(ctx, prerequisites); err != nil {
 		return err
-	}
-	if !s.Settings.NoMigration {
-		if err := s.applyMigration(ctx); err != nil {
-			return err
-		}
 	}
 	return s.ensureRuntimeAccess(ctx)
 }
 
-// ensureExtensions CREATE EXTENSION IF NOT EXISTS for the always-on defaults
-// plus anything in Settings.Extensions, BEFORE migrations run (so schema files
-// can rely on them). Best-effort per extension: a name whose shared library is
-// absent from the image (e.g. postgis on the pgvector image) is logged and
-// skipped, never fatal — point Settings.DockerImage at an image that ships it.
-func (s *Runtime) ensureExtensions(ctx context.Context) error {
-	exts := append([]string{}, defaultExtensions...)
-	exts = append(exts, s.Settings.Extensions...)
+// applySchema brings the database up to the resolved prerequisites: extensions
+// first, so migration files can rely on them, then every migration lineage.
+// Extensions are not migrations — they are ensured even when NoMigration is set,
+// so "port reachable" also implies "declared extensions available".
+func (s *Runtime) applySchema(ctx context.Context, prerequisites *schemaPrerequisites) error {
+	if err := s.ensureExtensions(ctx, prerequisites); err != nil {
+		return err
+	}
+	if !s.Settings.NoMigration {
+		if err := s.applyMigration(ctx, prerequisites.sources); err != nil {
+			return err
+		}
+	}
+	s.reportSchemaPrerequisites(prerequisites)
+	return nil
+}
 
+// ensureExtensions CREATE EXTENSION IF NOT EXISTS for every resolved request.
+// An explicitly declared extension is required: its failure — an absent shared
+// library, a migration owner without the privilege, a lost connection — fails
+// readiness rather than leaving the service running against a schema it cannot
+// use. The convenience defaults and declarations marked optional record a
+// structured skip instead.
+func (s *Runtime) ensureExtensions(ctx context.Context, prerequisites *schemaPrerequisites) error {
 	db, err := sql.Open("postgres", s.connection)
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot open database to create extensions")
 	}
 	defer db.Close()
 
-	seen := make(map[string]bool, len(exts))
-	for _, ext := range exts {
-		ext = strings.TrimSpace(ext)
-		if ext == "" || seen[ext] {
-			continue
-		}
-		seen[ext] = true
-		if !validExtName(ext) {
-			s.Wool.Warn("skipping extension with unsafe name", wool.Field("extension", ext))
-			continue
-		}
-		// Extension names cannot be parameterized; validExtName above restricts
+	for _, extension := range prerequisites.extensions {
+		// Extension names cannot be parameterized; resolveExtensions restricts
 		// them to [A-Za-z0-9_-] so the quoted identifier is injection-safe.
-		if _, err := db.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS "`+ext+`"`); err != nil {
-			s.Wool.Warn("could not create extension (is its library in the image?)",
-				wool.Field("extension", ext), wool.ErrField(err))
+		if _, err := db.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS "`+extension.name+`"`); err != nil {
+			if extension.required {
+				return s.Wool.Wrapf(err,
+					"cannot create required extension %q: the configured image must ship its library and the migration owner must be allowed to install it",
+					extension.name)
+			}
+			prerequisites.skipped = append(prerequisites.skipped, skippedPrerequisite{
+				kind:   prerequisiteExtension,
+				name:   extension.name,
+				reason: err.Error(),
+			})
 			continue
 		}
-		s.Wool.Debug("extension ready", wool.Field("extension", ext))
+		s.Wool.Debug("extension ready", wool.Field("extension", extension.name))
 	}
 	return nil
 }
@@ -460,29 +473,26 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 
 	s.Wool.Debug("waiting for ready")
 
-	err := s.WaitForReady(ctx)
+	prerequisites, err := s.resolveSchemaPrerequisites(ctx)
 	if err != nil {
 		return s.Runtime.StartError(err)
 	}
 
-	if err := s.ensureExtensions(ctx); err != nil {
+	err = s.WaitForReady(ctx)
+	if err != nil {
 		return s.Runtime.StartError(err)
 	}
 
-	if !s.Settings.NoMigration {
-		s.Wool.Debug("applying migrations")
-		err = s.applyMigration(ctx)
-		if err != nil {
-			return s.Runtime.StartError(err)
-		}
+	if err := s.applySchema(ctx, prerequisites); err != nil {
+		return s.Runtime.StartError(err)
+	}
 
-		if s.Settings.HotReload {
-			watch, errWatch := s.migrationWatchRequirements(ctx)
-			if errWatch != nil {
-				s.Wool.Warn("cannot resolve migration watch roots", wool.ErrField(errWatch))
-			} else if errWatch = s.SetupWatcher(ctx, services.NewWatchConfiguration(watch), s.EventHandler); errWatch != nil {
-				s.Wool.Warn("error in watcher", wool.ErrField(errWatch))
-			}
+	if !s.Settings.NoMigration && s.Settings.HotReload {
+		watch, errWatch := s.migrationWatchRequirements(ctx)
+		if errWatch != nil {
+			s.Wool.Warn("cannot resolve migration watch roots", wool.ErrField(errWatch))
+		} else if errWatch = s.SetupWatcher(ctx, services.NewWatchConfiguration(watch), s.EventHandler); errWatch != nil {
+			s.Wool.Warn("error in watcher", wool.ErrField(errWatch))
 		}
 	}
 	if err := s.ensureRuntimeAccess(ctx); err != nil {

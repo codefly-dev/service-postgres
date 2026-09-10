@@ -7,13 +7,10 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/core/wool"
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
@@ -37,6 +34,9 @@ type migrationSource struct {
 	// the driver default (schema_migrations) — used by the own source so legacy
 	// databases keep their existing version table.
 	table string
+	// optional lets a declared source that has not shipped any migration yet
+	// report a skip instead of failing startup.
+	optional bool
 }
 
 // label is a human-readable source name for logs.
@@ -131,63 +131,6 @@ func (m migrationSource) trackingTable() string {
 	return m.table
 }
 
-// migrationSources resolves every migration lineage to apply to the shared
-// database: this service's own ./migrations dir (when present) plus each entry
-// in Settings.MigrationSources. A source whose directory does not exist is
-// skipped with a warning — a service may legitimately declare a dependency on
-// this database before it ships any migrations.
-func (s *Runtime) migrationSources(ctx context.Context) ([]migrationSource, error) {
-	var sources []migrationSource
-
-	// Own migrations — default tracking table, backward compatible.
-	own := s.Local("migrations")
-	exists, err := shared.DirectoryExists(ctx, own)
-	if err != nil {
-		return nil, s.Wool.Wrapf(err, "cannot check migration directory")
-	}
-	if exists {
-		sources = append(sources, migrationSource{dir: own})
-	} else {
-		s.Wool.Debug("no own migration folder found", wool.DirField(own))
-	}
-
-	// Additional per-service sources sharing this database.
-	for _, src := range s.Settings.MigrationSources {
-		name := strings.TrimSpace(src.Name)
-		if name == "" {
-			s.Wool.Warn("skipping migration source with empty name", wool.Field("path", src.Path))
-			continue
-		}
-		if !validSourceName(name) {
-			s.Wool.Warn("skipping migration source with unsafe name", wool.Field("name", name))
-			continue
-		}
-		dir := src.Path
-		if dir == "" {
-			dir = filepath.Join("..", name, "migrations")
-		}
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(s.Location, dir)
-		}
-		dir = filepath.Clean(dir)
-		ok, errExists := shared.DirectoryExists(ctx, dir)
-		if errExists != nil {
-			return nil, s.Wool.Wrapf(errExists, "cannot check migration directory for source %q", name)
-		}
-		if !ok {
-			s.Wool.Warn("migration source directory not found; skipping",
-				wool.Field("source", name), wool.DirField(dir))
-			continue
-		}
-		sources = append(sources, migrationSource{
-			name:  name,
-			dir:   dir,
-			table: "schema_migrations_" + name,
-		})
-	}
-	return sources, nil
-}
-
 // validSourceName restricts a source name to characters safe in a SQL
 // identifier (the tracking table is schema_migrations_<name>). golang-migrate
 // quotes the table, but we keep the name conservative regardless.
@@ -202,17 +145,12 @@ func validSourceName(name string) bool {
 	return name != ""
 }
 
-func (s *Runtime) applyMigration(ctx context.Context) error {
+// applyMigration brings every resolved lineage up to date. The sources have
+// already been validated against the declaration, so this only fails on a real
+// migration failure.
+func (s *Runtime) applyMigration(ctx context.Context, sources []migrationSource) error {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-
-	sources, err := s.migrationSources(ctx)
-	if err != nil {
-		return err
-	}
-	if len(sources) == 0 {
-		return nil
-	}
 
 	s.Wool.Debug("migrations", wool.Field("sources", len(sources)))
 	for _, src := range sources {

@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -289,6 +291,7 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 
 	assertExternalIdentityReconciliation(t, ctx, migrationControl)
 	assertExternalIdentityTokenAuthentication(t, ctx, readOnlyConnection, readWriteConnection)
+	assertSchemaPrerequisitesFailClosed(t, ctx, migrationControl, runtime.connection, readWriteConnection)
 
 	if runtimeContext.Kind == resources.RuntimeContextContainer {
 		assertDockerStateSurvivesContainerRecreation(t, ctx, fixture, runtime, serviceName, fixtureID)
@@ -606,6 +609,137 @@ func assertExternalIdentityTokenAuthentication(t *testing.T, ctx context.Context
 		}),
 	)
 	require.Error(t, err, "a failed token acquisition must abort connection")
+}
+
+// assertSchemaPrerequisitesFailClosed proves the declared schema contract
+// against a real Postgres. A declaration that cannot resolve fails before any
+// migration side effect — a sentinel ledger stays untouched and no new tracking
+// table appears. A required extension the server cannot install fails readiness
+// with an actionable diagnostic, whether the library is absent or the principal
+// lacks the privilege; the same declaration marked optional reports a skip.
+func assertSchemaPrerequisitesFailClosed(
+	t *testing.T,
+	ctx context.Context,
+	control *migrationtest.ControlPlane,
+	ownerConnection string,
+	unprivilegedConnection string,
+) {
+	t.Helper()
+	isolate, err := control.Create(ctx, "service_postgres_schema_prerequisites")
+	require.NoError(t, err)
+	defer isolate.Drop(context.Background())
+
+	_, err = isolate.DB.ExecContext(ctx,
+		`CREATE TABLE schema_migrations_sentinel (version bigint not null primary key, dirty boolean not null)`)
+	require.NoError(t, err)
+	_, err = isolate.DB.ExecContext(ctx, `INSERT INTO schema_migrations_sentinel (version, dirty) VALUES (7, false)`)
+	require.NoError(t, err)
+
+	requireNoMigrationSideEffect := func() {
+		t.Helper()
+		var version int64
+		var dirty bool
+		require.NoError(t, isolate.DB.QueryRowContext(ctx,
+			`SELECT version, dirty FROM schema_migrations_sentinel`).Scan(&version, &dirty))
+		require.EqualValues(t, 7, version, "a rejected declaration moved an existing ledger")
+		require.False(t, dirty, "a rejected declaration dirtied an existing ledger")
+		var ledgers int
+		require.NoError(t, isolate.DB.QueryRowContext(ctx, `
+			SELECT count(*) FROM pg_tables
+			WHERE schemaname = 'public'
+			  AND tablename LIKE 'schema\_migrations%'
+			  AND tablename <> 'schema_migrations_sentinel'`).Scan(&ledgers))
+		require.Zero(t, ledgers, "a rejected declaration created a migration ledger")
+	}
+
+	overlength := strings.Repeat("a", maxIdentifierBytes-len(migrationTablePrefix)+1)
+	for name, declared := range map[string][]MigrationSource{
+		"missing explicit path": {{Name: "api", Path: "../nowhere/migrations"}},
+		"empty name":            {{Name: "  "}},
+		"duplicate name":        {{Name: "api"}, {Name: "api", Path: "../other/migrations"}},
+		"overlength name":       {{Name: overlength}},
+	} {
+		candidate := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
+		candidate.Settings.MigrationSources = declared
+		_, resolveErr := candidate.resolveSchemaPrerequisites(ctx)
+		require.Errorf(t, resolveErr, "declaration %q must be rejected", name)
+		requireNoMigrationSideEffect()
+	}
+
+	// A resolvable declaration applies: the own lineage keeps the legacy default
+	// ledger and the declared source gets its own.
+	accepted := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
+	writeMigrationDirectory(t, filepath.Join(accepted.Location, "..", "api", "migrations"),
+		"CREATE TABLE IF NOT EXISTS prerequisite_api (id integer);")
+	accepted.Settings.MigrationSources = []MigrationSource{{Name: "api"}}
+	prerequisites, err := accepted.resolveSchemaPrerequisites(ctx)
+	require.NoError(t, err)
+	require.NoError(t, accepted.applySchema(ctx, prerequisites))
+	for _, ledger := range []string{"schema_migrations", "schema_migrations_api"} {
+		var present bool
+		require.NoError(t, isolate.DB.QueryRowContext(ctx,
+			`SELECT to_regclass('public.' || $1) IS NOT NULL`, ledger).Scan(&present))
+		require.Truef(t, present, "lineage ledger %q was not created", ledger)
+	}
+
+	const absentExtension = "codefly-absent-extension"
+
+	unavailable := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
+	unavailable.Settings.Extensions = []Extension{{Name: absentExtension}}
+	prerequisites, err = unavailable.resolveSchemaPrerequisites(ctx)
+	require.NoError(t, err)
+	require.ErrorContains(t, unavailable.applySchema(ctx, prerequisites),
+		`cannot create required extension "`+absentExtension+`"`)
+
+	optional := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
+	optional.Settings.Extensions = []Extension{{Name: absentExtension, Optional: true}}
+	prerequisites, err = optional.resolveSchemaPrerequisites(ctx)
+	require.NoError(t, err)
+	require.NoError(t, optional.applySchema(ctx, prerequisites))
+	require.Contains(t, skippedPrerequisiteNames(prerequisites, prerequisiteExtension), absentExtension,
+		"an explicitly optional extension must report a structured skipped result")
+
+	// A principal without the privilege to install extensions fails readiness
+	// rather than reporting a database that silently lacks the extension.
+	unprivileged := newRuntimeForDatabase(t, unprivilegedConnection, isolate.Name)
+	unprivileged.Settings.Extensions = []Extension{{Name: "hstore"}}
+	prerequisites, err = unprivileged.resolveSchemaPrerequisites(ctx)
+	require.NoError(t, err)
+	require.ErrorContains(t, unprivileged.applySchema(ctx, prerequisites),
+		`cannot create required extension "hstore"`)
+}
+
+// newRuntimeForDatabase points a runtime at one isolated database, with a
+// service directory that owns a single valid migration.
+func newRuntimeForDatabase(t *testing.T, connection, database string) *Runtime {
+	t.Helper()
+	parsed, err := url.Parse(connection)
+	require.NoError(t, err)
+	parsed.Path = "/" + database
+
+	runtime := NewRuntime()
+	runtime.Location = filepath.Join(t.TempDir(), "store")
+	runtime.Settings.DatabaseName = database
+	runtime.connection = parsed.String()
+	writeMigrationDirectory(t, filepath.Join(runtime.Location, "migrations"),
+		"CREATE TABLE IF NOT EXISTS prerequisite_store (id integer);")
+	return runtime
+}
+
+func writeMigrationDirectory(t *testing.T, directory, body string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(directory, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(directory, "1_init.up.sql"), []byte(body), 0o600))
+}
+
+func skippedPrerequisiteNames(prerequisites *schemaPrerequisites, kind string) []string {
+	var names []string
+	for _, skipped := range prerequisites.skipped {
+		if skipped.kind == kind {
+			names = append(names, skipped.name)
+		}
+	}
+	return names
 }
 
 func splitConnectionPassword(t *testing.T, connection string) (user, password, passwordless string) {

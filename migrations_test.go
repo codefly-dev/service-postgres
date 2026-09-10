@@ -50,14 +50,14 @@ func TestValidSourceName(t *testing.T) {
 }
 
 // TestMigrationSources_Resolution checks that the own migrations dir gets the
-// default tracking table, named sources get schema_migrations_<name> + the
-// sibling-default path, and missing dirs are skipped.
+// default tracking table and named sources get schema_migrations_<name> plus
+// the sibling-default path.
 func TestMigrationSources_Resolution(t *testing.T) {
 	root := t.TempDir()
 	svcDir := filepath.Join(root, "store")
-	mustMkdir(t, filepath.Join(svcDir, "migrations"))
-	mustMkdir(t, filepath.Join(root, "api", "migrations"))           // sibling default path
-	mustMkdir(t, filepath.Join(root, "billing", "db", "migrations")) // explicit path
+	mustMigrationDir(t, filepath.Join(svcDir, "migrations"))
+	mustMigrationDir(t, filepath.Join(root, "api", "migrations"))           // sibling default path
+	mustMigrationDir(t, filepath.Join(root, "billing", "db", "migrations")) // explicit path
 
 	s := NewRuntime()
 	s.Location = svcDir
@@ -65,12 +65,14 @@ func TestMigrationSources_Resolution(t *testing.T) {
 	s.Settings.MigrationSources = []MigrationSource{
 		{Name: "api"},
 		{Name: "billing", Path: "../billing/db/migrations"},
-		{Name: "ghost"}, // dir missing → skipped
 	}
 
-	sources, err := s.migrationSources(context.Background())
+	sources, skipped, err := s.resolveMigrationSources(context.Background())
 	if err != nil {
-		t.Fatalf("migrationSources: %v", err)
+		t.Fatalf("resolveMigrationSources: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Errorf("expected no skipped prerequisite, got %+v", skipped)
 	}
 	if len(sources) != 3 {
 		t.Fatalf("expected 3 resolved sources (own, api, billing), got %d: %+v", len(sources), sources)
@@ -90,10 +92,15 @@ func TestMigrationSources_Resolution(t *testing.T) {
 	}
 }
 
-func mustMkdir(t *testing.T, p string) {
+// mustMigrationDir creates a migrations directory holding one real, correctly
+// named migration, the shape a declared source is required to have.
+func mustMigrationDir(t *testing.T, p string) {
 	t.Helper()
 	if err := os.MkdirAll(p, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", p, err)
+	}
+	if err := os.WriteFile(filepath.Join(p, "1_init.up.sql"), []byte("SELECT 1;"), 0o600); err != nil {
+		t.Fatalf("write migration in %s: %v", p, err)
 	}
 }
 
