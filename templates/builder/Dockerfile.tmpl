@@ -1,19 +1,40 @@
-FROM alpine:3.21
+FROM {{ .Bootstrap.Base.Reference }}
 
 ARG TARGETARCH
 
+# Literals, not build arguments: a label is provenance only if it reports what
+# actually built the image, and a --build-arg must not be able to rewrite it.
+LABEL {{ range $index, $entry := .Bootstrap.Provenance }}{{ if $index }} \
+      {{ end }}{{ $entry.Label }}="{{ $entry.Value }}"{{ end }}
+
 WORKDIR /app
 
-RUN apk add --no-cache curl postgresql17-client
-RUN architecture="${TARGETARCH:-$(apk --print-arch)}" \
-    && case "${architecture}" in \
+# apk resolves from the locked repositories alone, and every package is pinned to an
+# exact version: once upstream replaces one of them the build fails instead of
+# quietly installing different bytes. .github/scripts/update-bootstrap-lock.sh
+# moves the lock forward.
+RUN printf '%s\n' {{ .Bootstrap.Packages.RepositoryArguments }} >/etc/apk/repositories \
+    && apk add --no-cache {{ .Bootstrap.Packages.Specs }}
+
+# The archive is downloaded to a file and checksum-verified against the lock before
+# anything unpacks or runs it, so tampered release bytes never reach tar.
+RUN set -eu; \
+    architecture="${TARGETARCH:-$(apk --print-arch)}"; \
+    case "${architecture}" in \
       x86_64) architecture=amd64 ;; \
       aarch64) architecture=arm64 ;; \
-      amd64|arm64) ;; \
+    esac; \
+    case "${architecture}" in \
+{{- range .Bootstrap.Migrate.Archives }}
+      {{ .Architecture }}) checksum={{ .SHA256 }} ;; \
+{{- end }}
       *) echo "unsupported target architecture: ${architecture}" >&2; exit 1 ;; \
-    esac \
-    && curl -fsSL "https://github.com/golang-migrate/migrate/releases/download/v4.19.1/migrate.linux-${architecture}.tar.gz" | tar xz \
-    && mv migrate /usr/local/bin/migrate
+    esac; \
+    curl -fsSL -o /tmp/migrate.tar.gz "https://github.com/golang-migrate/migrate/releases/download/{{ .Bootstrap.Migrate.Version }}/migrate.linux-${architecture}.tar.gz"; \
+    printf '%s  %s\n' "${checksum}" /tmp/migrate.tar.gz | sha256sum -c -; \
+    tar -xzf /tmp/migrate.tar.gz -C /tmp migrate; \
+    install -m 0755 /tmp/migrate /usr/local/bin/migrate; \
+    rm -f /tmp/migrate.tar.gz /tmp/migrate
 
 COPY . .
 

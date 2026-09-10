@@ -113,6 +113,13 @@ type DockerTemplating struct {
 	ReadWriteRoles               []string
 }
 
+// Bootstrap resolves the locked bootstrap inputs the Dockerfile renders from. A
+// method, not a field: the template dereferences it on its first line, so a
+// constructed value must not be able to omit it.
+func (DockerTemplating) Bootstrap() *bootstrapImageLock {
+	return bootstrapLock
+}
+
 func (s *Builder) WithMigration() bool {
 	return !s.Settings.NoMigration
 }
@@ -243,7 +250,11 @@ func (s *Builder) buildRecipe(ctx context.Context, outputDirectory string, img *
 		Dockerfile: "builder/Dockerfile",
 		Context:    ".",
 		Image:      img.FullName(),
-		Platforms:  []string{"linux/amd64", "linux/arm64"},
+		Platforms:  bootstrapRecipePlatforms(),
+		// The recipe carries the resolved bootstrap inputs it was rendered from, so a
+		// consumer reads the base, package and migrate identities off the plan
+		// instead of re-resolving them.
+		BuildArgs: docker.Bootstrap().RecipeBuildArgs(),
 	}})
 	if err != nil {
 		return s.Builder.BuildError(err)

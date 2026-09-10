@@ -48,8 +48,14 @@ jobs:
           cache: false
           go-version-file: go.mod
 
+      # Registered before the tests, not just before the multi-arch publish: the
+      # bootstrap image build test verifies linux/arm64, which needs emulation on an
+      # amd64 runner. Without this the arm64 case would skip and a wrong arm64
+      # archive checksum would pass CI.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+
       - name: Run unit tests
-        run: go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker)$'
+        run: go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker)$' -timeout 20m
 
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
@@ -125,9 +131,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
       - if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f

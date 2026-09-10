@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"embed"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -151,10 +150,8 @@ func parseRuntimeImageLock(content []byte) (*resources.DockerImage, error) {
 	if lock.Digest == "" {
 		return nil, fmt.Errorf("runtime image digest is required")
 	}
-	algorithm, encoded, found := strings.Cut(lock.Digest, ":")
-	decoded, err := hex.DecodeString(encoded)
-	if !found || algorithm != "sha256" || err != nil || len(decoded) != 32 {
-		return nil, fmt.Errorf("runtime image digest must be a sha256 digest")
+	if err := validateSHA256Digest("runtime image digest", lock.Digest); err != nil {
+		return nil, err
 	}
 	return &resources.DockerImage{
 		Name:   lock.Name,

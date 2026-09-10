@@ -1,0 +1,35 @@
+{
+  "base": {
+    "image": "alpine",
+    "version": "3.21.7",
+    "digest": "sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
+  },
+  "packages": {
+    "repositories": [
+      "https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
+    ],
+    "pinned": [
+      {
+        "name": "curl",
+        "version": "8.14.1-r2"
+      },
+      {
+        "name": "postgresql17-client",
+        "version": "17.11-r0"
+      }
+    ]
+  },
+  "migrate": {
+    "version": "v4.19.1",
+    "archives": [
+      {
+        "architecture": "amd64",
+        "sha256": "2ac648fbd1b127b69ab5a7b33cf96212178f71e22379fc50573630c6f4c7ce18"
+      },
+      {
+        "architecture": "arm64",
+        "sha256": "2fea2455c0f3f07cc3f4b98471c951ad1a716059574b20b6416bd1e9058751c5"
+      }
+    ]
+  }
+}

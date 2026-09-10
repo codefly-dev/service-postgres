@@ -182,3 +182,50 @@ func TestBuildRecipeCreatesEmptyMigrationsDirectory(t *testing.T) {
 	require.DirExists(t, filepath.Join(outputDirectory, "migrations"))
 	require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
 }
+
+// TestBuildRecipeLocksBootstrapInputs covers the recipe a consumer builds without
+// the agent: the Dockerfile pins the base by digest and the recipe's typed build
+// arguments record every resolved bootstrap identity, including the lock digest.
+func TestBuildRecipeLocksBootstrapInputs(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+	outputDirectory := t.TempDir()
+
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	recipe := response.GetResult().GetDockerBuildPlan().GetRecipes()[0]
+	require.Equal(t, bootstrapLock.RecipeBuildArgs(), recipe.GetBuildArgs())
+	require.Equal(t, bootstrapLock.LockDigest, recipe.GetBuildArgs()["CODEFLY_BOOTSTRAP_LOCK_DIGEST"])
+
+	dockerfile, err := os.ReadFile(filepath.Join(outputDirectory, "builder", "Dockerfile"))
+	require.NoError(t, err)
+	require.Contains(t, string(dockerfile), "FROM "+bootstrapLock.Base.Reference())
+}
+
+// TestBuildRecipeResolvesIdenticalInputsAcrossEmissions builds the recipe twice
+// from independent builders and output directories: the resolved inputs, and the
+// aggregate digest over the tree they produce, must not depend on the emitting run.
+func TestBuildRecipeResolvesIdenticalInputsAcrossEmissions(t *testing.T) {
+	ctx := context.Background()
+
+	emit := func() (*builderv0.DockerBuildPlan, []byte) {
+		builder := newBuildTestBuilder(t)
+		outputDirectory := t.TempDir()
+		response, err := builder.Build(ctx, buildRequest(outputDirectory))
+		require.NoError(t, err)
+		require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		dockerfile, err := os.ReadFile(filepath.Join(outputDirectory, "builder", "Dockerfile"))
+		require.NoError(t, err)
+		return response.GetResult().GetDockerBuildPlan(), dockerfile
+	}
+
+	firstPlan, firstDockerfile := emit()
+	secondPlan, secondDockerfile := emit()
+
+	require.Equal(t, firstDockerfile, secondDockerfile)
+	require.Equal(t, firstPlan.GetRecipes()[0].GetBuildArgs(), secondPlan.GetRecipes()[0].GetBuildArgs())
+	require.NotEmpty(t, firstPlan.GetDigest())
+	require.Equal(t, firstPlan.GetDigest(), secondPlan.GetDigest())
+}
