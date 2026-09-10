@@ -138,6 +138,17 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 
 	ctx = s.Wool.Inject(ctx)
 
+	// The emitted bootstrap still owns password-authenticated login roles.
+	// External-identity deployment metadata does not make that SQL compatible
+	// with cloud-managed logins. Fail before deleting/staging caller output or
+	// invoking Docker until an external-identity bootstrap is implemented.
+	if err := s.validateAuthMode(); err != nil {
+		return s.Builder.BuildError(err)
+	}
+	if s.externalIdentity() {
+		return s.Builder.BuildError(fmt.Errorf("external-identity bootstrap generation is unsupported: the password bootstrap must not rewrite cloud-managed login roles"))
+	}
+
 	dockerRequest, err := s.Builder.DockerBuildRequest(ctx, req)
 	if err != nil {
 		return nil, s.Wool.Wrapf(err, "can only do docker build request")
