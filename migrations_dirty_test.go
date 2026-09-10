@@ -443,38 +443,20 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 }
 
 // TestStartupPathHasNoAutomaticRecovery locks the source-level property the audit
-// asked for. It scans the WHOLE file rather than runUp's body, so moving a Drop or
-// Force into a helper reached from startup cannot slip past it; the hot-reload
-// path (updateMigration) is the one place these calls are still expected.
+// asked for. It scans the WHOLE of every file that migrates, so moving a Drop or
+// Force into a helper cannot slip past it. There is no longer any carve-out:
+// hot reload used to be the one place these calls were expected, and it is now
+// forward-only, so no migration path may reach for them.
 func TestStartupPathHasNoAutomaticRecovery(t *testing.T) {
-	body, err := os.ReadFile("migrations.go")
-	require.NoError(t, err)
-	source := string(body)
+	for _, file := range []string{"migrations.go", "hotreload.go"} {
+		body, err := os.ReadFile(file)
+		require.NoError(t, err)
 
-	hotReload := functionBody(t, source, "func (s *Runtime) updateMigration(")
-	require.Contains(t, hotReload, "m.Force(", "sanity: updateMigration is the expected home of Force")
-
-	startup := strings.Replace(source, hotReload, "", 1)
-	require.NotEqual(t, source, startup, "hot-reload body must have been excluded")
-
-	for _, forbidden := range []string{"m.Drop()", ".Force(", ".Steps(", "m.Down()"} {
-		require.NotContains(t, startup, forbidden,
-			"the startup migration path must not recover automatically from a dirty lineage")
+		for _, forbidden := range []string{"m.Drop()", ".Force(", ".Steps(", "m.Down()"} {
+			require.NotContains(t, string(body), forbidden,
+				"%s must not recover automatically from a dirty lineage", file)
+		}
 	}
-}
-
-// functionBody returns the source text of the function whose declaration starts
-// with prefix, from its declaration to the next top-level declaration or EOF.
-func functionBody(t *testing.T, source, prefix string) string {
-	t.Helper()
-	start := strings.Index(source, prefix)
-	require.NotEqual(t, -1, start, "cannot find %q", prefix)
-	rest := source[start+len(prefix):]
-	end := strings.Index(rest, "\nfunc ")
-	if end == -1 {
-		return source[start:]
-	}
-	return source[start : start+len(prefix)+end]
 }
 
 // TestDirtyRecoveryRunbookExists keeps the pointer in the dirty-lineage error and
