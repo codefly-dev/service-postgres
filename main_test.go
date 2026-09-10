@@ -666,6 +666,26 @@ func assertSchemaPrerequisitesFailClosed(
 		requireNoMigrationSideEffect()
 	}
 
+	// An empty own migrations/ is documented as legal, and the builder creates one
+	// so the bootstrap image's COPY resolves. Applying must therefore succeed
+	// against a real database: golang-migrate reports an empty source as a
+	// missing first version rather than "no change", so a lineage with nothing to
+	// apply must never be handed to Up().
+	empty := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
+	require.NoError(t, os.RemoveAll(empty.Local("migrations")))
+	require.NoError(t, os.MkdirAll(empty.Local("migrations"), 0o755))
+	writeMigrationDirectory(t, filepath.Join(empty.Location, "..", "sibling", "migrations"),
+		"CREATE TABLE IF NOT EXISTS prerequisite_sibling (id integer);")
+	empty.Settings.MigrationSources = []MigrationSource{{Name: "sibling"}}
+	emptyPrerequisites, err := empty.resolveSchemaPrerequisites()
+	require.NoError(t, err)
+	require.NoError(t, empty.applySchema(ctx, emptyPrerequisites),
+		"an empty own migrations directory must not fail the migration step")
+	var siblingApplied bool
+	require.NoError(t, isolate.DB.QueryRowContext(ctx,
+		`SELECT to_regclass('public.prerequisite_sibling') IS NOT NULL`).Scan(&siblingApplied))
+	require.True(t, siblingApplied, "the sibling lineage must still apply beside an empty own directory")
+
 	// A resolvable declaration applies: the own lineage keeps the legacy default
 	// ledger and the declared source gets its own.
 	accepted := newRuntimeForDatabase(t, ownerConnection, isolate.Name)

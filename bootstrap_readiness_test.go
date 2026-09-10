@@ -107,20 +107,18 @@ func TestBootstrapReadinessWaitEndsWithinItsBudget(t *testing.T) {
 	}
 }
 
-// bootstrapCommand renders the Dockerfile and returns its CMD as the single
-// shell string Docker would hand to /bin/sh -c.
+// bootstrapCommand renders the bootstrap program the image's CMD runs, so a
+// regression in the rendered text fails here rather than in a cluster.
 func bootstrapCommand(t *testing.T, readinessSeconds int, withMigration bool) string {
 	t.Helper()
-	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
-		WithMigration:                withMigration,
-		ReadinessTimeoutSeconds:      readinessSeconds,
-	})
-	_, command, found := strings.Cut(dockerfile, "\nCMD ")
-	if !found {
-		t.Fatalf("rendered Dockerfile has no CMD:\n%s", dockerfile)
+	parameters := DockerTemplating{
+		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
+		ReadinessTimeoutSeconds:        readinessSeconds,
 	}
-	return strings.ReplaceAll(command, "\\\n", "")
+	if withMigration {
+		parameters.Lineages = []BootstrapLineage{{Label: "store", Stage: "00-store", Ledger: "schema_migrations"}}
+	}
+	return renderStagedTemplate(t, "templates/bootstrap/bootstrap.sh.tmpl", parameters)
 }
 
 // writeClientStub installs a postgres client the bootstrap CMD invokes,

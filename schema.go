@@ -122,7 +122,17 @@ func (s *Service) resolveMigrationSources() ([]migrationSource, []skippedPrerequ
 			// A path that is a file, or a directory this process may not read, is
 			// a misconfiguration even for an optional source.
 			return nil, nil, fmt.Errorf("migration source %q: %w", lineage.name, err)
-		case count == 0 && !own:
+		case count == 0:
+			// A lineage with nothing to apply must not reach the apply list at
+			// all: golang-migrate reports an empty source as a MISSING FIRST
+			// VERSION, not as "no change", so applying one fails the whole run.
+			// Whether emptiness is also an ERROR is a separate question — it is,
+			// for a declared source that did not ask to be optional, and it is
+			// not for the own directory, whose emptiness is documented as legal.
+			if own {
+				s.Wool.Debug("own migration folder holds no migration", wool.DirField(lineage.dir))
+				continue
+			}
 			if !lineage.optional {
 				return nil, nil, fmt.Errorf(
 					"migration source %q declares directory %s, which holds no migration: add a <version>_<title>.up.sql file, or declare the source optional",

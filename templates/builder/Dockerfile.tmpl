@@ -36,41 +36,20 @@ RUN set -eu; \
     install -m 0755 /tmp/migrate /usr/local/bin/migrate; \
     rm -f /tmp/migrate.tar.gz /tmp/migrate
 
-COPY . .
-
-{{- if .WithMigration }}
-COPY migrations /app/migrations
-# An editor backup kept beside a migration (2_x.up.sql~, .bak, .orig) parses as
-# the same version and direction as the file it shadows, so migrate rejects the
-# whole directory as a duplicate. Drop exactly what the runtime filter hides:
-# the pattern is rendered from the single Go definition.
-RUN find /app/migrations -maxdepth 1 -type f | while read -r file; do \
-      echo "${file##*/}" | grep -qE '{{ .MigrationFileNamePattern }}' || rm -f "${file}"; \
-    done
-{{- end }}
-COPY runtime-access.sql /app/runtime-access.sql
+# Only the staged bootstrap artifact and the runtime-access program enter the
+# image. The build context is the whole service directory, which also holds
+# local configuration and secrets, so nothing is copied wholesale. The staged
+# tree carries only files matching the one migration-filename definition, so an
+# editor backup left beside a migration never reaches the image to be pruned.
+COPY bootstrap /app/bootstrap
 COPY bootstrap.sql /app/bootstrap.sql
+COPY runtime-access.sql /app/runtime-access.sql
 
 # The bootstrap is ONE psql session over bootstrap.sql: it takes the
 # runtime-access advisory lock, runs `migrate up` as a child process while still
 # holding it, then includes runtime-access.sql for the grants. migrate used to
 # run here as its own process, which left the two steps in different lock
 # domains -- see bootstrap.sql for the collision that allowed between concurrent
-# bootstrap pods.
-CMD set -eu; \
-    readiness_deadline=$(($(date +%s) + {{ .ReadinessTimeoutSeconds }})); \
-    while :; do \
-      readiness=0; \
-      pg_isready -q -d "${{.MigrationConnectionKeyHolder}}" || readiness=$?; \
-      if [ "$readiness" -eq 0 ]; then break; fi; \
-      if [ "$readiness" -eq 3 ]; then \
-        echo "bootstrap: database connection parameters are invalid (pg_isready status 3)" >&2; \
-        exit 78; \
-      fi; \
-      if [ "$(date +%s)" -ge "$readiness_deadline" ]; then \
-        echo "bootstrap: database did not accept connections within {{ .ReadinessTimeoutSeconds }}s (last pg_isready status $readiness)" >&2; \
-        exit 1; \
-      fi; \
-      sleep 2; \
-    done; \
-    psql "${{.MigrationConnectionKeyHolder}}" --no-psqlrc --set=ON_ERROR_STOP=1 --file=/app/bootstrap.sql
+# bootstrap pods. bootstrap.sh gates that session on readiness and on verifying
+# the staged migration sources.
+CMD ["/bin/sh", "/app/bootstrap/bootstrap.sh"]

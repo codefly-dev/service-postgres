@@ -1,0 +1,52 @@
+# Generated from the service's schema plan (see plan.json). This script gates
+# the run: it waits for the database within a budget and verifies the staged
+# migration sources. Everything that touches the database then happens in ONE
+# psql session over bootstrap.sql, so every lineage and the grants that describe
+# them are serialized by a single advisory lock.
+set -eu
+
+connection={{ printf "\"${%s:-}\"" .MigrationConnectionEnvironment }}
+if [ -z "${connection}" ]; then
+    echo "bootstrap: {{ .MigrationConnectionEnvironment }} is not set" >&2
+    exit 1
+fi
+
+# Each lineage is applied to its own ledger, which golang-migrate takes as a
+# query parameter -- and the connection string may already carry one.
+# bootstrap.sql builds each lineage's DSN with this separator.
+case "${connection}" in
+    *\?*) CODEFLY_LEDGER_SEPARATOR="&" ;;
+    *) CODEFLY_LEDGER_SEPARATOR="?" ;;
+esac
+export CODEFLY_LEDGER_SEPARATOR
+
+# Bounded readiness: an unreachable database must fail the Job within its
+# budget rather than block it, and invalid connection parameters are a
+# configuration fault (EX_CONFIG) no amount of waiting fixes.
+readiness_deadline=$(($(date +%s) + {{ .ReadinessTimeoutSeconds }}))
+while :; do
+    readiness=0
+    pg_isready -q -d "${connection}" || readiness=$?
+    if [ "${readiness}" -eq 0 ]; then break; fi
+    if [ "${readiness}" -eq 3 ]; then
+        echo "bootstrap: database connection parameters are invalid (pg_isready status 3)" >&2
+        exit 78
+    fi
+    if [ "$(date +%s)" -ge "${readiness_deadline}" ]; then
+        echo "bootstrap: database did not accept connections within {{ .ReadinessTimeoutSeconds }}s (last pg_isready status ${readiness})" >&2
+        exit 1
+    fi
+    sleep 2
+done
+{{- if .Lineages }}
+
+# The image is built from the service directory by a separate process, long
+# after this plan was emitted. Verify the staged sources against the manifest
+# before applying anything: a source that drifted or was only partly copied
+# would otherwise apply fewer migrations and exit successfully. This runs after
+# the readiness gate so a misconfigured Job still fails fast on it.
+cd /app/bootstrap
+sha256sum -c sources.sha256
+{{- end }}
+
+psql "${connection}" --no-psqlrc --set=ON_ERROR_STOP=1 --file=/app/bootstrap.sql
