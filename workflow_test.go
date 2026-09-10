@@ -21,11 +21,38 @@ type workflowJob struct {
 }
 
 type workflowStep struct {
-	Name string         `yaml:"name"`
-	If   string         `yaml:"if"`
-	Uses string         `yaml:"uses"`
-	Run  string         `yaml:"run"`
-	With map[string]any `yaml:"with"`
+	Name string            `yaml:"name"`
+	If   string            `yaml:"if"`
+	Uses string            `yaml:"uses"`
+	Run  string            `yaml:"run"`
+	With map[string]any    `yaml:"with"`
+	Env  map[string]string `yaml:"env"`
+}
+
+// TestCIWorkflowEnforcesMigrationRegression locks the wiring that keeps the
+// dirty-migration fail-closed regression actually running in CI. It must run
+// unconditionally, after the runtime image is built locally (so it needs no
+// registry credentials, which this job only acquires later), and it must declare
+// SERVICE_POSTGRES_TEST_IMAGE — the flag that turns a missing docker daemon into
+// a failure instead of a skip. Without these, the regression can silently stop
+// enforcing anything while the build stays green.
+func TestCIWorkflowEnforcesMigrationRegression(t *testing.T) {
+	imageJob := readWorkflow(t, ".github/workflows/ci.yml").Jobs["image"]
+
+	buildIndex, _ := findWorkflowStepAt(t, imageJob, "Build runtime image")
+	regressionIndex, regression := findWorkflowStepAt(t, imageJob, "Migration fail-closed regression")
+	require.Less(t, buildIndex, regressionIndex, "the regression must run after the image it uses is built")
+
+	require.Empty(t, regression.If, "the regression must never be conditionally skipped")
+	require.Equal(t, "service-postgres:test", regression.Env["SERVICE_POSTGRES_TEST_IMAGE"],
+		"the regression must run against the locally built image, which also makes the prerequisite mandatory")
+	require.Contains(t, regression.Run, "TestDirtyMigrationFailsClosed")
+
+	// The unit-test step deliberately carries no container-booting test; the
+	// regression must therefore be excluded there and present here, not neither.
+	unitTests := findWorkflowStep(t, imageJob, "Run unit tests")
+	require.Contains(t, unitTests.Run, "TestDirtyMigrationFailsClosed",
+		"the unit-test step must exclude the container-booting regression")
 }
 
 func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
@@ -122,6 +149,7 @@ func TestRuntimeDockerfilePinsReproducibleBuildInputs(t *testing.T) {
 	require.Contains(t, dockerfile, "llvm21-dev=21.1.8-r1")
 	require.Contains(t, dockerfile, "libcrypto3=3.5.8-r0")
 	require.Contains(t, dockerfile, "libssl3=3.5.8-r0")
+	require.Contains(t, dockerfile, "libuuid=2.42.3-r1")
 	require.Contains(t, dockerfile, "su-exec=0.3-r0")
 	require.Contains(t, dockerfile, "RUN rm /usr/local/bin/gosu")
 	require.Contains(t, dockerfile, "ln -s /sbin/su-exec /usr/local/bin/gosu")
