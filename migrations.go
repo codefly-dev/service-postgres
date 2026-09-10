@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,8 @@ import (
 	"github.com/codefly-dev/core/wool"
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
 // migrationSource is one independent migration lineage applied against the
@@ -43,10 +47,74 @@ func (m migrationSource) label() string {
 	return m.name
 }
 
-// fileURL returns the file:// migration source URL golang-migrate expects.
-func (m migrationSource) fileURL() string {
-	u := url.URL{Scheme: "file", Path: m.dir}
-	return u.String()
+// migrationFileName matches the conventional golang-migrate filename:
+// <version>_<name>.up.sql or <version>_<name>.down.sql.
+var migrationFileName = regexp.MustCompile(`^([0-9]+)_.+\.(up|down)\.sql$`)
+
+// migrationFS hides every directory entry that is not a conventional migration
+// filename. golang-migrate parses the extension as a free-form group, so an
+// editor backup left beside a migration — 2_add_index.up.sql~, .bak, .orig —
+// parses as the SAME version and direction as the file it shadows and makes the
+// source driver reject the entire lineage as a duplicate.
+type migrationFS struct {
+	fs.FS
+}
+
+func (f migrationFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	entries, err := fs.ReadDir(f.FS, name)
+	if err != nil {
+		return nil, err
+	}
+	var migrations []fs.DirEntry
+	for _, entry := range entries {
+		if !entry.IsDir() && migrationFileName.MatchString(entry.Name()) {
+			migrations = append(migrations, entry)
+		}
+	}
+	return migrations, nil
+}
+
+// openSource builds the golang-migrate source driver for one lineage over the
+// filtered view of its directory.
+func (m migrationSource) openSource() (source.Driver, error) {
+	if err := m.checkConflicts(); err != nil {
+		return nil, err
+	}
+	return iofs.New(migrationFS{os.DirFS(m.dir)}, ".")
+}
+
+// checkConflicts rejects two migration files claiming the same version and
+// direction — a real authoring mistake, unlike the editor leftovers filtered
+// above. golang-migrate names only the file it read second, which does not say
+// what it collides with.
+func (m migrationSource) checkConflicts() error {
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		return err
+	}
+	claimed := make(map[string]string)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		match := migrationFileName.FindStringSubmatch(entry.Name())
+		if match == nil {
+			continue
+		}
+		version, err := strconv.ParseUint(match[1], 10, 64)
+		if err != nil {
+			// golang-migrate skips a version it cannot parse; stay aligned with
+			// what the source driver will actually see.
+			continue
+		}
+		key := fmt.Sprintf("%d.%s", version, match[2])
+		if first, taken := claimed[key]; taken {
+			return fmt.Errorf("migration version %d has two %s files: %q and %q",
+				version, match[2], first, entry.Name())
+		}
+		claimed[key] = entry.Name()
+	}
+	return nil
 }
 
 // migrationSources resolves every migration lineage to apply to the shared
@@ -224,7 +292,15 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 			wrapMigrationCloseError("SQL pool after driver failure", pool.Close()),
 		)
 	}
-	migration, err := migrate.NewWithDatabaseInstance(src.fileURL(), s.Settings.DatabaseName, driver)
+	sourceDriver, err := src.openSource()
+	if err != nil {
+		return nil, errors.Join(
+			s.Wool.Wrapf(err, "cannot read migrations for source %q", src.label()),
+			wrapMigrationCloseError("database driver after source failure", driver.Close()),
+			wrapMigrationCloseError("SQL pool after source failure", pool.Close()),
+		)
+	}
+	migration, err := migrate.NewWithInstance(src.label(), sourceDriver, s.Settings.DatabaseName, driver)
 	if err != nil {
 		return nil, errors.Join(
 			s.Wool.Wrapf(err, "cannot create migration"),

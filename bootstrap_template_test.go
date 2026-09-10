@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"text/template"
@@ -110,6 +111,64 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 	command := exec.Command("docker", "build", "--build-arg", "TARGETARCH=", "--tag", tag, root)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("legacy Docker build without TARGETARCH failed: %v\n%s", err, output)
+	}
+}
+
+// TestBootstrapImageDropsStrayMigrationFiles proves the deployed bootstrap runs
+// migrate over the same filtered set the local runtime applies: an editor backup
+// that keeps a migration's prefix must not reach the image.
+func TestBootstrapImageDropsStrayMigrationFiles(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	parameters := DockerTemplating{
+		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
+		WithMigration:                true,
+	}
+	if err := os.WriteFile(
+		filepath.Join(root, "Dockerfile"),
+		[]byte(renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", parameters)),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "runtime-access.sql"), []byte("SELECT 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	migrations := filepath.Join(root, "migrations")
+	if err := os.MkdirAll(migrations, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	kept := []string{"1_init.up.sql", "1_init.down.sql", "2_add_index.up.sql", "2_add_index.down.sql"}
+	stray := []string{"2_add_index.up.sql~", "2_add_index.up.sql.bak", "2_add_index.up.sql.orig", ".2_add_index.up.sql.swp"}
+	for _, name := range append(append([]string{}, kept...), stray...) {
+		if err := os.WriteFile(filepath.Join(migrations, name), []byte("SELECT 1;\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tag := fmt.Sprintf("service-postgres-bootstrap-stray-test:%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_ = exec.Command("docker", "image", "rm", tag).Run()
+	})
+	if output, err := exec.Command("docker", "build", "--tag", tag, root).CombinedOutput(); err != nil {
+		t.Fatalf("bootstrap image build failed: %v\n%s", err, output)
+	}
+	output, err := exec.Command("docker", "run", "--rm", tag, "ls", "-A", "/app/migrations").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list packaged migrations: %v\n%s", err, output)
+	}
+	packaged := strings.Fields(string(output))
+	for _, name := range kept {
+		if !slices.Contains(packaged, name) {
+			t.Errorf("bootstrap image dropped migration %q: %v", name, packaged)
+		}
+	}
+	for _, name := range stray {
+		if slices.Contains(packaged, name) {
+			t.Errorf("bootstrap image packaged stray file %q, which blocks the whole lineage", name)
+		}
 	}
 }
 

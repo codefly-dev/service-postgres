@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -92,5 +94,85 @@ func mustMkdir(t *testing.T, p string) {
 	t.Helper()
 	if err := os.MkdirAll(p, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", p, err)
+	}
+}
+
+// TestMigrationSourceIgnoresEditorLeftovers locks the acceptance case from the
+// bug: a backup file keeping the migration's own prefix parses as the same
+// version and direction and used to make golang-migrate reject the whole
+// lineage as a duplicate.
+func TestMigrationSourceIgnoresEditorLeftovers(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"1_init.up.sql":         "CREATE TABLE one ();",
+		"1_init.down.sql":       "DROP TABLE one;",
+		"2_pending.up.sql":      "CREATE TABLE two ();",
+		"2_pending.down.sql":    "DROP TABLE two;",
+		"2_pending.up.sql~":     "CREATE TABLE stale ();",
+		"2_pending.up.sql.bak":  "CREATE TABLE stale ();",
+		"2_pending.up.sql.orig": "CREATE TABLE stale ();",
+		".2_pending.up.sql.swp": "binary",
+		"#2_pending.up.sql#":    "CREATE TABLE stale ();",
+		"README.md":             "not a migration",
+	} {
+		mustWrite(t, filepath.Join(dir, name), body)
+	}
+	mustMkdir(t, filepath.Join(dir, "archive"))
+
+	driver, err := migrationSource{dir: dir}.openSource()
+	if err != nil {
+		t.Fatalf("openSource: %v", err)
+	}
+	defer driver.Close()
+
+	first, err := driver.First()
+	if err != nil || first != 1 {
+		t.Fatalf("First() = %d, %v; want 1", first, err)
+	}
+	next, err := driver.Next(1)
+	if err != nil || next != 2 {
+		t.Fatalf("Next(1) = %d, %v; want 2", next, err)
+	}
+	if _, err := driver.Next(2); err == nil {
+		t.Fatal("Next(2) must report the end of the lineage")
+	}
+
+	body, _, err := driver.ReadUp(2)
+	if err != nil {
+		t.Fatalf("ReadUp(2): %v", err)
+	}
+	defer body.Close()
+	content, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read migration body: %v", err)
+	}
+	if string(content) != "CREATE TABLE two ();" {
+		t.Fatalf("ReadUp(2) served %q, want the real migration", content)
+	}
+}
+
+// TestMigrationSourceRejectsConflictingVersions keeps a genuine authoring
+// mistake failing, and naming both files.
+func TestMigrationSourceRejectsConflictingVersions(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "1_init.up.sql"), "CREATE TABLE one ();")
+	mustWrite(t, filepath.Join(dir, "2_add_index.up.sql"), "CREATE INDEX a ON one (id);")
+	mustWrite(t, filepath.Join(dir, "02_add_column.up.sql"), "ALTER TABLE one ADD COLUMN id INT;")
+
+	_, err := migrationSource{dir: dir}.openSource()
+	if err == nil {
+		t.Fatal("two up files for version 2 must fail")
+	}
+	for _, name := range []string{"02_add_column.up.sql", "2_add_index.up.sql"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("error %q does not name the conflicting file %q", err, name)
+		}
+	}
+}
+
+func mustWrite(t *testing.T, p string, body string) {
+	t.Helper()
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatalf("write %s: %v", p, err)
 	}
 }
