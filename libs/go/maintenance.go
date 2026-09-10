@@ -92,6 +92,7 @@ func OpenMaintenance(ctx context.Context, connection, applicationRole string, op
 		}
 		return nil
 	}
+	installRestrictedSession(pc, c)
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
 		return nil, nil, errors.New("cannot open maintenance Postgres capability")
