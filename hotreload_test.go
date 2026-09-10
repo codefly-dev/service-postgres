@@ -326,6 +326,34 @@ func assertHotReloadPreservesAppliedHistory(
 		require.True(t, fixture.relationExists(t, ctx, "forward_two"))
 	})
 
+	t.Run("a ledger dirtied at the nil version fails closed, not into a drop", func(t *testing.T) {
+		fixture := newHotReloadFixture(t, ctx, control, ownerConnection, "hot_reload_nil_version_dirty")
+		fixture.writeMigration(t, 1, "sentinel",
+			`CREATE TABLE sentinel (id int PRIMARY KEY);`, `DROP TABLE sentinel;`)
+		require.NoError(t, fixture.runtime.applyMigration(ctx))
+		for id := 1; id <= 3; id++ {
+			_, err := fixture.db.ExecContext(ctx, `INSERT INTO sentinel (id) VALUES ($1)`, id)
+			require.NoError(t, err)
+		}
+
+		// An interrupted full down migration leaves the ledger dirty at the nil
+		// version, where migrate.Version() reports "no migration" and drops the
+		// dirty flag: the applied-version read cannot see this state, only the
+		// forward call can.
+		_, err := fixture.db.ExecContext(ctx, `UPDATE schema_migrations SET version = -1, dirty = true`)
+		require.NoError(t, err)
+
+		forwardUp, _ := fixture.writeMigration(t, 2, "forward",
+			`CREATE TABLE forward_two (id int);`, `DROP TABLE forward_two;`)
+		applied, err := fixture.runtime.applyMigrationChange(ctx, forwardUp)
+		require.ErrorIs(t, err, errDirtyMigrationLedger)
+		require.False(t, applied)
+		fixture.requireLedger(t, ctx, "schema_migrations", -1, true)
+		require.False(t, fixture.relationExists(t, ctx, "forward_two"))
+		require.True(t, fixture.relationExists(t, ctx, "sentinel"), "recovering a dirty ledger must never drop the schema")
+		require.Equal(t, 3, fixture.countRows(t, ctx, "sentinel"))
+	})
+
 	t.Run("simultaneous events apply a new migration exactly once", func(t *testing.T) {
 		fixture := newHotReloadFixture(t, ctx, control, ownerConnection, "hot_reload_simultaneous")
 		fixture.writeMigration(t, 1, "sentinel",

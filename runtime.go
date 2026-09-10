@@ -71,8 +71,9 @@ type Runtime struct {
 	retainedDataPath string
 
 	// migrationReload serializes hot-reload migration work against this
-	// database. The watcher delivers a burst of events per save and can deliver
-	// the next one while a migration is still running.
+	// database. Deciding what to apply reads the ledger and applies it in
+	// separate statements, so two reloads at once would both plan from the same
+	// version.
 	migrationReload sync.Mutex
 }
 
@@ -641,8 +642,10 @@ func (s *Runtime) EventHandler(event code.Change) error {
 	applied, err := s.applyMigrationChange(ctx, event.Path)
 	if err != nil {
 		s.Wool.Warn("cannot apply migration change", wool.ErrField(err))
-		return nil
 	}
+	// Reconcile whenever SQL reached the database: an apply failure reports
+	// applied=false, so an error here is a cleanup failure over a schema that
+	// already changed and still needs its runtime grants.
 	if !applied {
 		return nil
 	}

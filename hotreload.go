@@ -19,8 +19,8 @@ import (
 // re-apply SQL whose effects are already present, and — through the down
 // script golang-migrate must execute to replay it — delete live rows. Saving
 // an applied migration is therefore REPORTED, never executed; only a migration
-// above the applied version is applied, through the same forward path used at
-// startup.
+// above the applied version is applied, and only ever by moving the lineage
+// forward — never through a recovery path that rewrites or drops anything.
 
 var (
 	// errAppliedMigrationEdited reports an edit to a migration at or below the
@@ -107,15 +107,20 @@ func (s *Runtime) applyMigrationChange(ctx context.Context, changed string) (app
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
-	// One save fires a burst of events — the up file, its paired down file,
-	// editor churn — and the watcher can deliver the next one while a migration
-	// is still running. Two golang-migrate operations interleaving over one
-	// ledger write each other's version, so hot-reload work against this
-	// database is serialized.
+	file := s.resolveMigrationPath(changed)
+	migration, ok := parseMigrationFile(filepath.Base(file))
+	if !ok {
+		s.Wool.Debug("ignoring change that is not a migration file", wool.Field("file", file))
+		return false, nil
+	}
+	if !migration.forward {
+		s.Wool.Debug("ignoring down migration change", wool.Field("file", file))
+		return false, nil
+	}
+
 	s.migrationReload.Lock()
 	defer s.migrationReload.Unlock()
 
-	file := s.resolveMigrationPath(changed)
 	sources, err := s.migrationSources(ctx)
 	if err != nil {
 		return false, err
@@ -126,16 +131,6 @@ func (s *Runtime) applyMigrationChange(ctx context.Context, changed string) (app
 	}
 	if owner == nil {
 		s.Wool.Debug("ignoring change outside every migration source", wool.Field("file", file))
-		return false, nil
-	}
-	migration, ok := parseMigrationFile(filepath.Base(file))
-	if !ok {
-		s.Wool.Debug("ignoring change that is not a migration file", wool.Field("file", file))
-		return false, nil
-	}
-	if !migration.forward {
-		s.Wool.Debug("ignoring down migration change",
-			wool.Field("file", file), wool.Field("source", owner.label()))
 		return false, nil
 	}
 
@@ -155,9 +150,7 @@ func (s *Runtime) applyMigrationChange(ctx context.Context, changed string) (app
 	case err != nil:
 		return false, s.Wool.Wrapf(err, "cannot read the applied version of source %q", owner.label())
 	case dirty:
-		return false, fmt.Errorf(
-			"%w: source %q is dirty at version %d. An interrupted migration may or may not have committed, so hot reload will not repair it: inspect the schema and the %s table, reconcile them by hand, and clear the dirty flag",
-			errDirtyMigrationLedger, owner.label(), current, owner.trackingTable())
+		return false, dirtyLedgerError(*owner, int64(current))
 	case uint64(current) >= migration.version:
 		return false, fmt.Errorf(
 			"%w: source %q is at version %d, so editing migration %d cannot change the schema — add a new forward migration instead",
@@ -165,8 +158,17 @@ func (s *Runtime) applyMigrationChange(ctx context.Context, changed string) (app
 	}
 
 	s.Wool.Info(fmt.Sprintf("applying migrations for source %s (saw version %d)", owner.label(), migration.version))
-	if err := s.runUp(handle.migration, *owner); err != nil {
-		return false, err
+	// golang-migrate re-reads the ledger under its advisory lock, and waits for
+	// that lock indefinitely — long enough for a concurrent migrator on this
+	// lineage to leave it dirty after the read above. Own the forward call so a
+	// dirty ledger discovered there still fails closed instead of reaching a
+	// recovery path that can drop the schema.
+	if err := handle.migration.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		var dirtyLedger migrate.ErrDirty
+		if errors.As(err, &dirtyLedger) {
+			return false, dirtyLedgerError(*owner, int64(dirtyLedger.Version))
+		}
+		return false, s.Wool.Wrapf(err, "cannot apply migrations for source %q", owner.label())
 	}
 	updated, _, err := handle.migration.Version()
 	if err != nil {
@@ -179,6 +181,15 @@ func (s *Runtime) applyMigrationChange(ctx context.Context, changed string) (app
 	}
 	s.Wool.Info(fmt.Sprintf("applied migrations for source %s up to version %d", owner.label(), updated))
 	return true, nil
+}
+
+// dirtyLedgerError reports an interrupted migration for one lineage. Hot reload
+// never repairs it: a dirty marker does not establish whether the interrupted
+// migration committed, rolled back, or was a downgrade.
+func dirtyLedgerError(src migrationSource, version int64) error {
+	return fmt.Errorf(
+		"%w: source %q is dirty at version %d. An interrupted migration may or may not have committed, so hot reload will not repair it: inspect the schema and the %s table, reconcile them by hand, and clear the dirty flag",
+		errDirtyMigrationLedger, src.label(), version, src.trackingTable())
 }
 
 // migrationWatchRequirements builds the hot-reload watch set from the RESOLVED
