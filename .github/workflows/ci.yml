@@ -55,7 +55,7 @@ jobs:
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
       - name: Run unit tests
-        run: go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker)$' -timeout 20m
+        run: go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
@@ -69,6 +69,16 @@ jobs:
         env:
           SERVICE_POSTGRES_TEST_IMAGE: service-postgres:test
         run: go test . -run '^TestDirtyMigrationFailsClosed$' -timeout 20m
+
+      # Real-database regression for the migration budgets
+      # (codefly-dev/service-postgres#80). Both budgets are enforced by session
+      # GUCs, so only a real backend holding a real lock and running a real long
+      # statement can show that they bite. Same image and same mandatory
+      # prerequisite as the step above.
+      - name: Migration budget regression
+        env:
+          SERVICE_POSTGRES_TEST_IMAGE: service-postgres:test
+        run: go test . -run '^(TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 
       - name: Smoke test runtime image
         shell: bash

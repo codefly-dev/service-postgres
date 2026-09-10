@@ -43,3 +43,20 @@ Set `auth-mode: external-identity` for managed cloud Postgres with password auth
 Consumers acquire a short-lived token at connect time rather than reading a password from the DSN. The primary path is in-process token acquisition with `azidentity` wired into pgx's `BeforeConnect` hook, which sets the per-connection password to a freshly minted token (see `module-saas-starter#154`). The passwordless DSN supplies the host, database, and principal; the token supplies the credential.
 
 For tenant isolation, application migrations must enable row-level security and define policies against transaction-local tenant/user settings. Go services should use the service-owned library at `github.com/codefly-dev/service-postgres/libs/go`, which resolves an authenticated principal from context, issues separate read-only/read-write stores without exposing raw pools, and provides tenant-scoped transaction advisory locks without exposing tenant identity to repository code.
+
+## Operation budgets
+
+Every wait this service performs or renders is bounded, and each bound is configurable under `timeouts:` in the service settings. A value is a whole number of seconds; omitting one selects the default below, and a negative or out-of-range value is rejected when the service loads rather than at the moment the wait would have run.
+
+| Setting | Default | Bounds |
+| --- | --- | --- |
+| `connect-seconds` | 5 | One connection establishment — dial, TLS, and the Postgres startup handshake — for every connection the agent opens against its own database. |
+| `readiness-seconds` | 90 | The whole "the database answers queries" wait in `Init` and `Start`, retries included. |
+| `migration-lock-seconds` | 30 | Acquiring a migration lineage's advisory lock, including the driver-handshake retries that share the one budget. |
+| `migration-statement-seconds` | 600 | One statement inside a migration. |
+| `bootstrap-readiness-seconds` | 300 | The deployed bootstrap container's wait for the database to accept connections. |
+| `bootstrap-job-seconds` | 1800 | The bootstrap `Job`'s `activeDeadlineSeconds`. `backoffLimit` counts failed pods and cannot stop a container that is still running, so the elapsed-time bound is its own field. |
+
+The two migration budgets are session `lock_timeout` and `statement_timeout` on the connection the migration driver owns. They have to be enforced by the server: the driver takes its advisory lock, reads and writes the version row, and drops tables under `context.Background()`, so cancelling the caller does not cancel that SQL.
+
+A budget that expires names the phase it expired in and carries the last database-side failure; connection strings are never included. The bootstrap container distinguishes a database that is merely unavailable — it retries until its budget is spent, then exits `1` — from connection parameters that cannot work, which exit `78` immediately. A budget expiry during a migration leaves the tracking table exactly as it found it, so an interrupted lineage stays available for inspection.

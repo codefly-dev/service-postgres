@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +25,10 @@ import (
 const (
 	postgresDataCacheKey  = "postgres-data"
 	postgresDataDirectory = "/var/lib/postgresql/data"
+
+	// readinessProbeInterval paces the readiness loop. The number of attempts
+	// is whatever the readiness budget affords, not a separate knob.
+	readinessProbeInterval = 3 * time.Second
 )
 
 type persistentCacheMounter interface {
@@ -80,7 +86,7 @@ func NewRuntime() *Runtime {
 func (s *Runtime) Load(ctx context.Context, req *runtimev0.LoadRequest) (*runtimev0.LoadResponse, error) {
 	defer s.Wool.Catch()
 
-	return s.Runtime.LoadService(ctx, req, services.RuntimeLoad{
+	response, err := s.Runtime.LoadService(ctx, req, services.RuntimeLoad{
 		Settings:     s.Settings,
 		Requirements: requirements,
 		ResolveEndpoints: func(ctx context.Context, endpoints []*basev0.Endpoint) error {
@@ -93,6 +99,13 @@ func (s *Runtime) Load(ctx context.Context, req *runtimev0.LoadRequest) (*runtim
 			return nil
 		},
 	})
+	if err != nil {
+		return response, err
+	}
+	if err = s.Settings.Timeouts.validate(); err != nil {
+		return s.Runtime.LoadError(err)
+	}
+	return response, nil
 }
 
 func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtimev0.InitResponse, error) {
@@ -156,7 +169,11 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 
 	}
 
-	s.connection, err = s.createOwnerConnectionString(ctx, configuration, hostInstance.Address, false)
+	connection, err := s.createOwnerConnectionString(ctx, configuration, hostInstance.Address, false)
+	if err != nil {
+		return s.Runtime.InitError(err)
+	}
+	s.connection, err = withConnectTimeout(connection, s.Settings.Timeouts.connect())
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
@@ -330,7 +347,8 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
-	s.Wool.Debug("waiting for database readiness")
+	budget := s.Settings.Timeouts.readiness()
+	s.Wool.Debug("waiting for database readiness", wool.Field("budget", budget.String()))
 
 	// One pool, opened once and reused for every probe. sql.Open is lazy
 	// (it doesn't dial until Ping), so a single *sql.DB pinged in a loop is
@@ -342,22 +360,71 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 		return s.Wool.Wrapf(err, "cannot open database")
 	}
 	defer db.Close()
-	maxRetry := 30
-	var lastErr error
-	for range maxRetry {
-		err = db.Ping()
+
+	deadline, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	retry := time.NewTicker(readinessProbeInterval)
+	defer retry.Stop()
+
+	// The last probe failure that came from the database rather than from our
+	// own budget running out: that is what tells the user why postgres never
+	// answered, and it is lost if a cancellation overwrites it.
+	var lastProbeErr error
+	for {
+		err = probeReady(deadline, db)
 		if err == nil {
-			s.Wool.Debug("ping successful")
-			// Try to execute a simple query
-			_, err = db.Exec("SELECT 1")
-			if err == nil {
-				s.Wool.Debug("database ready!")
-				return nil
-			}
+			s.Wool.Debug("database ready!")
+			return nil
 		}
-		lastErr = err
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			lastProbeErr = err
+		}
 		s.Wool.Debug("waiting for database to be ready", wool.ErrField(err))
-		time.Sleep(3 * time.Second)
+		select {
+		case <-deadline.Done():
+			return s.readinessFailure(ctx, budget, deadline.Err(), lastProbeErr)
+		case <-retry.C:
+		}
+	}
+}
+
+// probeReady answers whether postgres is accepting work, and returns as soon as
+// ctx is done. Establishment is bounded by the DSN's connect_timeout rather
+// than by ctx — libpq reads the startup handshake off a raw socket deadline —
+// so a peer that accepts TCP and then goes silent would otherwise hold a
+// cancelled caller for the whole connect budget.
+func probeReady(ctx context.Context, db *sql.DB) error {
+	probe := make(chan error, 1)
+	go func() {
+		if err := db.PingContext(ctx); err != nil {
+			probe <- err
+			return
+		}
+		// A backend that accepts connections is not necessarily one that runs
+		// queries: postgres answers the handshake during crash recovery and
+		// refuses statements until it finishes.
+		_, err := db.ExecContext(ctx, "SELECT 1")
+		probe <- err
+	}()
+	select {
+	case err := <-probe:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// readinessFailure names the phase, says whether the budget ran out or the
+// caller gave up, and carries the last database-side failure. The connection
+// string is never included: it holds the migration-owner password.
+func (s *Runtime) readinessFailure(ctx context.Context, budget time.Duration, ended, lastProbeErr error) error {
+	phase := fmt.Sprintf("database readiness budget of %s expired", budget)
+	if errors.Is(ended, context.Canceled) {
+		phase = "database readiness wait cancelled"
+	}
+	if lastProbeErr == nil {
+		lastProbeErr = ended
 	}
 	// Tail container logs so the user sees the real failure (bad CMD,
 	// disk full, port collision, ...) instead of a generic timeout.
@@ -366,9 +433,9 @@ func (s *Runtime) WaitForReady(ctx context.Context) error {
 		tail = s.runnerEnvironment.TailLogs(ctx, 30)
 	}
 	if tail != "" {
-		return s.Wool.NewError("database not ready after %d retries (last probe: %v); container logs (tail 30):\n%s", maxRetry, lastErr, tail)
+		return s.Wool.NewError("%s (last probe: %v); container logs (tail 30):\n%s", phase, lastProbeErr, tail)
 	}
-	return s.Wool.NewError("database not ready after %d retries (last probe: %v)", maxRetry, lastErr)
+	return s.Wool.NewError("%s (last probe: %v)", phase, lastProbeErr)
 }
 
 func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runtimev0.StartResponse, error) {

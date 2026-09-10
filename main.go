@@ -108,6 +108,11 @@ type Settings struct {
 	// Paths are relative to this service's directory (or absolute). A source
 	// whose directory is missing is skipped with a warning.
 	MigrationSources []MigrationSource `yaml:"migration-sources"`
+
+	// Timeouts bounds every wait this agent performs or renders: readiness
+	// probing, connection establishment, migration locking and statements, and
+	// the deployed bootstrap Job. See Timeouts for the keys and defaults.
+	Timeouts Timeouts `yaml:"timeouts"`
 }
 
 // MigrationSource declares one additional service contributing migrations to
@@ -165,6 +170,7 @@ type DeploymentTemplateParameters struct {
 	ManagedImage                 string
 	BootstrapJobName             string
 	DatabaseName                 string
+	BootstrapJobDeadlineSeconds  int
 	StatefulSetSecretReferences  map[string]*builderv0.KubernetesSecretKeyReference
 	BootstrapJobSecretReferences map[string]*builderv0.KubernetesSecretKeyReference
 }

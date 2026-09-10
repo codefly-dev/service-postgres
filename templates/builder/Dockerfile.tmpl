@@ -51,6 +51,20 @@ RUN find /app/migrations -maxdepth 1 -type f | while read -r file; do \
 COPY runtime-access.sql /app/runtime-access.sql
 
 CMD set -eu; \
-    until pg_isready -d "${{.MigrationConnectionKeyHolder}}" >/dev/null 2>&1; do sleep 2; done; \
+    readiness_deadline=$(($(date +%s) + {{ .ReadinessTimeoutSeconds }})); \
+    while :; do \
+      readiness=0; \
+      pg_isready -q -d "${{.MigrationConnectionKeyHolder}}" || readiness=$?; \
+      if [ "$readiness" -eq 0 ]; then break; fi; \
+      if [ "$readiness" -eq 3 ]; then \
+        echo "bootstrap: database connection parameters are invalid (pg_isready status 3)" >&2; \
+        exit 78; \
+      fi; \
+      if [ "$(date +%s)" -ge "$readiness_deadline" ]; then \
+        echo "bootstrap: database did not accept connections within {{ .ReadinessTimeoutSeconds }}s (last pg_isready status $readiness)" >&2; \
+        exit 1; \
+      fi; \
+      sleep 2; \
+    done; \
 {{ if .WithMigration }}    /usr/local/bin/migrate -path /app/migrations -database "${{.MigrationConnectionKeyHolder}}" up; \
 {{ end }}    psql "${{.MigrationConnectionKeyHolder}}" --no-psqlrc --set=ON_ERROR_STOP=1 --file=/app/runtime-access.sql
