@@ -49,7 +49,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test ./... -skip '^TestCreateToRunDocker$'
+        run: go test ./... -skip '^TestCreateToRunDocker$|^TestLifecycleContractDocker$'
 
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
@@ -161,6 +161,9 @@ jobs:
             ["linux/amd64", "linux/arm64"]
           ' <<< "$manifest"
           docker --config "$anonymous_docker_config" pull "$RUNTIME_IMAGE"
+
+      - name: Run runtime lifecycle tests
+        run: go test . -run '^TestLifecycleContractDocker$' -count=1
 
       - name: Scan published runtime image
         env:

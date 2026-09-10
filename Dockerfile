@@ -26,6 +26,7 @@ RUN rm /usr/local/bin/gosu
 RUN apk add --no-cache --upgrade \
     libcrypto3=3.5.8-r0 \
     libssl3=3.5.8-r0 \
+    libuuid=2.42.3-r1 \
     su-exec=0.3-r0 && \
     ln -s /sbin/su-exec /usr/local/bin/gosu && \
     rm /var/log/apk.log
