@@ -49,6 +49,18 @@ func (m migrationSource) fileURL() string {
 	return u.String()
 }
 
+// defaultMigrationsTable mirrors the postgres driver default applied when
+// postgres.Config.MigrationsTable is empty.
+const defaultMigrationsTable = "schema_migrations"
+
+// trackingTable is the golang-migrate version table this lineage records into.
+func (m migrationSource) trackingTable() string {
+	if m.table == "" {
+		return defaultMigrationsTable
+	}
+	return m.table
+}
+
 // migrationSources resolves every migration lineage to apply to the shared
 // database: this service's own ./migrations dir (when present) plus each entry
 // in Settings.MigrationSources. A source whose directory does not exist is
@@ -143,8 +155,7 @@ func (s *Runtime) applyMigration(ctx context.Context) error {
 
 // applySource brings ONE migration lineage up to date against the shared db,
 // using that source's dedicated tracking table. Retries the driver handshake a
-// few times (the pool may still be warming up) and self-heals a dirty state
-// left by an interrupted prior run.
+// few times (the pool may still be warming up); a dirty lineage fails closed.
 func (s *Runtime) applySource(ctx context.Context, src migrationSource) error {
 	maxRetry := 3
 	var lastErr error
@@ -235,36 +246,52 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 	return &migrationHandle{migration: migration, pool: pool}, nil
 }
 
-// runUp runs m.Up with dirty-state self-healing for a single source.
+// DirtyMigrationError reports one migration lineage left in golang-migrate's
+// dirty state by an interrupted run. It carries the lineage identity and the
+// version the ledger is stuck on, and it unwraps to migrate.ErrDirty so callers
+// can still classify the failure with errors.As.
+type DirtyMigrationError struct {
+	Source  string
+	Table   string
+	Version int
+	Dirty   migrate.ErrDirty
+}
+
+func (e *DirtyMigrationError) Error() string {
+	return fmt.Sprintf(
+		"migration lineage %q is dirty at version %d (tracking table %s): an earlier migration run was interrupted, "+
+			"so the schema no longer matches the ledger. Automatic recovery is disabled because a dirty marker does not say "+
+			"what happened — the SQL may have committed before the marker was cleared, the migration may span several "+
+			"transactions, or the interrupted operation may have been a downgrade. Inspect, back up, and reconcile the lineage "+
+			"by hand; see docs/dirty-migrations.md",
+		e.Source, e.Version, e.Table)
+}
+
+func (e *DirtyMigrationError) Unwrap() error { return e.Dirty }
+
+// runUp brings one lineage up to date. A dirty ledger fails closed: golang-migrate's
+// Drop deletes every base table in the schema — including the other services sharing
+// this database — and forcing version-1 assumes both that the interrupted migration
+// rolled back and that versions are consecutive, neither of which a dirty marker
+// establishes.
 func (s *Runtime) runUp(m *migrate.Migrate, src migrationSource) error {
 	err := m.Up()
 	if err == nil || errors.Is(err, migrate.ErrNoChange) {
 		return nil
 	}
 
-	// Self-heal a dirty database left by an INTERRUPTED prior migration
-	// (process killed mid-apply). golang-migrate runs each migration file
-	// atomically, so a dirty version V means V fully rolled back and the schema
-	// is clean at V-1. Force the version pointer back to V-1 (clearing the dirty
-	// flag) and re-run Up to re-apply V onward. Without this, a single
-	// interrupted run wedges the database forever ("Dirty database version N").
 	var dirty migrate.ErrDirty
 	if errors.As(err, &dirty) {
-		s.Wool.Warn("recovering dirty migration",
-			wool.Field("source", src.label()), wool.Field("dirty_version", dirty.Version))
-		if dirty.Version <= 1 {
-			// Dirty at the FIRST migration: there is no "version 0" to force back
-			// to. The clean state is "nothing applied" — Drop and re-apply.
-			if derr := m.Drop(); derr != nil {
-				return s.Wool.Wrapf(derr, "cannot drop to recover dirty migration %d", dirty.Version)
-			}
-		} else if ferr := m.Force(dirty.Version - 1); ferr != nil {
-			return s.Wool.Wrapf(ferr, "cannot force dirty migration %d to clean state", dirty.Version)
+		s.Wool.Error("migration lineage is dirty; refusing to migrate",
+			wool.Field("source", src.label()),
+			wool.Field("tracking_table", src.trackingTable()),
+			wool.Field("dirty_version", dirty.Version))
+		return &DirtyMigrationError{
+			Source:  src.label(),
+			Table:   src.trackingTable(),
+			Version: dirty.Version,
+			Dirty:   dirty,
 		}
-		if uerr := m.Up(); uerr != nil && !errors.Is(uerr, migrate.ErrNoChange) {
-			return s.Wool.Wrapf(uerr, "cannot re-apply migrations after dirty recovery")
-		}
-		return nil
 	}
 	return s.Wool.Wrapf(err, "can't apply migration")
 }
