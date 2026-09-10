@@ -104,6 +104,7 @@ func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*
 }
 
 type DockerTemplating struct {
+	Bootstrap                    *bootstrapImageLock
 	MigrationConnectionKeyHolder string
 	WithMigration                bool
 	ReadOnlyRole                 string
@@ -144,6 +145,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		return s.Builder.BuildError(err)
 	}
 	docker := DockerTemplating{
+		Bootstrap:                    bootstrapLock,
 		MigrationConnectionKeyHolder: fmt.Sprintf("{%s}", migrationConnectionEnvironmentKey),
 		WithMigration:                s.WithMigration(),
 		ReadOnlyRole:                 readOnlyRole,
@@ -242,6 +244,10 @@ func (s *Builder) buildRecipe(ctx context.Context, outputDirectory string, img *
 		Context:    ".",
 		Image:      img.FullName(),
 		Platforms:  []string{"linux/amd64", "linux/arm64"},
+		// The recipe carries the resolved bootstrap inputs it was rendered from, so a
+		// consumer reads the base, package and migrate identities off the plan
+		// instead of re-resolving them.
+		BuildArgs: docker.Bootstrap.RecipeBuildArgs(),
 	}})
 	if err != nil {
 		return s.Builder.BuildError(err)
