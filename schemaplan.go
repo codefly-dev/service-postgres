@@ -62,11 +62,10 @@ type schemaAccess struct {
 // NoMigration packages no lineage at all, mirroring applySchema: extensions and
 // runtime grants still apply, so the image does exactly what the runtime does.
 //
-// A lineage holding no migration is not packaged either. Only the own
-// ./migrations directory can reach here empty — a declared source must hold one
-// or say it is optional — and golang-migrate reports an empty source as a
-// missing first version rather than "no change", so staging one would fail the
-// bootstrap Job.
+// Every resolved source is packaged as it comes. resolveSchemaPrerequisites
+// already excludes a lineage with no migration, and skipping one here as well
+// would hide a lineage from the image that the runtime still tried to apply —
+// the divergence this packaging exists to remove.
 func buildSchemaPlan(prerequisites *schemaPrerequisites, settings *Settings) (*schemaPlan, error) {
 	access, err := resolveSchemaAccess(settings)
 	if err != nil {
@@ -84,9 +83,6 @@ func buildSchemaPlan(prerequisites *schemaPrerequisites, settings *Settings) (*s
 		files, filesErr := stagedFiles(source.dir)
 		if filesErr != nil {
 			return nil, fmt.Errorf("cannot inventory migration source %q: %w", source.label(), filesErr)
-		}
-		if len(files) == 0 {
-			continue
 		}
 		plan.lineages = append(plan.lineages, schemaLineage{
 			migrationSource: source,

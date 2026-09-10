@@ -176,10 +176,11 @@ func TestSchemaPlanPackagesNothingWithoutMigrations(t *testing.T) {
 	require.NotEmpty(t, plan.access.readWriteRole)
 }
 
-// TestSchemaPlanSkipsAnEmptyOwnLineage covers the one lineage that can resolve
-// empty. golang-migrate reports an empty source as a missing first version
-// rather than "no change", so staging it would fail the bootstrap Job.
-func TestSchemaPlanSkipsAnEmptyOwnLineage(t *testing.T) {
+// TestSchemaPlanPackagesNoEmptyLineage checks the packaging consequence of the
+// resolver excluding a lineage with no migration: the staged tree and the
+// numbering start at the first lineage that actually has one, so the image never
+// carries a source golang-migrate would reject as a missing first version.
+func TestSchemaPlanPackagesNoEmptyLineage(t *testing.T) {
 	root := t.TempDir()
 	location := filepath.Join(root, "store")
 	mustMkdir(t, filepath.Join(location, "migrations"))
