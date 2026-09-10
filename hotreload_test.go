@@ -100,8 +100,8 @@ func TestMigrationWatchRequirementsCoverEveryDeclaredSource(t *testing.T) {
 	root := t.TempDir()
 	location := filepath.Join(root, "store")
 	mustMkdir(t, filepath.Join(location, "migrations"))
-	mustMkdir(t, filepath.Join(root, "api", "migrations"))
-	mustMkdir(t, filepath.Join(root, "billing", "db", "migrations"))
+	mustMigrationDir(t, filepath.Join(root, "api", "migrations"))
+	mustMigrationDir(t, filepath.Join(root, "billing", "db", "migrations"))
 
 	fixed := len(requirements.Components)
 	s := NewRuntime()
@@ -205,7 +205,7 @@ func assertHotReloadPreservesAppliedHistory(
 				fmt.Sprintf(`ALTER TABLE sentinel ADD COLUMN step%d int;`, version),
 				fmt.Sprintf(`ALTER TABLE sentinel DROP COLUMN step%d;`, version))
 		}
-		require.NoError(t, fixture.runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, fixture.runtime))
 		fixture.requireLedger(t, ctx, "schema_migrations", 5, false)
 		for id := 1; id <= 3; id++ {
 			_, err := fixture.db.ExecContext(ctx, `INSERT INTO sentinel (id) VALUES ($1)`, id)
@@ -247,7 +247,7 @@ func assertHotReloadPreservesAppliedHistory(
 		fixture := newHotReloadFixture(t, ctx, control, ownerConnection, "hot_reload_event_filter")
 		fixture.writeMigration(t, 1, "sentinel",
 			`CREATE TABLE sentinel (id int PRIMARY KEY);`, `DROP TABLE sentinel;`)
-		require.NoError(t, fixture.runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, fixture.runtime))
 		fixture.requireLedger(t, ctx, "schema_migrations", 1, false)
 
 		// A sibling service declares its own lineage into this database after
@@ -304,7 +304,7 @@ func assertHotReloadPreservesAppliedHistory(
 		fixture := newHotReloadFixture(t, ctx, control, ownerConnection, "hot_reload_dirty_ledger")
 		fixture.writeMigration(t, 1, "sentinel",
 			`CREATE TABLE sentinel (id int PRIMARY KEY);`, `DROP TABLE sentinel;`)
-		require.NoError(t, fixture.runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, fixture.runtime))
 		_, err := fixture.db.ExecContext(ctx, `UPDATE schema_migrations SET dirty = true`)
 		require.NoError(t, err)
 
@@ -330,7 +330,7 @@ func assertHotReloadPreservesAppliedHistory(
 		fixture := newHotReloadFixture(t, ctx, control, ownerConnection, "hot_reload_nil_version_dirty")
 		fixture.writeMigration(t, 1, "sentinel",
 			`CREATE TABLE sentinel (id int PRIMARY KEY);`, `DROP TABLE sentinel;`)
-		require.NoError(t, fixture.runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, fixture.runtime))
 		for id := 1; id <= 3; id++ {
 			_, err := fixture.db.ExecContext(ctx, `INSERT INTO sentinel (id) VALUES ($1)`, id)
 			require.NoError(t, err)
@@ -358,7 +358,7 @@ func assertHotReloadPreservesAppliedHistory(
 		fixture := newHotReloadFixture(t, ctx, control, ownerConnection, "hot_reload_simultaneous")
 		fixture.writeMigration(t, 1, "sentinel",
 			`CREATE TABLE sentinel (id int PRIMARY KEY);`, `DROP TABLE sentinel;`)
-		require.NoError(t, fixture.runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, fixture.runtime))
 		forwardUp, forwardDown := fixture.writeMigration(t, 2, "forward",
 			`CREATE TABLE forward_two (id int);`, `DROP TABLE forward_two;`)
 

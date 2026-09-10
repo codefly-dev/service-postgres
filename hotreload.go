@@ -121,7 +121,7 @@ func (s *Runtime) applyMigrationChange(ctx context.Context, changed string) (app
 	s.migrationReload.Lock()
 	defer s.migrationReload.Unlock()
 
-	sources, err := s.migrationSources(ctx)
+	sources, _, err := s.resolveMigrationSources()
 	if err != nil {
 		return false, err
 	}
@@ -197,7 +197,7 @@ func dirtyLedgerError(src migrationSource, version int64) error {
 // The fixed build requirements only ever name this service's own ./migrations,
 // which left every additional source's files unwatched.
 func (s *Runtime) migrationWatchRequirements(ctx context.Context) (*builders.Dependencies, error) {
-	sources, err := s.migrationSources(ctx)
+	sources, _, err := s.resolveMigrationSources()
 	if err != nil {
 		return nil, err
 	}
