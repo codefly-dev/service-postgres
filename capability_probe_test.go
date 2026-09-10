@@ -120,6 +120,11 @@ func (p *postgresCapabilityProbe) InstallDelegatedWriteRole(ctx context.Context,
 	return nil
 }
 
+func (p *postgresCapabilityProbe) RevokeRoleMembership(ctx context.Context, role, member string) error {
+	_, err := p.db.ExecContext(ctx, `REVOKE `+pq.QuoteIdentifier(role)+` FROM `+pq.QuoteIdentifier(member))
+	return err
+}
+
 type scopedFixtureRepository struct {
 	factory  *scoped.Factory
 	relation string
