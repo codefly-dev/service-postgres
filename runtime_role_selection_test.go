@@ -65,10 +65,10 @@ func TestDefaultRuntimeReadWriteRoleIsStableWhenRolesAreAppended(t *testing.T) {
 // default role has to be established there too.
 func TestRuntimeAccessTemplateSetsTheDefaultReadWriteRole(t *testing.T) {
 	base := DockerTemplating{
-		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
-		ReadOnlyRole:                 "codefly_app_ro",
-		ReadWriteRole:                "codefly_app_rw",
-		Schemas:                      []string{"public"},
+		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
+		ReadOnlyRole:                   "codefly_app_ro",
+		ReadWriteRole:                  "codefly_app_rw",
+		Schemas:                        []string{"public"},
 	}
 
 	delegated := base

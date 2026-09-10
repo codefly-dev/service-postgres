@@ -262,7 +262,7 @@ func lockArchives(document map[string]any) []any {
 
 func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
+		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
 	})
 
 	require.Contains(t, dockerfile, "FROM "+bootstrapLock.Base.Reference())
@@ -394,7 +394,7 @@ func TestBootstrapImageLabelsCannotBeOverriddenAtBuildTime(t *testing.T) {
 func TestBootstrapImageRejectsTamperedMigrateArchive(t *testing.T) {
 	requireDocker(t)
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
+		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
 	})
 	script := bootstrapMigrateInstallScript(t, dockerfile)
 
@@ -421,14 +421,19 @@ func bootstrapBuildContext(t *testing.T) string {
 	t.Helper()
 	context := t.TempDir()
 	parameters := DockerTemplating{
-		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
-		RuntimeAccessLockID:          runtimeAccessLockID,
+		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
+		RuntimeAccessLockID:            runtimeAccessLockID,
+		ReadinessTimeoutSeconds:        defaultBootstrapReadinessSeconds,
 	}
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", parameters)
 	require.NoError(t, os.WriteFile(filepath.Join(context, "Dockerfile"), []byte(dockerfile), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(context, "runtime-access.sql"), []byte("SELECT 1;\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(context, "bootstrap.sql"),
 		[]byte(renderBootstrapTemplate(t, parameters)), 0o644))
+	staged := filepath.Join(context, bootstrapDirectory)
+	require.NoError(t, os.MkdirAll(staged, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(staged, "bootstrap.sh"),
+		[]byte(renderStagedTemplate(t, "templates/bootstrap/bootstrap.sh.tmpl", parameters)), 0o644))
 	return context
 }
 

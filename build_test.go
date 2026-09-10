@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,8 +82,12 @@ func TestBuildRejectsUnresolvableSchemaDeclaration(t *testing.T) {
 // TestBuildDoesNotClaimSchemaItDoesNotPackage locks the other half: the build
 // validates declared sources but packages only this service's own migrations,
 // so reporting the resolved plan here would tell an operator the bootstrap
-// image carries schema it does not.
-func TestBuildDoesNotClaimSchemaItDoesNotPackage(t *testing.T) {
+// TestBuildPackagesTheSchemaItReports inverts a constraint this build used to
+// carry: it packaged only the service's own migrations, so reporting a resolved
+// plan would have claimed image content that did not exist. The build now stages
+// every resolved source, so the report is truthful — and the assertion is that
+// the sibling's migration is actually in the tree, not merely mentioned.
+func TestBuildPackagesTheSchemaItReports(t *testing.T) {
 	ctx := context.Background()
 	builder := newBuildTestBuilder(t)
 	sibling := filepath.Join(filepath.Dir(builder.Location), "api", "migrations")
@@ -96,11 +101,14 @@ func TestBuildDoesNotClaimSchemaItDoesNotPackage(t *testing.T) {
 	// against a line the level filter dropped rather than one never emitted.
 	builder.Wool.WithLoglevel(wool.DEBUG)
 
-	response, err := builder.Build(ctx, buildRequest(t.TempDir()))
+	outputDirectory := t.TempDir()
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
 	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
-	require.False(t, sink.saw("schema prerequisites resolved"),
-		"the build reported a resolved plan for schema it does not package")
+	require.True(t, sink.saw("schema prerequisites resolved"),
+		"the build no longer reports what it resolved")
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "01-api", "1_init.up.sql"),
+		"the build reported a declared source it did not package")
 }
 
 func TestBuildEmitsRecipeToOutputDirectory(t *testing.T) {
@@ -126,17 +134,21 @@ func TestBuildEmitsRecipeToOutputDirectory(t *testing.T) {
 	// The rendered tree is a self-contained context: a consumer with no codefly
 	// toolchain can build it from the emitted files alone.
 	require.FileExists(t, filepath.Join(outputDirectory, "builder", "Dockerfile"))
-	require.FileExists(t, filepath.Join(outputDirectory, "migrations", "1_create_table.up.sql"))
-	require.FileExists(t, filepath.Join(outputDirectory, "migrations", "1_create_table.down.sql"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "bootstrap.sh"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "extensions.sql"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "plan.json"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_create_table.down.sql"))
 
-	// The CLI resolves the recipe's "." context to the service directory, so the
-	// runtime-access.sql the Dockerfile COPYs root-relative must sit at the service
-	// directory root beside the committed migrations/ — otherwise the COPY the CLI
-	// runs against that context fails to resolve.
+	// The CLI resolves the recipe's "." context to the service directory, so
+	// everything the Dockerfile COPYs root-relative must also sit at the service
+	// directory root — otherwise the COPY the CLI runs fails to resolve.
 	require.FileExists(t, filepath.Join(builder.Location, "runtime-access.sql"))
+	require.FileExists(t, filepath.Join(builder.Location, "bootstrap", "bootstrap.sh"))
+	require.FileExists(t, filepath.Join(builder.Location, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
 
-	// It is also rendered into the recipe tree (never under builder/) so the emitted
-	// artifact stays a self-contained context a consumer can build directly.
+	// runtime-access.sql is also rendered into the recipe tree (never under
+	// builder/) so the emitted artifact stays a self-contained context.
 	require.FileExists(t, filepath.Join(outputDirectory, "runtime-access.sql"))
 	require.NoFileExists(t, filepath.Join(outputDirectory, "builder", "runtime-access.sql"))
 
@@ -163,6 +175,7 @@ func TestFactoryScaffoldsGitignoreForGeneratedRuntimeAccess(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(builder.Location, ".gitignore"))
 	require.NoError(t, err, "Create must scaffold a .gitignore at the service root")
 	require.Contains(t, string(data), "/runtime-access.sql")
+	require.Contains(t, string(data), "/bootstrap.sql")
 }
 
 func TestBuildRecipeOmitsMigrationsWhenDisabled(t *testing.T) {
@@ -175,7 +188,18 @@ func TestBuildRecipeOmitsMigrationsWhenDisabled(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
-	require.NoDirExists(t, filepath.Join(outputDirectory, "migrations"))
+	// Extension-only bootstrap: the artifact is still emitted and the image
+	// still reconciles runtime grants, but no lineage is staged or applied.
+	require.NoDirExists(t, filepath.Join(outputDirectory, "bootstrap", "sources"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "extensions.sql"))
+	require.FileExists(t, filepath.Join(outputDirectory, "runtime-access.sql"))
+	program, err := os.ReadFile(filepath.Join(outputDirectory, "bootstrap", "bootstrap.sh"))
+	require.NoError(t, err)
+	require.NotContains(t, readRendered(t, outputDirectory, "bootstrap.sql"), "/usr/local/bin/migrate")
+	require.Contains(t, string(program), "/app/bootstrap.sql")
+
+	require.Empty(t, readPlanArtifact(t, outputDirectory).Lineages)
+
 	require.NotNil(t, response.GetResult().GetDockerBuildPlan())
 	require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
 }
@@ -202,7 +226,7 @@ func TestBuildRecipePurgesPreexistingOutputDirectory(t *testing.T) {
 
 	require.NoFileExists(t, filepath.Join(outputDirectory, "stale-root.txt"))
 	require.NoFileExists(t, filepath.Join(outputDirectory, "migrations", "9_stale.up.sql"))
-	require.FileExists(t, filepath.Join(outputDirectory, "migrations", "1_create_table.up.sql"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
 
 	plan := response.GetResult().GetDockerBuildPlan()
 	require.NotNil(t, plan)
@@ -212,22 +236,173 @@ func TestBuildRecipePurgesPreexistingOutputDirectory(t *testing.T) {
 	require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, plan))
 }
 
-// TestBuildRecipeCreatesEmptyMigrationsDirectory covers migrations enabled with
-// none authored yet: the recipe must still carry a migrations directory so the
-// Dockerfile's COPY migrations resolves, matching the legacy in-agent build.
-func TestBuildRecipeCreatesEmptyMigrationsDirectory(t *testing.T) {
+// TestBuildRecipeTreatsOwnSourceAbsenceAndEmptinessAlike covers the two ways a
+// service can carry no own migrations. Both must bootstrap identically, and
+// neither may emit a migrate invocation: golang-migrate reports an empty source
+// as a missing first version, not as "no change", so applying one would fail the
+// bootstrap Job.
+func TestBuildRecipeTreatsOwnSourceAbsenceAndEmptinessAlike(t *testing.T) {
+	ctx := context.Background()
+	programs := map[string]string{}
+	for name, prepare := range map[string]func(*Builder){
+		"absent": func(builder *Builder) {
+			require.NoError(t, os.RemoveAll(builder.Local("migrations")))
+		},
+		"empty": func(builder *Builder) {
+			require.NoError(t, os.RemoveAll(builder.Local("migrations")))
+			require.NoError(t, os.MkdirAll(builder.Local("migrations"), 0o755))
+		},
+	} {
+		builder := newBuildTestBuilder(t)
+		prepare(builder)
+		outputDirectory := t.TempDir()
+
+		response, err := builder.Build(ctx, buildRequest(outputDirectory))
+		require.NoError(t, err)
+		require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+		program, err := os.ReadFile(filepath.Join(outputDirectory, "bootstrap", "bootstrap.sh"))
+		require.NoError(t, err)
+		require.NotContains(t, readRendered(t, outputDirectory, "bootstrap.sql"), "/usr/local/bin/migrate", name)
+		require.Contains(t, string(program), "/app/bootstrap.sql", name)
+		require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
+		require.Empty(t, readPlanArtifact(t, outputDirectory).Lineages, name)
+		programs[name] = string(program)
+	}
+	require.Equal(t, programs["absent"], programs["empty"],
+		"an absent and an empty own migrations directory must bootstrap identically")
+}
+
+// TestBuildStagesSiblingSourcesIntoTheBuildContext is the packaging half of the
+// local multi-source contract: a service whose tables come from sibling
+// directories must ship those bytes, since a Dockerfile COPY cannot reach
+// outside its context.
+func TestBuildStagesSiblingSourcesIntoTheBuildContext(t *testing.T) {
 	ctx := context.Background()
 	builder := newBuildTestBuilder(t)
-	require.NoError(t, os.RemoveAll(builder.Local("migrations")))
-	require.NoError(t, os.MkdirAll(builder.Local("migrations"), 0o755))
+	writeMigration(t, filepath.Join(filepath.Dir(builder.Location), "api", "migrations"), "1_api.up.sql")
+	writeMigration(t, filepath.Join(filepath.Dir(builder.Location), "billing", "migrations"), "1_billing.up.sql")
+	builder.Settings.MigrationSources = []MigrationSource{{Name: "api"}, {Name: "billing"}}
 	outputDirectory := t.TempDir()
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
 	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
-	require.DirExists(t, filepath.Join(outputDirectory, "migrations"))
+	for _, contextRoot := range []string{builder.Location, outputDirectory} {
+		require.FileExists(t, filepath.Join(contextRoot, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
+		require.FileExists(t, filepath.Join(contextRoot, "bootstrap", "sources", "01-api", "1_api.up.sql"))
+		require.FileExists(t, filepath.Join(contextRoot, "bootstrap", "sources", "02-billing", "1_billing.up.sql"))
+	}
+
+	// The migrate invocations live in the locked psql session, one per lineage.
+	bootstrapSQL := readRendered(t, outputDirectory, "bootstrap.sql")
+	require.Contains(t, bootstrapSQL, `-path /app/bootstrap/sources/01-api`)
+	require.Contains(t, bootstrapSQL, `x-migrations-table=schema_migrations_api`)
+	require.Contains(t, bootstrapSQL, `-path /app/bootstrap/sources/02-billing`)
+	require.Contains(t, bootstrapSQL, `x-migrations-table=schema_migrations_billing`)
+
+	artifact := readPlanArtifact(t, outputDirectory)
+	require.Len(t, artifact.Lineages, 3)
+	require.Equal(t,
+		[]string{"schema_migrations", "schema_migrations_api", "schema_migrations_billing"},
+		[]string{artifact.Lineages[0].Ledger, artifact.Lineages[1].Ledger, artifact.Lineages[2].Ledger})
+	// The artifact must stay machine-independent so its digest is reproducible.
+	require.NotContains(t, string(mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "plan.json"))), builder.Location)
+
 	require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
+}
+
+// TestBuildRejectsUnresolvedDeclaredSource covers the required-declaration rule:
+// local development tolerates a sibling that has not shipped migrations yet, but
+// a build that cannot stage the bytes must fail rather than emit an image that
+// silently leaves those tables out.
+func TestBuildRejectsUnresolvedDeclaredSource(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+	builder.Settings.MigrationSources = []MigrationSource{{Name: "api"}}
+	outputDirectory := t.TempDir()
+
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState())
+	require.Contains(t, response.GetState().GetMessage(), "api")
+}
+
+// TestBuildPlanDigestTracksMigrationContent proves the emitted evidence follows
+// the bytes: mutating one migration changes the plan digest, the staged content,
+// and the recipe digest the Job identity is derived from.
+func TestBuildPlanDigestTracksMigrationContent(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+	outputDirectory := t.TempDir()
+
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	before := readPlanArtifact(t, outputDirectory)
+	recipeDigestBefore := response.GetResult().GetDockerBuildPlan().GetDigest()
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(builder.Location, "migrations", "1_create_table.up.sql"),
+		[]byte("CREATE TABLE example (id UUID PRIMARY KEY);\n"), 0o644))
+
+	response, err = builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	after := readPlanArtifact(t, outputDirectory)
+
+	require.NotEqual(t, before.Digest, after.Digest)
+	require.NotEqual(t, before.Lineages[0].Files[1].Digest, after.Lineages[0].Files[1].Digest)
+	require.NotEqual(t, recipeDigestBefore, response.GetResult().GetDockerBuildPlan().GetDigest())
+	require.Contains(t,
+		string(mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))),
+		"id UUID PRIMARY KEY")
+}
+
+// TestBuildRecipeCarriesNoSecrets guards the emitted artifact and the image
+// contents: the build context is the whole service directory, which holds the
+// generated local secret file every scaffolded service carries.
+func TestBuildRecipeCarriesNoSecrets(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+	secretDirectory := filepath.Join(builder.Location, "configurations", "local")
+	require.NoError(t, os.MkdirAll(secretDirectory, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(secretDirectory, "postgres.secret.env"),
+		[]byte("POSTGRES_PASSWORD=super-secret\n"), 0o600))
+	outputDirectory := t.TempDir()
+
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	require.NoError(t, filepath.WalkDir(outputDirectory, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		require.NotContains(t, string(mustReadFile(t, path)), "super-secret", path)
+		return nil
+	}))
+
+	dockerfile := string(mustReadFile(t, filepath.Join(outputDirectory, "builder", "Dockerfile")))
+	require.NotContains(t, dockerfile, "COPY . .",
+		"a wholesale copy would bake the service directory's local secrets into the image")
+}
+
+func readPlanArtifact(t *testing.T, contextRoot string) schemaPlanArtifact {
+	t.Helper()
+	var artifact schemaPlanArtifact
+	require.NoError(t, json.Unmarshal(mustReadFile(t, filepath.Join(contextRoot, "bootstrap", "plan.json")), &artifact))
+	require.Equal(t, schemaPlanContractVersion, artifact.ContractVersion)
+	return artifact
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return content
 }
 
 // TestBuildRecipeLocksBootstrapInputs covers the recipe a consumer builds without

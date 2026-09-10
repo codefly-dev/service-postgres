@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -26,6 +27,11 @@ import (
 	"github.com/codefly-dev/core/shared"
 	"gopkg.in/yaml.v3"
 )
+
+// bootstrapDirectory is the agent-owned staging root written into the build
+// context. It carries the generated bootstrap program, the plan identity, and
+// one immutable copy of every packaged migration source.
+const bootstrapDirectory = "bootstrap"
 
 type Builder struct {
 	services.BuilderServer
@@ -103,21 +109,24 @@ func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*
 	return s.Builder.UpgradeResponse(res.Changes, res.LockfileDiff)
 }
 
+// DockerTemplating renders the bootstrap image: the Dockerfile, the generated
+// bootstrap program, and the SQL it applies. Every field is derived from the
+// schema plan, so the image can only carry what the plan declares.
 type DockerTemplating struct {
-	MigrationConnectionKeyHolder string
+	MigrationConnectionEnvironment string
 	// RuntimeAccessLockID is the advisory-lock expression the bootstrap script
 	// takes, shared verbatim with the agent so the two cannot drift apart.
-	RuntimeAccessLockID      string
-	WithMigration            bool
-	MigrationFileNamePattern string // rendered so the image prunes exactly what the runtime filter hides
-	ReadinessTimeoutSeconds  int
-	ReadOnlyRole             string
-	ReadWriteRole            string
-	Schemas                  []string
-	ReadWriteRoles           []string
+	RuntimeAccessLockID     string
+	ReadinessTimeoutSeconds int
+	ReadOnlyRole            string
+	ReadWriteRole           string
+	Schemas                 []string
+	ReadWriteRoles          []string
 	// DefaultReadWriteRole is the application role the managed read-write login
 	// selects on connect. See defaultRuntimeReadWriteRole.
 	DefaultReadWriteRole string
+	Extensions           []BootstrapExtension
+	Lineages             []BootstrapLineage
 }
 
 // Bootstrap resolves the locked bootstrap inputs the Dockerfile renders from. A
@@ -127,8 +136,42 @@ func (DockerTemplating) Bootstrap() *bootstrapImageLock {
 	return bootstrapLock
 }
 
-func (s *Builder) WithMigration() bool {
-	return !s.Settings.NoMigration
+// BootstrapLineage is one migration lineage as the generated bootstrap program
+// sees it: the staged directory inside the image and the ledger it owns.
+type BootstrapLineage struct {
+	Label  string
+	Stage  string
+	Ledger string
+}
+
+// bootstrapLineages projects the plan's lineages onto the staged layout the
+// image carries, in declared order.
+func bootstrapLineages(plan *schemaPlan) []BootstrapLineage {
+	lineages := make([]BootstrapLineage, 0, len(plan.lineages))
+	for _, lineage := range plan.lineages {
+		lineages = append(lineages, BootstrapLineage{
+			Label:  lineage.label(),
+			Stage:  lineage.stage,
+			Ledger: lineage.trackingTable(),
+		})
+	}
+	return lineages
+}
+
+// BootstrapExtension is one extension as the generated SQL sees it. A required
+// extension aborts the bootstrap when it cannot be created, exactly as it fails
+// the local runtime's readiness; an optional one is reported and skipped.
+type BootstrapExtension struct {
+	Name     string
+	Required bool
+}
+
+func bootstrapExtensions(plan *schemaPlan) []BootstrapExtension {
+	extensions := make([]BootstrapExtension, 0, len(plan.extensions))
+	for _, extension := range plan.extensions {
+		extensions = append(extensions, BootstrapExtension{Name: extension.name, Required: extension.required})
+	}
+	return extensions
 }
 
 func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*builderv0.BuildResponse, error) {
@@ -149,42 +192,41 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		return s.Builder.BuildError(fmt.Errorf("invalid docker image name: %s", img.Name))
 	}
 
-	readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
-	schemas, err := normalizedRuntimeSchemas(s.RuntimeSchemas)
-	if err != nil {
-		return s.Builder.BuildError(err)
-	}
-	readWriteRoles, err := normalizedRuntimeReadWriteRoles(s.RuntimeReadWriteRoles, readOnlyRole, readWriteRole)
+	// The declared schema prerequisites are resolved here as well as at runtime,
+	// so a typo'd source path or a colliding lineage fails the build instead of
+	// producing a bootstrap image that quietly ships an incomplete schema. The
+	// build then packages exactly what that resolution returned, so the image
+	// applies the same lineages and extensions the runtime does.
+	prerequisites, err := s.resolveSchemaPrerequisites()
 	if err != nil {
 		return s.Builder.BuildError(err)
 	}
 	if err = s.Settings.Timeouts.validate(); err != nil {
 		return s.Builder.BuildError(err)
 	}
-	// The declared schema prerequisites are validated here as well as at runtime,
-	// so a typo'd source path or a colliding lineage fails the build instead of
-	// producing a bootstrap image that quietly ships an incomplete schema. The
-	// resolved plan is deliberately not reported here: this build packages only
-	// this service's own migrations, so listing the declared sources would claim
-	// an image content that does not exist.
-	if _, err := s.resolveSchemaPrerequisites(); err != nil {
+	plan, err := buildSchemaPlan(prerequisites, s.Settings)
+	if err != nil {
 		return s.Builder.BuildError(err)
 	}
+	if err = plan.attest(); err != nil {
+		return s.Builder.BuildError(err)
+	}
+	s.reportSchemaPrerequisites(prerequisites)
 	docker := DockerTemplating{
-		MigrationConnectionKeyHolder: fmt.Sprintf("{%s}", migrationConnectionEnvironmentKey),
-		RuntimeAccessLockID:          runtimeAccessLockID,
-		WithMigration:                s.WithMigration(),
-		MigrationFileNamePattern:     migrationFileNamePattern,
-		ReadinessTimeoutSeconds:      s.Settings.Timeouts.BootstrapReadinessSeconds(),
-		ReadOnlyRole:                 readOnlyRole,
-		ReadWriteRole:                readWriteRole,
-		Schemas:                      schemas,
-		ReadWriteRoles:               readWriteRoles,
-		DefaultReadWriteRole:         defaultRuntimeReadWriteRole(readWriteRoles),
+		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
+		RuntimeAccessLockID:            runtimeAccessLockID,
+		ReadinessTimeoutSeconds:        s.Settings.Timeouts.BootstrapReadinessSeconds(),
+		ReadOnlyRole:                   plan.access.readOnlyRole,
+		ReadWriteRole:                  plan.access.readWriteRole,
+		Schemas:                        plan.access.schemas,
+		ReadWriteRoles:                 plan.access.readWriteRoles,
+		DefaultReadWriteRole:           defaultRuntimeReadWriteRole(plan.access.readWriteRoles),
+		Extensions:                     bootstrapExtensions(plan),
+		Lineages:                       bootstrapLineages(plan),
 	}
 
 	if outputDirectory := req.GetOutputDirectory(); outputDirectory != "" {
-		return s.buildRecipe(ctx, outputDirectory, img, docker)
+		return s.buildRecipe(ctx, outputDirectory, img, plan, docker)
 	}
 
 	err = shared.DeleteFile(ctx, s.Local("builder/Dockerfile"))
@@ -197,7 +239,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		return s.Builder.BuildError(err)
 	}
 
-	if err = s.renderRuntimeAccess(ctx, docker, s.Location); err != nil {
+	if err = s.stageBootstrapContext(ctx, plan, docker, s.Location); err != nil {
 		return s.Builder.BuildError(err)
 	}
 
@@ -220,19 +262,27 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	return s.Builder.BuildResponse()
 }
 
-// buildRecipe renders the bootstrap image's Dockerfile into the caller-owned
-// output directory and returns a reproducible build plan instead of running
-// docker itself. The CLI builds the emitted recipe multi-arch and pushes a
-// manifest list, so a consumer can rebuild the image without the agent toolchain.
-// The CLI resolves the recipe's "." context to the service directory (s.Location),
-// not the recipe tree, so the files the Dockerfile COPYs must be staged there:
-// migrations/ is already committed and runtime-access.sql is rendered in below.
-// They are mirrored into the recipe tree so it also builds standalone.
-func (s *Builder) buildRecipe(ctx context.Context, outputDirectory string, img *resources.DockerImage, docker DockerTemplating) (*builderv0.BuildResponse, error) {
-	// The plan inventories the whole output directory and the recipe context is
-	// its root, so any pre-existing content the caller left here would be
-	// digested into the plan and copied into the image. Empty the directory the
-	// agent fully owns before rendering, as the deployment emitter does.
+// buildRecipe renders the bootstrap image's recipe into the caller-owned output
+// directory and returns a reproducible build plan instead of running docker
+// itself. The CLI builds the emitted recipe multi-arch and pushes a manifest
+// list, so a consumer can rebuild the image without the agent toolchain.
+// The CLI resolves the recipe's "." context to the service directory
+// (s.Location), not the recipe tree, so the bootstrap tree the Dockerfile COPYs
+// is staged into both: into the service directory for the build the CLI runs,
+// and into the recipe tree so the emitted artifact is a self-contained context
+// a consumer can build directly. Both stagings write identical bytes.
+func (s *Builder) buildRecipe(
+	ctx context.Context,
+	outputDirectory string,
+	img *resources.DockerImage,
+	plan *schemaPlan,
+	docker DockerTemplating,
+) (*builderv0.BuildResponse, error) {
+	// The build plan inventories the whole output directory and the recipe
+	// context is its root, so any pre-existing content the caller left here
+	// would be digested into the plan and copied into the image. Empty the
+	// directory the agent fully owns before rendering, as the deployment
+	// emitter does.
 	if err := shared.EmptyDir(ctx, outputDirectory); err != nil {
 		return s.Builder.BuildError(err)
 	}
@@ -241,33 +291,13 @@ func (s *Builder) buildRecipe(ctx context.Context, outputDirectory string, img *
 		return s.Builder.BuildError(err)
 	}
 
-	// The Dockerfile COPYs runtime-access.sql from the build context root. The CLI
-	// resolves the recipe's "." context to the service directory (s.Location) — not
-	// to the recipe tree — so render it there, beside the already-committed
-	// migrations/, for the build the CLI runs to resolve the COPY. Also render it
-	// into the recipe tree so the emitted artifact stays a self-contained context a
-	// consumer can build directly, mirroring how migrations/ lives in both places.
-	if err := s.renderRuntimeAccess(ctx, docker, s.Location); err != nil {
-		return s.Builder.BuildError(err)
-	}
-	if err := s.renderRuntimeAccess(ctx, docker, outputDirectory); err != nil {
-		return s.Builder.BuildError(err)
-	}
-
-	if s.WithMigration() {
-		// The Dockerfile's COPY migrations needs the directory to exist even when
-		// no migrations are authored yet, so create it before copying rather than
-		// letting copyTree leave it absent for an empty source.
-		migrationsDirectory := filepath.Join(outputDirectory, "migrations")
-		if err := os.MkdirAll(migrationsDirectory, 0o755); err != nil {
-			return s.Builder.BuildError(err)
-		}
-		if err := copyTree(ctx, s.Local("migrations"), migrationsDirectory); err != nil {
+	for _, contextRoot := range []string{s.Location, outputDirectory} {
+		if err := s.stageBootstrapContext(ctx, plan, docker, contextRoot); err != nil {
 			return s.Builder.BuildError(err)
 		}
 	}
 
-	plan, err := services.BuildDockerBuildPlan(outputDirectory, []*builderv0.DockerBuildRecipe{{
+	buildPlan, err := services.BuildDockerBuildPlan(outputDirectory, []*builderv0.DockerBuildRecipe{{
 		Name:       "bootstrap",
 		Dockerfile: "builder/Dockerfile",
 		Context:    ".",
@@ -282,34 +312,75 @@ func (s *Builder) buildRecipe(ctx context.Context, outputDirectory string, img *
 		return s.Builder.BuildError(err)
 	}
 
-	s.Builder.WithBuildPlan(plan)
+	s.Builder.WithBuildPlan(buildPlan)
 	return s.Builder.BuildResponse()
+}
+
+// stageBootstrapContext writes the complete bootstrap artifact into a build
+// context root: the generated bootstrap program and SQL, the plan identity, and
+// one immutable copy of every resolved migration source under its own staged
+// directory. Sibling sources live outside the build context, so staging is what
+// makes them reachable at all — a Dockerfile COPY cannot leave its context.
+func (s *Builder) stageBootstrapContext(
+	ctx context.Context,
+	plan *schemaPlan,
+	docker DockerTemplating,
+	contextRoot string,
+) error {
+	root := filepath.Join(contextRoot, bootstrapDirectory)
+	// A source removed from the settings must disappear from the image, so the
+	// agent-owned staging root is rebuilt rather than merged into.
+	if err := os.RemoveAll(root); err != nil {
+		return err
+	}
+	if err := s.Templates(ctx, docker, services.WithTemplate(bootstrapFS, "bootstrap", "").WithDestination("%s", root)); err != nil {
+		return err
+	}
+	// Every resolved lineage is staged, including one that carries no migration
+	// yet, so the plan artifact's staged paths always describe real directories.
+	for _, lineage := range plan.lineages {
+		if err := stageLineage(ctx, lineage, filepath.Join(root, "sources", lineage.stage)); err != nil {
+			return fmt.Errorf("stage migration source %q: %w", lineage.label(), err)
+		}
+	}
+	artifact, err := json.MarshalIndent(plan.artifact(), "", "  ")
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(root, "plan.json"), append(artifact, '\n'), 0o644); err != nil {
+		return err
+	}
+	return s.renderRuntimeAccess(ctx, docker, contextRoot)
+}
+
+// stageLineage copies one lineage's inventoried files into its staged directory
+// and re-checks each digest, so the plan artifact describes exactly the bytes
+// the image carries even if a file changed while the build was running.
+func stageLineage(ctx context.Context, lineage schemaLineage, destination string) error {
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return err
+	}
+	for _, file := range lineage.files {
+		staged := filepath.Join(destination, file.name)
+		if err := shared.CopyFile(ctx, filepath.Join(lineage.dir, file.name), staged); err != nil {
+			return err
+		}
+		digest, err := fileDigest(staged)
+		if err != nil {
+			return err
+		}
+		if digest != file.digest {
+			return fmt.Errorf("%s changed while it was being staged", file.name)
+		}
+	}
+	return nil
 }
 
 // renderRuntimeAccess renders runtime-access.sql into the build context root, the
 // directory docker builds from. The Dockerfile COPYs it from there, so it must
-// sit beside migrations/ rather than under builder/.
+// sit beside the staged bootstrap tree rather than under builder/.
 func (s *Builder) renderRuntimeAccess(ctx context.Context, docker DockerTemplating, contextRoot string) error {
 	return s.Templates(ctx, docker, services.WithTemplate(runtimeFS, "runtime", "").WithDestination("%s", contextRoot))
-}
-
-// copyTree copies every regular file under from into to, preserving the relative
-// layout. Directory entries themselves are not created here; the caller
-// provisions any directory a build step requires to exist.
-func copyTree(ctx context.Context, from, to string) error {
-	return filepath.WalkDir(from, func(entryPath string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		relative, err := filepath.Rel(from, entryPath)
-		if err != nil {
-			return err
-		}
-		return shared.CopyFile(ctx, entryPath, filepath.Join(to, relative))
-	})
 }
 
 func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) (*builderv0.DeploymentResponse, error) {
@@ -596,6 +667,9 @@ var factoryFS embed.FS
 
 //go:embed templates/builder
 var builderFS embed.FS
+
+//go:embed templates/bootstrap
+var bootstrapFS embed.FS
 
 //go:embed templates/runtime
 var runtimeFS embed.FS

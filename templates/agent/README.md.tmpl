@@ -11,6 +11,28 @@ The migration owner is private to the Postgres service and its bootstrap job. It
 
 The bootstrap job applies migrations and reconciles runtime roles and grants on every deployment. Local Docker and Nix runtimes enforce the same contract.
 
+## Migration sources
+
+Several services can share one database while each owns its migrations. The service resolves one schema plan — ordered lineages, their ledgers, the required extensions, and the runtime-role grant inputs — and the local runtimes and the deployed bootstrap image both execute that same plan.
+
+```yaml
+database-name: app
+extensions:
+  - hstore
+runtime-schemas:
+  - public
+migration-sources:
+  - name: api                          # ../api/migrations
+  - name: billing
+    path: ../billing/db/migrations     # relative to this service's directory
+```
+
+- **Paths** are relative to this service's directory, or absolute. An omitted `path` defaults to `../<name>/migrations`, the sibling layout used inside a module.
+- **Order** is this service's own `./migrations` first, then each declared source in the order it appears. Later sources may depend on relations earlier ones create.
+- **Ledgers** are independent: the own source keeps golang-migrate's `schema_migrations`, and each declared source gets `schema_migrations_<name>`. Per-source version counters therefore never collide, and a source's numbering is its own.
+- A source with **no own `./migrations`** directory is normal — a database whose tables all come from siblings declares none.
+- A declared source whose directory is **missing** is skipped with a warning while developing, and **fails the build**: the image stages each source's bytes, so a declaration that cannot be resolved would otherwise ship a database without those tables.
+
 Local database state survives ordinary stop/start and container recreation. In Docker mode, the agent mounts the official image's data directory from a Codefly-owned persistent runtime directory scoped by workspace, service, and naming scope. Stable and development scopes therefore keep independent databases even when they run from the same checkout.
 
 ## Lifecycle: stop, keep-running, destroy

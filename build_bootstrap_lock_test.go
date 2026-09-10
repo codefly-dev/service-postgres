@@ -42,7 +42,7 @@ func TestBootstrapRunsMigrationInsideRuntimeAccessLock(t *testing.T) {
 
 	// The migration must be invoked from inside the locked psql session...
 	lockAt := strings.Index(bootstrap, "pg_advisory_lock("+runtimeAccessLockSQL+")")
-	migrateAt := strings.Index(bootstrap, `/usr/local/bin/migrate -path /app/migrations`)
+	migrateAt := strings.Index(bootstrap, `/usr/local/bin/migrate -path /app/bootstrap/sources/00-store`)
 	includeAt := strings.Index(bootstrap, `\i /app/runtime-access.sql`)
 	require.NotEqual(t, -1, lockAt, "bootstrap must take the runtime-access advisory lock")
 	require.NotEqual(t, -1, migrateAt, "bootstrap must run the migration inside that session")
@@ -77,7 +77,11 @@ func TestBootstrapRunsMigrationInsideRuntimeAccessLock(t *testing.T) {
 	// INSTALLS the binary, so the assertion is on the invocation form only.
 	require.NotContains(t, dockerfile, "migrate -path",
 		"migrate must not run outside the locked psql session")
-	require.Contains(t, dockerfile, "--file=/app/bootstrap.sql")
+	// The image's CMD runs the bootstrap program, which gates on readiness and
+	// on verifying the staged sources before opening that one locked session.
+	require.Contains(t, dockerfile, `CMD ["/bin/sh", "/app/bootstrap/bootstrap.sh"]`)
+	require.Contains(t, readRendered(t, outputDirectory, "bootstrap/bootstrap.sh"),
+		"--file=/app/bootstrap.sql")
 }
 
 // TestBootstrapOmitsMigrationWhenDisabled keeps the lock unconditional while the
