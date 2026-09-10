@@ -69,6 +69,11 @@ type Runtime struct {
 	// nix cluster's data directory. Reported in Stop/Destroy results so a caller
 	// sees what was kept without having to inspect the backend.
 	retainedDataPath string
+
+	// migrationReload serializes hot-reload migration work against this
+	// database. The watcher delivers a burst of events per save and can deliver
+	// the next one while a migration is still running.
+	migrationReload sync.Mutex
 }
 
 func NewRuntime() *Runtime {
@@ -404,10 +409,11 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 		}
 
 		if s.Settings.HotReload {
-			conf := services.NewWatchConfiguration(requirements)
-			err := s.SetupWatcher(ctx, conf, s.EventHandler)
-			if err != nil {
-				s.Wool.Warn("error in watcher", wool.ErrField(err))
+			watch, errWatch := s.migrationWatchRequirements(ctx)
+			if errWatch != nil {
+				s.Wool.Warn("cannot resolve migration watch roots", wool.ErrField(errWatch))
+			} else if errWatch = s.SetupWatcher(ctx, services.NewWatchConfiguration(watch), s.EventHandler); errWatch != nil {
+				s.Wool.Warn("error in watcher", wool.ErrField(errWatch))
 			}
 		}
 	}
@@ -626,16 +632,22 @@ func (s *Runtime) Test(ctx context.Context, req *runtimev0.TestRequest) (*runtim
 
  */
 
+// EventHandler reacts to one watched file change. Errors are reported and
+// swallowed: an edit that cannot be applied — an already-applied migration, a
+// dirty ledger, bad SQL — must leave hot reload armed so fixing the source or
+// adding a new migration gets another attempt.
 func (s *Runtime) EventHandler(event code.Change) error {
-	if strings.Contains(event.Path, "migrations") {
-		err := s.updateMigration(context.Background(), event.Path)
-		if err != nil {
-			s.Wool.Warn("cannot apply migration", wool.ErrField(err))
-			return nil
-		}
-		if err := s.ensureRuntimeAccess(context.Background()); err != nil {
-			s.Wool.Warn("cannot reconcile runtime access after migration", wool.ErrField(err))
-		}
+	ctx := context.Background()
+	applied, err := s.applyMigrationChange(ctx, event.Path)
+	if err != nil {
+		s.Wool.Warn("cannot apply migration change", wool.ErrField(err))
+		return nil
+	}
+	if !applied {
+		return nil
+	}
+	if err := s.ensureRuntimeAccess(ctx); err != nil {
+		s.Wool.Warn("cannot reconcile runtime access after migration", wool.ErrField(err))
 	}
 	return nil
 }

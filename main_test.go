@@ -110,9 +110,10 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	require.NoError(t, migrationtest.ApplyDown(ctx, clone.DB, isolateMigrations))
 	require.NoError(t, clone.DB.QueryRowContext(ctx, `SELECT to_regclass('public.migration_control_fixture') IS NOT NULL`).Scan(&relationExists))
 	require.False(t, relationExists)
-	// Migration ownership remains inside the plugin. A hot-reload migration is
-	// rolled down and back up here without ever exporting the owner connection
-	// to a dependent service.
+	// Migration ownership remains inside the plugin. Hot reload applies a NEW
+	// forward migration without ever exporting the owner connection to a
+	// dependent service, and re-saving that migration once it is applied
+	// neither re-runs its SQL nor touches the rows it now holds.
 	migrationRelation := serviceName + "_migration_replay"
 	migrationDirectory := path.Join(fixture.workspaceDir, "mod", serviceName, "migrations")
 	migrationUp := path.Join(migrationDirectory, "2_replay.up.sql")
@@ -120,24 +121,29 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	quotedMigrationRelation := pq.QuoteIdentifier(migrationRelation)
 	require.NoError(t, os.WriteFile(migrationUp, []byte("CREATE TABLE "+quotedMigrationRelation+" (id UUID PRIMARY KEY);"), 0o600))
 	require.NoError(t, os.WriteFile(migrationDown, []byte("DROP TABLE IF EXISTS "+quotedMigrationRelation+";"), 0o600))
-	require.NoError(t, runtime.updateMigration(ctx, migrationUp))
+	applied, err := runtime.applyMigrationChange(ctx, migrationUp)
+	require.NoError(t, err)
+	require.True(t, applied)
 	exists, err := owner.RelationExists(ctx, migrationRelation)
 	require.NoError(t, err)
 	require.True(t, exists)
 	replayFixtureID := "00000000-0000-0000-0000-000000000003"
 	require.NoError(t, owner.AppendFixture(ctx, migrationRelation, replayFixtureID))
-	require.NoError(t, runtime.updateMigration(ctx, migrationUp))
+	applied, err = runtime.applyMigrationChange(ctx, migrationUp)
+	require.ErrorIs(t, err, errAppliedMigrationEdited)
+	require.False(t, applied)
 	exists, err = owner.RelationExists(ctx, migrationRelation)
 	require.NoError(t, err)
 	require.True(t, exists)
 	found, err = owner.HasFixture(ctx, migrationRelation, replayFixtureID)
 	require.NoError(t, err)
-	require.False(t, found, "hot reload must execute down then up, rebuilding the migration-owned relation")
+	require.True(t, found, "re-saving an applied migration must not replay it or drop its rows")
 	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
 	found, err = reader.HasFixture(ctx, migrationRelation, replayFixtureID)
-	require.NoError(t, err, "reader grants must be reconciled after migration replay")
-	require.False(t, found)
+	require.NoError(t, err, "reader grants must be reconciled after a forward migration")
+	require.True(t, found)
 	assertStrayMigrationFilesDoNotBlockLineage(t, ctx, runtime, owner, migrationDirectory, migrationUp, migrationRelation)
+	assertHotReloadPreservesAppliedHistory(t, ctx, migrationControl, runtime.connection)
 	tenantRelation := serviceName + "_tenant_scope"
 	require.NoError(t, owner.InstallTenantFixture(ctx, tenantRelation))
 
@@ -262,6 +268,13 @@ func assertMigrationConnectionsAreOwned(t *testing.T, ctx context.Context, runti
 // the same version and direction as the file it shadows, which used to make the
 // source driver refuse every migration path — startup and hot reload alike. A
 // genuine version collision must still fail, naming both files.
+//
+// Hot reload is forward-only, so the leftovers are visible here at two distinct
+// layers and both must hold: a change event naming one is not a migration event
+// at all, and a leftover merely SITTING beside a migration must not stop the
+// lineage being read. The second is what proves the directory is filtered —
+// before that filter the apply died on "duplicate migration file" instead of
+// reaching its forward-only verdict.
 func assertStrayMigrationFilesDoNotBlockLineage(
 	t *testing.T,
 	ctx context.Context,
@@ -296,16 +309,20 @@ func assertStrayMigrationFilesDoNotBlockLineage(
 	// rows in the table that migration owns.
 	survivorID := "00000000-0000-0000-0000-000000000010"
 	require.NoError(t, owner.AppendFixture(ctx, relation, survivorID))
-	require.NoError(
-		t,
-		runtime.updateMigration(ctx, path.Join(migrationDirectory, "2_replay.up.sql.bak")),
-		"a change event for a non-migration file must be ignored",
-	)
+	applied, err := runtime.applyMigrationChange(ctx, path.Join(migrationDirectory, "2_replay.up.sql.bak"))
+	require.NoError(t, err, "a change event for a non-migration file must be ignored")
+	require.False(t, applied, "an ignored file must not reach the database at all")
 	survived, err := owner.HasFixture(ctx, relation, survivorID)
 	require.NoError(t, err)
 	require.True(t, survived, "an editor backup must not trigger a destructive migration replay")
 
-	require.NoError(t, runtime.updateMigration(ctx, migrationUp), "hot reload must ignore editor leftovers")
+	// Re-saving migration 2 while the leftovers sit beside it: the lineage is
+	// read (the leftovers are filtered out of the source), and the event is then
+	// declined because version 2 is already applied — not because the directory
+	// could not be parsed.
+	applied, err = runtime.applyMigrationChange(ctx, migrationUp)
+	require.ErrorIs(t, err, errAppliedMigrationEdited, "hot reload must ignore editor leftovers")
+	require.False(t, applied)
 	exists, err := owner.RelationExists(ctx, relation)
 	require.NoError(t, err)
 	require.True(t, exists, "the migration the leftovers shadow must stay applied")
