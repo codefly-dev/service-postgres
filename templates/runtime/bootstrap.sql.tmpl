@@ -1,0 +1,45 @@
+\set ON_ERROR_STOP on
+
+-- The schema migration and the grants that describe it run in ONE session
+-- holding ONE lock. They used to be two separate processes in the job's CMD
+-- with nothing serializing them: golang-migrate takes its own advisory lock in
+-- a DIFFERENT key space from this one, so a second bootstrap pod's `migrate up`
+-- could TRUNCATE the tracking table while this pod's GRANT ... ON ALL TABLES
+-- rewrote that same table's pg_class row -- "tuple concurrently updated", one
+-- side aborts, and a migration aborted mid-run leaves the lineage dirty, which
+-- the agent fails closed on and hands to manual recovery. Kubernetes does not
+-- guarantee a single running pod for a Job with restartPolicy: Never, so two
+-- concurrent bootstrap pods are reachable in production.
+--
+-- Session-scoped rather than transaction-scoped: it must be held across the
+-- migrate child process below, which runs outside any transaction here.
+SELECT pg_advisory_lock({{ .RuntimeAccessLockID }});
+{{- if .WithMigration }}
+
+-- Runs while the lock above is held: psql keeps this session, and therefore the
+-- lock, open for the lifetime of the child process. ON_ERROR_STOP does NOT
+-- cover \!, so the exit status is checked explicitly -- otherwise a failed
+-- migration would fall through and grant access over a schema that was never
+-- migrated.
+--
+-- The libpq settings below are stripped from the child environment. psql
+-- exports PGSYSCONFDIR to its children, and migrate's driver (lib/pq) PANICS
+-- rather than ignoring the settings it does not implement -- "setting
+-- PGSYSCONFDIR not supported" -- which running migrate as a psql child would
+-- otherwise turn into a crash. Exactly lib/pq's unsupported set is unset, so
+-- every setting it does honour (PGSSLROOTCERT and friends) still reaches it.
+\! env -u PGSERVICE -u PGSERVICEFILE -u PGREALM -u PGREQUIRESSL -u PGSSLCRL -u PGREQUIREPEER -u PGKRBSRVNAME -u PGGSSLIB -u PGSYSCONFDIR -u PGLOCALEDIR /usr/local/bin/migrate -path /app/migrations -database "${{ .MigrationConnectionKeyHolder }}" up
+\if :SHELL_ERROR
+DO $codefly_bootstrap$ BEGIN
+    RAISE EXCEPTION 'schema migration failed; refusing to reconcile runtime access';
+END $codefly_bootstrap$;
+\endif
+{{- end }}
+
+-- runtime-access.sql stays purely about access: it is the file a consumer may
+-- substitute, and nothing here may depend on its contents. It takes its own
+-- transaction-scoped lock on this same key, which is free — advisory locks
+-- stack within one session — and keeps that file correct when run standalone.
+\i /app/runtime-access.sql
+
+SELECT pg_advisory_unlock({{ .RuntimeAccessLockID }});

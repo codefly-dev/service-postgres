@@ -2,3 +2,7 @@
 # `codefly build` — it is the bootstrap image's build context, generated and
 # never hand-edited. Keep it out of version control.
 /runtime-access.sql
+
+# bootstrap.sql is generated beside it and runs the migration under the
+# runtime-access lock before including runtime-access.sql.
+/bootstrap.sql

@@ -81,6 +81,51 @@ type Runtime struct {
 	// separate statements, so two reloads at once would both plan from the same
 	// version.
 	migrationReload sync.Mutex
+
+	// controlPlane serializes this agent's database control-plane mutations:
+	// extension creation, migration application, hot-reload changes, and
+	// runtime-access reconciliation. The hot-reload watcher drives its work from
+	// its own goroutine while Init and Start drive the rest from RPC handlers,
+	// and Postgres does not serialize them for us: REVOKE/GRANT ON ALL TABLES
+	// rewrites the pg_class row of every table in the schema — each lineage's
+	// golang-migrate tracking table included — while taking no lock on the table
+	// itself, so it collides with the TRUNCATE golang-migrate uses to record a
+	// version and one side aborts with "tuple concurrently updated".
+	//
+	// This lock covers ONE process. The cross-process half of the same collision
+	// is held by the runtime-access advisory lock — see runtimeAccessLockID,
+	// which every control-plane mutation takes inside the database itself.
+	controlPlane controlPlaneLock
+}
+
+// controlPlaneLock is context-aware mutual exclusion over one Runtime's
+// database control-plane mutations. sync.Mutex would serialize just as well,
+// but Lock() cannot be cancelled: a caller whose ctx already expired would
+// still queue behind an in-flight migration and then run DDL on behalf of an RPC
+// that returned long ago. Acquiring through a channel lets a cancelled caller
+// return ctx.Err() instead of executing late. The zero value is ready to use.
+type controlPlaneLock struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+// acquire blocks until the control plane is free or ctx is done. The returned
+// release must be called exactly once, and only when err is nil.
+func (l *controlPlaneLock) acquire(ctx context.Context) (func(), error) {
+	l.once.Do(func() { l.ch = make(chan struct{}, 1) })
+	// Checked BEFORE the select: when the lock is free and ctx is already done,
+	// both select cases are ready and Go picks between them at random, so an
+	// expired caller would sometimes proceed to run DDL anyway. Failing up front
+	// makes "cancelled callers never mutate" deterministic.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case l.ch <- struct{}{}:
+		return func() { <-l.ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func NewRuntime() *Runtime {
@@ -290,10 +335,22 @@ func (s *Runtime) migrateOnInit(ctx context.Context) error {
 	if err := s.WaitForReady(ctx); err != nil {
 		return err
 	}
+	// Extensions, migrations and grants are ONE control-plane transition, so
+	// they are taken under ONE acquisition. Releasing between them lets a
+	// hot-reload change apply a forward migration in the gap, so the grants
+	// this transition computes describe a schema that has already moved on: the
+	// tables that migration created fall outside them, and no runtime role can
+	// read them until something reconciles again.
+	release, acquireErr := s.controlPlane.acquire(ctx)
+	if acquireErr != nil {
+		return acquireErr
+	}
+	defer release()
+
 	if err := s.applySchema(ctx, prerequisites); err != nil {
 		return err
 	}
-	return s.ensureRuntimeAccess(ctx)
+	return s.ensureRuntimeAccessLocked(ctx)
 }
 
 // applySchema brings the database up to the resolved prerequisites: extensions
@@ -486,6 +543,16 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 		return s.Runtime.StartError(err)
 	}
 
+	// One acquisition over the whole transition, for the reason migrateOnInit
+	// documents. Arming the watcher inside it is deliberate: a save landing
+	// while Start is still migrating queues rather than applying against a
+	// half-applied schema.
+	release, acquireErr := s.controlPlane.acquire(ctx)
+	if acquireErr != nil {
+		return s.Runtime.StartError(acquireErr)
+	}
+	defer release()
+
 	if err := s.applySchema(ctx, prerequisites); err != nil {
 		return s.Runtime.StartError(err)
 	}
@@ -498,7 +565,7 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 			s.Wool.Warn("error in watcher", wool.ErrField(errWatch))
 		}
 	}
-	if err := s.ensureRuntimeAccess(ctx); err != nil {
+	if err := s.ensureRuntimeAccessLocked(ctx); err != nil {
 		return s.Runtime.StartError(err)
 	}
 	s.Wool.Debug("start done")
@@ -568,6 +635,20 @@ func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtim
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
+	// Tear the hot-reload watcher down on EVERY path, the keep-running early
+	// return below included. core's SetupWatcher REPLACES s.Events/s.Watcher/
+	// s.watcherCancel without cancelling what was already there, so a Stop that
+	// leaves the watcher running makes the next Start leak a second one, and
+	// every leaked watcher still holds a live reference to EventHandler. They
+	// fire against a database this invocation has already released, and each
+	// restart adds another: duplicate apply attempts the forward-only path then
+	// reports as already-applied, duplicate grant reconciliations, and an
+	// fsnotify handle plus two goroutines leaked per restart. core documents
+	// StopWatcher as the mandatory teardown, and it is idempotent when no
+	// watcher is running. Under lifecycleMu because it writes s.watcherCancel,
+	// which Destroy also clears.
+	s.StopWatcher()
+
 	// keep-running asks for a server the NEXT invocation reattaches to, and only
 	// the container backend can reattach: GetContainer adopts an existing
 	// container by name. nixPostgres has no such path — Init always launches a
@@ -618,6 +699,10 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	defer s.lifecycleMu.Unlock()
 
 	s.Wool.Debug("Destroying")
+
+	// A leaked watcher would keep firing EventHandler at a database that is
+	// being removed. Idempotent when Stop already ran.
+	s.StopWatcher()
 
 	if s.nixRuntime != nil {
 		if err := s.nixRuntime.Stop(ctx); err != nil {
@@ -719,8 +804,22 @@ func (s *Runtime) Test(ctx context.Context, req *runtimev0.TestRequest) (*runtim
 // adding a new migration gets another attempt.
 func (s *Runtime) EventHandler(event code.Change) error {
 	ctx := context.Background()
+
+	// The change and the reconciliation that grants its new tables are ONE
+	// transition, taken under ONE acquisition, so an Init or Start transition
+	// cannot interleave and reconcile grants over a schema this handler is
+	// still moving. applyMigrationChange takes migrationReload inside this,
+	// never the other way round, so the two locks have one order.
+	release, acquireErr := s.controlPlane.acquire(ctx)
+	if acquireErr != nil {
+		return acquireErr
+	}
+	defer release()
+
 	applied, err := s.applyMigrationChange(ctx, event.Path)
 	if err != nil {
+		// Reported, not returned: on the forward-only path an edit to an
+		// already-applied migration is a routine condition, not a failure.
 		s.Wool.Warn("cannot apply migration change", wool.ErrField(err))
 	}
 	// Reconcile whenever SQL reached the database: an apply failure reports
@@ -729,7 +828,7 @@ func (s *Runtime) EventHandler(event code.Change) error {
 	if !applied {
 		return nil
 	}
-	if err := s.ensureRuntimeAccess(ctx); err != nil {
+	if err := s.ensureRuntimeAccessLocked(ctx); err != nil {
 		s.Wool.Warn("cannot reconcile runtime access after migration", wool.ErrField(err))
 	}
 	return nil

@@ -105,13 +105,16 @@ func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*
 
 type DockerTemplating struct {
 	MigrationConnectionKeyHolder string
-	WithMigration                bool
-	MigrationFileNamePattern     string // rendered so the image prunes exactly what the runtime filter hides
-	ReadinessTimeoutSeconds      int
-	ReadOnlyRole                 string
-	ReadWriteRole                string
-	Schemas                      []string
-	ReadWriteRoles               []string
+	// RuntimeAccessLockID is the advisory-lock expression the bootstrap script
+	// takes, shared verbatim with the agent so the two cannot drift apart.
+	RuntimeAccessLockID      string
+	WithMigration            bool
+	MigrationFileNamePattern string // rendered so the image prunes exactly what the runtime filter hides
+	ReadinessTimeoutSeconds  int
+	ReadOnlyRole             string
+	ReadWriteRole            string
+	Schemas                  []string
+	ReadWriteRoles           []string
 	// DefaultReadWriteRole is the application role the managed read-write login
 	// selects on connect. See defaultRuntimeReadWriteRole.
 	DefaultReadWriteRole string
@@ -169,6 +172,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	}
 	docker := DockerTemplating{
 		MigrationConnectionKeyHolder: fmt.Sprintf("{%s}", migrationConnectionEnvironmentKey),
+		RuntimeAccessLockID:          runtimeAccessLockID,
 		WithMigration:                s.WithMigration(),
 		MigrationFileNamePattern:     migrationFileNamePattern,
 		ReadinessTimeoutSeconds:      s.Settings.Timeouts.BootstrapReadinessSeconds(),

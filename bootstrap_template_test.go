@@ -26,6 +26,7 @@ func TestBootstrapImageAlwaysReconcilesRuntimeAccess(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			parameters := DockerTemplating{
 				MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
+				RuntimeAccessLockID:          runtimeAccessLockID,
 				WithMigration:                test.withMigrations,
 				ReadinessTimeoutSeconds:      300,
 				ReadOnlyRole:                 "codefly_app_ro",
@@ -67,12 +68,36 @@ func TestBootstrapImageAlwaysReconcilesRuntimeAccess(t *testing.T) {
 					t.Fatalf("bootstrap image is not target-architecture portable: missing %q", required)
 				}
 			}
-			hasMigration := strings.Contains(dockerfile, "/usr/local/bin/migrate -path")
+			// The migration no longer runs from the Dockerfile CMD. It runs as a
+			// child of the psql session holding the runtime-access advisory
+			// lock, so both bootstrap steps share ONE lock domain instead of
+			// colliding on the tracking table. The image still INSTALLS the
+			// binary, so this asserts on the invocation form only.
+			if strings.Contains(dockerfile, "/usr/local/bin/migrate -path") {
+				t.Fatal("migrate must not run as its own process outside the locked psql session")
+			}
+
+			// The orchestration script holds the lock across both steps and
+			// includes the access script rather than absorbing it: a consumer
+			// substituting runtime-access.sql must not silently lose the
+			// migration with it.
+			bootstrapSQL := renderBootstrapTemplate(t, parameters)
+			if !strings.Contains(bootstrapSQL, "pg_advisory_lock("+runtimeAccessLockID+")") {
+				t.Fatal("bootstrap does not hold the runtime-access advisory lock")
+			}
+			if !strings.Contains(bootstrapSQL, `\i /app/runtime-access.sql`) {
+				t.Fatal("bootstrap does not include the runtime-access script")
+			}
+			hasMigration := strings.Contains(bootstrapSQL, `/usr/local/bin/migrate -path`)
 			if hasMigration != test.withMigrations {
 				t.Fatalf("migration command present = %t, want %t", hasMigration, test.withMigrations)
 			}
 
 			accessSQL := renderRuntimeAccessTemplate(t, parameters)
+			// runtime-access.sql stays purely about access.
+			if strings.Contains(accessSQL, "/usr/local/bin/migrate") {
+				t.Fatal("runtime-access.sql must not run migrations; a substituted copy would drop them")
+			}
 			for _, required := range []string{
 				"NOBYPASSRLS",
 				"NOCREATEROLE",
@@ -103,6 +128,7 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 	root := t.TempDir()
 	parameters := DockerTemplating{
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
+		RuntimeAccessLockID:          runtimeAccessLockID,
 		ReadinessTimeoutSeconds:      defaultBootstrapReadinessSeconds,
 	}
 	if err := os.WriteFile(
@@ -113,6 +139,10 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "runtime-access.sql"), []byte("SELECT 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bootstrap.sql"),
+		[]byte(renderBootstrapTemplate(t, parameters)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	tag := fmt.Sprintf("service-postgres-bootstrap-targetarch-test:%d", time.Now().UnixNano())
@@ -135,6 +165,7 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 	}
 	parameters := DockerTemplating{
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
+		RuntimeAccessLockID:          runtimeAccessLockID,
 		WithMigration:                true,
 		MigrationFileNamePattern:     migrationFileNamePattern,
 		ReadinessTimeoutSeconds:      defaultBootstrapReadinessSeconds,
@@ -151,6 +182,10 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "runtime-access.sql"), []byte("SELECT 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bootstrap.sql"),
+		[]byte(renderBootstrapTemplate(t, parameters)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	migrations := filepath.Join(root, "migrations")
@@ -355,6 +390,12 @@ func renderBuilderTemplate(t *testing.T, name string, parameters DockerTemplatin
 
 func renderRuntimeAccessTemplate(t *testing.T, parameters DockerTemplating) string {
 	return renderTemplate(t, runtimeFS, "templates/runtime/runtime-access.sql.tmpl", parameters)
+}
+
+// renderBootstrapTemplate renders the orchestration script the image runs: it
+// holds the runtime-access lock across the migration and the grants.
+func renderBootstrapTemplate(t *testing.T, parameters DockerTemplating) string {
+	return renderTemplate(t, runtimeFS, "templates/runtime/bootstrap.sql.tmpl", parameters)
 }
 
 func renderTemplate(t *testing.T, fsys fs.FS, name string, parameters DockerTemplating) string {

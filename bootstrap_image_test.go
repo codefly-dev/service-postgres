@@ -416,15 +416,19 @@ func TestBootstrapImageRejectsTamperedMigrateArchive(t *testing.T) {
 }
 
 // bootstrapBuildContext stages a build context for the bootstrap Dockerfile: the
-// rendered Dockerfile plus the runtime-access.sql it COPYs.
+// rendered Dockerfile plus the bootstrap.sql and runtime-access.sql it COPYs.
 func bootstrapBuildContext(t *testing.T) string {
 	t.Helper()
 	context := t.TempDir()
-	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
+	parameters := DockerTemplating{
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
-	})
+		RuntimeAccessLockID:          runtimeAccessLockID,
+	}
+	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", parameters)
 	require.NoError(t, os.WriteFile(filepath.Join(context, "Dockerfile"), []byte(dockerfile), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(context, "runtime-access.sql"), []byte("SELECT 1;\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(context, "bootstrap.sql"),
+		[]byte(renderBootstrapTemplate(t, parameters)), 0o644))
 	return context
 }
 
