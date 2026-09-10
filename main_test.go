@@ -137,6 +137,7 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	found, err = reader.HasFixture(ctx, migrationRelation, replayFixtureID)
 	require.NoError(t, err, "reader grants must be reconciled after migration replay")
 	require.False(t, found)
+	assertStrayMigrationFilesDoNotBlockLineage(t, ctx, runtime, owner, migrationDirectory, migrationUp, migrationRelation)
 	tenantRelation := serviceName + "_tenant_scope"
 	require.NoError(t, owner.InstallTenantFixture(ctx, tenantRelation))
 
@@ -254,6 +255,70 @@ func assertMigrationConnectionsAreOwned(t *testing.T, ctx context.Context, runti
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+// assertStrayMigrationFilesDoNotBlockLineage exercises the editor-leftover case
+// against the real database. A backup keeping a migration's own prefix parses as
+// the same version and direction as the file it shadows, which used to make the
+// source driver refuse every migration path — startup and hot reload alike. A
+// genuine version collision must still fail, naming both files.
+func assertStrayMigrationFilesDoNotBlockLineage(
+	t *testing.T,
+	ctx context.Context,
+	runtime *Runtime,
+	owner *postgresCapabilityProbe,
+	migrationDirectory string,
+	migrationUp string,
+	relation string,
+) {
+	t.Helper()
+
+	const strayRelation = "stray_must_not_apply"
+	for _, stray := range []string{
+		"2_replay.up.sql~",
+		"2_replay.up.sql.bak",
+		"2_replay.up.sql.orig",
+		".2_replay.up.sql.swp",
+	} {
+		strayPath := path.Join(migrationDirectory, stray)
+		require.NoError(t, os.WriteFile(
+			strayPath,
+			[]byte("CREATE TABLE "+pq.QuoteIdentifier(strayRelation)+" (id UUID PRIMARY KEY);"),
+			0o600,
+		))
+		defer os.Remove(strayPath)
+	}
+
+	require.NoError(t, runtime.applyMigration(ctx), "startup migrations must ignore editor leftovers")
+
+	// A save that writes a backup emits a change event for that file too. Acting
+	// on it would replay the version it shadows — down then up — and destroy the
+	// rows in the table that migration owns.
+	survivorID := "00000000-0000-0000-0000-000000000010"
+	require.NoError(t, owner.AppendFixture(ctx, relation, survivorID))
+	require.NoError(
+		t,
+		runtime.updateMigration(ctx, path.Join(migrationDirectory, "2_replay.up.sql.bak")),
+		"a change event for a non-migration file must be ignored",
+	)
+	survived, err := owner.HasFixture(ctx, relation, survivorID)
+	require.NoError(t, err)
+	require.True(t, survived, "an editor backup must not trigger a destructive migration replay")
+
+	require.NoError(t, runtime.updateMigration(ctx, migrationUp), "hot reload must ignore editor leftovers")
+	exists, err := owner.RelationExists(ctx, relation)
+	require.NoError(t, err)
+	require.True(t, exists, "the migration the leftovers shadow must stay applied")
+	exists, err = owner.RelationExists(ctx, strayRelation)
+	require.NoError(t, err)
+	require.False(t, exists, "no SQL from an ignored file may reach the database")
+
+	conflictPath := path.Join(migrationDirectory, "2_conflict.up.sql")
+	require.NoError(t, os.WriteFile(conflictPath, []byte("SELECT 1;"), 0o600))
+	defer os.Remove(conflictPath)
+	err = runtime.applyMigration(ctx)
+	require.ErrorContains(t, err, "2_conflict.up.sql")
+	require.ErrorContains(t, err, "2_replay.up.sql")
 }
 
 func assertDockerStateSurvivesContainerRecreation(

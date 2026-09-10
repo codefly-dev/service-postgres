@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,8 @@ import (
 	"github.com/codefly-dev/core/wool"
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
 // migrationSource is one independent migration lineage applied against the
@@ -43,10 +47,76 @@ func (m migrationSource) label() string {
 	return m.name
 }
 
-// fileURL returns the file:// migration source URL golang-migrate expects.
-func (m migrationSource) fileURL() string {
-	u := url.URL{Scheme: "file", Path: m.dir}
-	return u.String()
+// migrationFileNamePattern is the ONE definition of a conventional
+// golang-migrate filename: <version>_<name>.<up|down>.<ext>. It is POSIX ERE so
+// the bootstrap image's shell prune matches it with grep -E over the same names
+// this runtime applies; builder.go renders it into the Dockerfile.
+//
+// The extension is a single alphanumeric run, exactly what golang-migrate's own
+// `migrate create -ext` produces. Its parser accepts ANY extension (a free-form
+// group), which is why an editor backup left beside a migration —
+// 2_add_index.up.sql~, .bak, .orig — parses as the SAME version and direction as
+// the file it shadows and makes the source driver reject the entire lineage as a
+// duplicate. Requiring a plain extension excludes the leftovers while keeping
+// every real migration, whatever it is named (.sql, .pgsql, .psql).
+const migrationFileNamePattern = `^([0-9]+)_.+\.(up|down)\.[A-Za-z0-9]+$`
+
+var migrationFileName = regexp.MustCompile(migrationFileNamePattern)
+
+// migrationFS serves golang-migrate ONE snapshot of the migration files, taken
+// by openSource. Handing over a precomputed listing rather than re-reading the
+// directory keeps the conflict check and the exposed set from disagreeing when a
+// file lands between the two scans — hot reload runs while an editor is writing.
+type migrationFS struct {
+	fs.FS
+	entries []fs.DirEntry
+}
+
+func (f migrationFS) ReadDir(string) ([]fs.DirEntry, error) {
+	return f.entries, nil
+}
+
+// openSource builds the golang-migrate source driver for one lineage over the
+// migration files in its directory, hiding everything that is not one.
+func (m migrationSource) openSource() (source.Driver, error) {
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		return nil, err
+	}
+	var migrations []fs.DirEntry
+	for _, entry := range entries {
+		if !entry.IsDir() && migrationFileName.MatchString(entry.Name()) {
+			migrations = append(migrations, entry)
+		}
+	}
+	if err := checkConflicts(migrations); err != nil {
+		return nil, err
+	}
+	return iofs.New(migrationFS{FS: os.DirFS(m.dir), entries: migrations}, ".")
+}
+
+// checkConflicts rejects two migration files claiming the same version and
+// direction — a real authoring mistake, unlike the editor leftovers already
+// filtered out. golang-migrate names only the file it read second, which does
+// not say what it collides with.
+func checkConflicts(migrations []fs.DirEntry) error {
+	claimed := make(map[string]string)
+	for _, entry := range migrations {
+		match := migrationFileName.FindStringSubmatch(entry.Name())
+		version, err := strconv.ParseUint(match[1], 10, 64)
+		if err != nil {
+			// golang-migrate skips a version it cannot parse; stay aligned with
+			// what the source driver will actually see.
+			continue
+		}
+		key := fmt.Sprintf("%d.%s", version, match[2])
+		if first, taken := claimed[key]; taken {
+			return fmt.Errorf("migration version %d has two %s files: %q and %q",
+				version, match[2], first, entry.Name())
+		}
+		claimed[key] = entry.Name()
+	}
+	return nil
 }
 
 // dirtyRecoveryRunbook is the manual reconciliation procedure a dirty-lineage
@@ -235,7 +305,15 @@ func (s *Runtime) openMigration(ctx context.Context, src migrationSource) (*migr
 			wrapMigrationCloseError("SQL pool after driver failure", pool.Close()),
 		)
 	}
-	migration, err := migrate.NewWithDatabaseInstance(src.fileURL(), s.Settings.DatabaseName, driver)
+	sourceDriver, err := src.openSource()
+	if err != nil {
+		return nil, errors.Join(
+			s.Wool.Wrapf(err, "cannot read migrations for source %q", src.label()),
+			wrapMigrationCloseError("database driver after source failure", driver.Close()),
+			wrapMigrationCloseError("SQL pool after source failure", pool.Close()),
+		)
+	}
+	migration, err := migrate.NewWithInstance(src.label(), sourceDriver, s.Settings.DatabaseName, driver)
 	if err != nil {
 		return nil, errors.Join(
 			s.Wool.Wrapf(err, "cannot create migration"),
@@ -297,8 +375,17 @@ func (s *Runtime) updateMigration(ctx context.Context, migrationFile string) (ru
 		return nil
 	}
 
-	// Extract the migration number from the filename (NNN_name.up.sql).
+	// A write to anything that is not a migration file must not touch the
+	// schema: the replay below rolls the version down and back up, so acting on
+	// an editor backup (2_x.up.sql~, .bak) would drop and rebuild the table that
+	// file shadows, destroying its rows.
 	base := filepath.Base(migrationFile)
+	if !migrationFileName.MatchString(base) {
+		s.Wool.Debug("changed file is not a migration", wool.Field("file", base))
+		return nil
+	}
+
+	// Extract the migration number from the filename (NNN_name.up.sql).
 	s.Wool.Info(fmt.Sprintf("applying migration: %v (source %s)", base, owner.label()))
 	migrationNumber, err := strconv.Atoi(strings.Split(base, "_")[0])
 	if err != nil {

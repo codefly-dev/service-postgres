@@ -19,6 +19,13 @@ COPY . .
 
 {{- if .WithMigration }}
 COPY migrations /app/migrations
+# An editor backup kept beside a migration (2_x.up.sql~, .bak, .orig) parses as
+# the same version and direction as the file it shadows, so migrate rejects the
+# whole directory as a duplicate. Drop exactly what the runtime filter hides:
+# the pattern is rendered from the single Go definition.
+RUN find /app/migrations -maxdepth 1 -type f | while read -r file; do \
+      echo "${file##*/}" | grep -qE '{{ .MigrationFileNamePattern }}' || rm -f "${file}"; \
+    done
 {{- end }}
 COPY runtime-access.sql /app/runtime-access.sql
 
