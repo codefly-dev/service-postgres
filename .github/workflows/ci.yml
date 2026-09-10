@@ -207,4 +207,4 @@ jobs:
           EXPECTED_DIGEST: ${{ steps.runtime.outputs.digest }}
           RUNTIME_IMAGE: ${{ steps.runtime.outputs.reference }}
           RUNTIME_TAG: ${{ steps.runtime.outputs.tag_reference }}
-        run: .github/scripts/tag-runtime-image.sh
+        run: .github/scripts/tag-runtime-image.sh "$RUNTIME_TAG"

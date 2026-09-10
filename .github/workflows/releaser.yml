@@ -11,6 +11,13 @@ on:
         required: true
         type: string
 
+# Releases share the runtime tag read from runtime-image.json, so two of them
+# publishing at once can each see the other's digest on it. They queue rather
+# than cancel: cancelling would abandon a half-published release.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -21,6 +28,9 @@ jobs:
       contents: read
       packages: write
     runs-on: ubuntu-latest
+    # The publish step waits on registry propagation, so bound the job rather
+    # than leave a hung read to GitHub's six-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -41,20 +51,10 @@ jobs:
           set -euo pipefail
           name=$(jq -er '.name' runtime-image.json)
           tag=$(jq -er '.tag' runtime-image.json)
-          digest=$(jq -er '.digest' runtime-image.json)
-          RUNTIME_IMAGE="$name@$digest"
-          docker buildx imagetools create \
-            --tag "$name:$RELEASE_TAG" \
-            --tag "$name:$tag" \
-            "$RUNTIME_IMAGE"
-          for published_tag in "$name:$RELEASE_TAG" "$name:$tag"; do
-            published_digest=$(docker buildx imagetools inspect "$published_tag" |
-              awk '$1 == "Digest:" { print $2; exit }')
-            if [[ "$published_digest" != "$digest" ]]; then
-              echo "$published_tag resolves to $published_digest, want $digest" >&2
-              exit 1
-            fi
-          done
+          EXPECTED_DIGEST=$(jq -er '.digest' runtime-image.json)
+          RUNTIME_IMAGE="$name@$EXPECTED_DIGEST"
+          export EXPECTED_DIGEST RUNTIME_IMAGE
+          .github/scripts/tag-runtime-image.sh "$name:$RELEASE_TAG" "$name:$tag"
 
   release:
     if: github.event_name == 'push'
