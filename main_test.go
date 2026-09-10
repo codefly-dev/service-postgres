@@ -267,6 +267,26 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	runtime.RuntimeReadWriteRoles = []string{delegatedWriter}
 	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
 
+	maintenance, closeMaintenance, err := scoped.OpenMaintenance(ctx, readWriteConnection, delegatedWriter, scoped.WithOperationTimeout(5*time.Second))
+	require.NoError(t, err)
+	maintenanceWriter, err := maintenance.Writer(ctx)
+	require.NoError(t, err)
+	require.NoError(t, maintenanceWriter.InTransaction(ctx, func(ctx context.Context, tx scoped.WriteTx) error {
+		_, err := tx.Exec(ctx, "INSERT INTO "+pq.QuoteIdentifier(serviceName)+" (id) VALUES ($1)", "10000000-0000-0000-0000-000000000001")
+		return err
+	}))
+	require.Error(t, maintenanceWriter.InTransaction(ctx, func(ctx context.Context, tx scoped.WriteTx) error {
+		_, err := tx.Exec(ctx, "CREATE TABLE forbidden_maintenance(id integer)")
+		return err
+	}))
+	closeMaintenance()
+	closeMaintenance()
+	_, closeOwner, err := scoped.OpenMaintenance(ctx, runtime.connection, delegatedWriter, scoped.WithOperationTimeout(5*time.Second))
+	if err == nil {
+		closeOwner()
+	}
+	require.Error(t, err, "maintenance must not accept the migration owner")
+
 	assertExternalIdentityReconciliation(t, ctx, migrationControl)
 	assertExternalIdentityTokenAuthentication(t, ctx, readOnlyConnection, readWriteConnection)
 
