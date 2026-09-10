@@ -7,10 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -25,8 +28,56 @@ func TestBootstrapImageLockMatchesCommittedDocument(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, lock, bootstrapLock)
 
-	document := sha256.Sum256(content)
+	canonical, err := json.Marshal(lock)
+	require.NoError(t, err)
+	document := sha256.Sum256(canonical)
 	require.Equal(t, "sha256:"+hex.EncodeToString(document[:]), bootstrapLock.LockDigest)
+}
+
+// TestBootstrapImageLockDigestIgnoresDocumentFormatting covers the value a consumer
+// compares across two builds: reindenting the lock resolves the same inputs, so it
+// must not report a different identity.
+func TestBootstrapImageLockDigestIgnoresDocumentFormatting(t *testing.T) {
+	document := committedBootstrapLockDocument(t)
+	compact, err := json.Marshal(document)
+	require.NoError(t, err)
+	indented, err := json.MarshalIndent(document, "", "\t")
+	require.NoError(t, err)
+	require.NotEqual(t, compact, indented)
+
+	fromCompact, err := parseBootstrapImageLock(compact)
+	require.NoError(t, err)
+	fromIndented, err := parseBootstrapImageLock(indented)
+	require.NoError(t, err)
+
+	require.Equal(t, bootstrapLock.LockDigest, fromCompact.LockDigest)
+	require.Equal(t, bootstrapLock.LockDigest, fromIndented.LockDigest)
+}
+
+// TestBootstrapImageLockChecksumsMatchPublishedArchives is the check that makes a
+// locked checksum falsifiable: it downloads each archive the lock pins and hashes
+// it. Nothing else in the suite can tell a correct checksum from a plausible one —
+// the template test only asserts the value is present, and the per-architecture
+// build test needs emulation the host may not have.
+func TestBootstrapImageLockChecksumsMatchPublishedArchives(t *testing.T) {
+	for _, archive := range bootstrapLock.Migrate.Archives {
+		t.Run(archive.Architecture, func(t *testing.T) {
+			url := fmt.Sprintf(
+				"https://github.com/golang-migrate/migrate/releases/download/%s/migrate.linux-%s.tar.gz",
+				bootstrapLock.Migrate.Version, archive.Architecture,
+			)
+			response, err := http.Get(url)
+			require.NoError(t, err, "cannot reach %s to verify the locked checksum", url)
+			defer func() { require.NoError(t, response.Body.Close()) }()
+			require.Equal(t, http.StatusOK, response.StatusCode, url)
+
+			hasher := sha256.New()
+			_, err = io.Copy(hasher, response.Body)
+			require.NoError(t, err)
+			require.Equal(t, archive.SHA256, hex.EncodeToString(hasher.Sum(nil)),
+				"locked checksum does not match the archive published at %s", url)
+		})
+	}
 }
 
 // The bootstrap image downloads the migrate archive with curl and its command
@@ -64,6 +115,7 @@ func TestBootstrapProvenanceExposesEveryResolvedInput(t *testing.T) {
 	require.Equal(t, bootstrapLock.LockDigest, values["dev.codefly.bootstrap.lock-digest"])
 	require.Equal(t, bootstrapLock.Base.Reference(), values["dev.codefly.bootstrap.base"])
 	require.Equal(t, bootstrapLock.Packages.Specs(), values["dev.codefly.bootstrap.apk-packages"])
+	require.Equal(t, strings.Join(bootstrapLock.Packages.Repositories, " "), values["dev.codefly.bootstrap.apk-repositories"])
 	require.Contains(t, values["dev.codefly.bootstrap.migrate-archives"], "amd64=")
 	require.Contains(t, values["dev.codefly.bootstrap.migrate-archives"], "arm64=")
 
@@ -93,7 +145,7 @@ func TestParseBootstrapImageLockRejectsUnverifiableInput(t *testing.T) {
 		{
 			name:  "truncated base digest",
 			amend: func(document map[string]any) { lockBase(document)["digest"] = "sha256:48b0309ca019d89d" },
-			error: "bootstrap base image digest must be a sha256 checksum",
+			error: "bootstrap base image digest must be a sha256 digest",
 		},
 		{
 			name:  "missing base version",
@@ -103,7 +155,7 @@ func TestParseBootstrapImageLockRejectsUnverifiableInput(t *testing.T) {
 		{
 			name: "plaintext package repository",
 			amend: func(document map[string]any) {
-				lockPackages(document)["repository"] = "http://dl-cdn.alpinelinux.org/alpine/v3.21/main"
+				lockPackages(document)["repositories"] = []any{"http://dl-cdn.alpinelinux.org/alpine/v3.21/main"}
 			},
 			error: `bootstrap apk repository must be an https URL, got "http://dl-cdn.alpinelinux.org/alpine/v3.21/main"`,
 		},
@@ -118,6 +170,11 @@ func TestParseBootstrapImageLockRejectsUnverifiableInput(t *testing.T) {
 				lockPackages(document)["pinned"] = []any{map[string]any{"name": "curl", "version": ""}}
 			},
 			error: "bootstrap apk package curl must pin an exact version",
+		},
+		{
+			name:  "no package repositories",
+			amend: func(document map[string]any) { lockPackages(document)["repositories"] = []any{} },
+			error: "bootstrap apk repositories are required",
 		},
 		{
 			name:  "no pinned packages",
@@ -205,14 +262,16 @@ func lockArchives(document map[string]any) []any {
 
 func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		Bootstrap:                    bootstrapLock,
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 	})
 
 	require.Contains(t, dockerfile, "FROM "+bootstrapLock.Base.Reference())
 	require.NotContains(t, dockerfile, bootstrapLock.Base.Image+":", "base image must not resolve through a mutable tag")
 
-	require.Contains(t, dockerfile, bootstrapLock.Packages.Repository+"\" >/etc/apk/repositories")
+	for _, repository := range bootstrapLock.Packages.Repositories {
+		require.Contains(t, dockerfile, `"`+repository+`"`)
+	}
+	require.Contains(t, dockerfile, ">/etc/apk/repositories")
 	require.Contains(t, dockerfile, "apk add --no-cache "+bootstrapLock.Packages.Specs())
 
 	script := bootstrapMigrateInstallScript(t, dockerfile)
@@ -234,10 +293,23 @@ func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 	require.Greater(t, extraction, verification)
 	require.Greater(t, installation, extraction)
 
+	// Literal label values, and no ARG behind them: a label that resolves a build
+	// argument reports whatever the caller passed, not what built the image.
 	for _, entry := range bootstrapLock.Provenance() {
-		require.Contains(t, dockerfile, "ARG "+entry.Arg+"=\""+entry.Value+"\"")
-		require.Contains(t, dockerfile, entry.Label+"=\"$"+entry.Arg+"\"")
+		require.Contains(t, dockerfile, entry.Label+"=\""+entry.Value+"\"")
+		require.NotContains(t, dockerfile, "ARG "+entry.Arg)
+		require.NotContains(t, dockerfile, "$"+entry.Arg)
 	}
+}
+
+// TestBootstrapDockerfileRendersFromZeroValueTemplating covers the locked inputs no
+// caller passes in: they reach the template through DockerTemplating's own method,
+// so a value constructed without them still renders a fully pinned image instead of
+// failing at render with a nil dereference.
+func TestBootstrapDockerfileRendersFromZeroValueTemplating(t *testing.T) {
+	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{})
+	require.Contains(t, dockerfile, "FROM "+bootstrapLock.Base.Reference())
+	require.Contains(t, dockerfile, "apk add --no-cache "+bootstrapLock.Packages.Specs())
 }
 
 // TestBootstrapImageBuildsLockedInputsPerArchitecture builds the image the
@@ -268,17 +340,49 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 				require.Equal(t, entry.Value, labels[entry.Label])
 			}
 
+			machine, named := machines[architecture]
+			require.True(t, named, "no expected machine name for %s", architecture)
+
 			resolved, err := exec.Command("docker", "run", "--rm", "--platform", platform,
 				"--entrypoint", "sh", tag, "-c",
 				"migrate -version; uname -m; cat /etc/alpine-release; psql --version",
 			).CombinedOutput()
 			require.NoError(t, err, string(resolved))
 			require.Contains(t, string(resolved), strings.TrimPrefix(bootstrapLock.Migrate.Version, "v"))
-			require.Contains(t, string(resolved), machines[architecture])
+			require.Contains(t, string(resolved), machine)
 			require.Contains(t, string(resolved), bootstrapLock.Base.Version)
 			client, _, _ := strings.Cut(bootstrapPinnedVersion(t, "postgresql17-client"), "-r")
 			require.Contains(t, string(resolved), "(PostgreSQL) "+client)
 		})
+	}
+}
+
+// TestBootstrapImageLabelsCannotBeOverriddenAtBuildTime covers the provenance the
+// image reports about itself: passing the same names the recipe carries as build
+// arguments must not change a single label, or the labels are a caller's claim
+// rather than evidence of what was built.
+func TestBootstrapImageLabelsCannotBeOverriddenAtBuildTime(t *testing.T) {
+	requireDocker(t)
+	requireDockerPlatform(t, "linux/"+runtime.GOARCH)
+	context := bootstrapBuildContext(t)
+
+	arguments := []string{"build", "--tag", ""}
+	for argument := range bootstrapLock.RecipeBuildArgs() {
+		arguments = append(arguments, "--build-arg", argument+"=forged")
+	}
+	tag := fmt.Sprintf("service-postgres-bootstrap-forge-test:%d", time.Now().UnixNano())
+	arguments[2] = tag
+	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", tag).Run() })
+
+	output, err := exec.Command("docker", append(arguments, context)...).CombinedOutput()
+	require.NoError(t, err, string(output))
+
+	inspect, err := exec.Command("docker", "image", "inspect", tag, "--format", "{{json .Config.Labels}}").Output()
+	require.NoError(t, err)
+	labels := map[string]string{}
+	require.NoError(t, json.Unmarshal(inspect, &labels))
+	for _, entry := range bootstrapLock.Provenance() {
+		require.Equal(t, entry.Value, labels[entry.Label], "%s was forged by a build argument", entry.Label)
 	}
 }
 
@@ -290,7 +394,6 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 func TestBootstrapImageRejectsTamperedMigrateArchive(t *testing.T) {
 	requireDocker(t)
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		Bootstrap:                    bootstrapLock,
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 	})
 	script := bootstrapMigrateInstallScript(t, dockerfile)
@@ -318,7 +421,6 @@ func bootstrapBuildContext(t *testing.T) string {
 	t.Helper()
 	context := t.TempDir()
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		Bootstrap:                    bootstrapLock,
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 	})
 	require.NoError(t, os.WriteFile(filepath.Join(context, "Dockerfile"), []byte(dockerfile), 0o644))
@@ -390,13 +492,20 @@ func requireDocker(t *testing.T) {
 	}
 }
 
-// requireDockerPlatform skips when the host cannot run images for platform: a
-// foreign architecture needs emulation the runner may not have installed, and a
-// silent pass would claim coverage the run never had.
+// requireDockerPlatform skips when the host cannot run images for platform, because
+// a foreign architecture needs emulation a developer machine may not have. Under CI
+// it fails instead: that is the run whose green result is taken as proof both
+// architectures were verified, so it must not be able to quietly verify one.
 func requireDockerPlatform(t *testing.T, platform string) {
 	t.Helper()
 	probe := exec.Command("docker", "run", "--rm", "--platform", platform, bootstrapLock.Base.Reference(), "true")
-	if output, err := probe.CombinedOutput(); err != nil {
-		t.Skipf("docker cannot run %s images on this host: %v\n%s", platform, err, output)
+	output, err := probe.CombinedOutput()
+	if err == nil {
+		return
 	}
+	message := fmt.Sprintf("docker cannot run %s images on this host: %v\n%s", platform, err, output)
+	if os.Getenv("CI") != "" {
+		t.Fatal(message + "\nCI must register emulation (docker/setup-qemu-action) before running these tests")
+	}
+	t.Skip(message)
 }

@@ -24,7 +24,6 @@ func TestBootstrapImageAlwaysReconcilesRuntimeAccess(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			parameters := DockerTemplating{
-				Bootstrap:                    bootstrapLock,
 				MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 				WithMigration:                test.withMigrations,
 				ReadOnlyRole:                 "codefly_app_ro",
@@ -94,7 +93,6 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 	}
 	root := t.TempDir()
 	parameters := DockerTemplating{
-		Bootstrap:                    bootstrapLock,
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 	}
 	if err := os.WriteFile(
@@ -119,7 +117,6 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 
 func TestRuntimeAccessTemplateUsesDelegatedRolesAsExclusiveWriteAuthority(t *testing.T) {
 	parameters := DockerTemplating{
-		Bootstrap:                    bootstrapLock,
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 		ReadOnlyRole:                 "codefly_app_ro",
 		ReadWriteRole:                "codefly_app_rw",
@@ -153,7 +150,6 @@ func TestRuntimeAccessTemplateUsesDelegatedRolesAsExclusiveWriteAuthority(t *tes
 
 func TestRuntimeAccessTemplatePreservesDirectWriterWithoutDelegatedRoles(t *testing.T) {
 	parameters := DockerTemplating{
-		Bootstrap:                    bootstrapLock,
 		MigrationConnectionKeyHolder: "{" + migrationConnectionEnvironmentKey + "}",
 		ReadOnlyRole:                 "codefly_app_ro",
 		ReadWriteRole:                "codefly_app_rw",

@@ -1,19 +1,19 @@
 FROM {{ .Bootstrap.Base.Reference }}
 
 ARG TARGETARCH
-{{- range .Bootstrap.Provenance }}
-ARG {{ .Arg }}="{{ .Value }}"
-{{- end }}
+
+# Literals, not build arguments: a label is provenance only if it reports what
+# actually built the image, and a --build-arg must not be able to rewrite it.
 LABEL {{ range $index, $entry := .Bootstrap.Provenance }}{{ if $index }} \
-      {{ end }}{{ $entry.Label }}="${{ $entry.Arg }}"{{ end }}
+      {{ end }}{{ $entry.Label }}="{{ $entry.Value }}"{{ end }}
 
 WORKDIR /app
 
-# apk resolves from the locked repository alone, and every package is pinned to an
+# apk resolves from the locked repositories alone, and every package is pinned to an
 # exact version: once upstream replaces one of them the build fails instead of
 # quietly installing different bytes. .github/scripts/update-bootstrap-lock.sh
 # moves the lock forward.
-RUN printf '%s\n' "{{ .Bootstrap.Packages.Repository }}" >/etc/apk/repositories \
+RUN printf '%s\n' {{ .Bootstrap.Packages.RepositoryArguments }} >/etc/apk/repositories \
     && apk add --no-cache {{ .Bootstrap.Packages.Specs }}
 
 # The archive is downloaded to a file and checksum-verified against the lock before

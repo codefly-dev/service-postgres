@@ -21,6 +21,17 @@ var bootstrapImageLockJSON []byte
 // resolve a migrate archive for each of them, and the image rejects any other.
 var bootstrapArchitectures = []string{"amd64", "arm64"}
 
+// bootstrapRecipePlatforms are the buildx platforms the emitted recipe targets,
+// derived from the architectures the lock resolves inputs for so a platform can
+// never be advertised without a verified migrate archive behind it.
+func bootstrapRecipePlatforms() []string {
+	platforms := make([]string, 0, len(bootstrapArchitectures))
+	for _, architecture := range bootstrapArchitectures {
+		platforms = append(platforms, "linux/"+architecture)
+	}
+	return platforms
+}
+
 // bootstrapLock resolves the inputs the bootstrap image builds from. The runtime
 // image lock covers only the managed Postgres image, so this separate image needs
 // its own source of truth.
@@ -40,9 +51,11 @@ type bootstrapImageLock struct {
 	Packages bootstrapPackages      `json:"packages"`
 	Migrate  bootstrapMigrateBinary `json:"migrate"`
 
-	// LockDigest is the sha256 of the lock document, derived when it is parsed. It
-	// is the single value two builds compare to prove they resolved the same
-	// inputs, and it travels with the image as a label.
+	// LockDigest is the sha256 of the lock's canonical encoding, derived when it is
+	// parsed. It is the single value two builds compare to prove they resolved the
+	// same inputs, and it travels with the image as a label. Canonical, not the
+	// document's own bytes: reindenting or reordering keys in the file changes no
+	// input, so it must not change the identity the provenance reports.
 	LockDigest string `json:"-"`
 }
 
@@ -53,8 +66,8 @@ type bootstrapBaseImage struct {
 }
 
 type bootstrapPackages struct {
-	Repository string             `json:"repository"`
-	Pinned     []bootstrapPackage `json:"pinned"`
+	Repositories []string           `json:"repositories"`
+	Pinned       []bootstrapPackage `json:"pinned"`
 }
 
 type bootstrapPackage struct {
@@ -77,6 +90,16 @@ type bootstrapMigrateArchive struct {
 // manifest for the platform it is building.
 func (b bootstrapBaseImage) Reference() string {
 	return b.Image + "@" + b.Digest
+}
+
+// RepositoryArguments renders the locked repositories as printf arguments, quoted
+// for the shell, in lock order. They become the image's entire apk repository set.
+func (p bootstrapPackages) RepositoryArguments() string {
+	quoted := make([]string, 0, len(p.Repositories))
+	for _, repository := range p.Repositories {
+		quoted = append(quoted, `"`+repository+`"`)
+	}
+	return strings.Join(quoted, " ")
 }
 
 // Specs renders the locked packages as apk arguments, each pinned to an exact
@@ -109,7 +132,7 @@ func (l *bootstrapImageLock) Provenance() []bootstrapProvenance {
 		{Arg: "CODEFLY_BOOTSTRAP_LOCK_DIGEST", Label: "dev.codefly.bootstrap.lock-digest", Value: l.LockDigest},
 		{Arg: "CODEFLY_BOOTSTRAP_BASE", Label: "dev.codefly.bootstrap.base", Value: l.Base.Reference()},
 		{Arg: "CODEFLY_BOOTSTRAP_BASE_VERSION", Label: "dev.codefly.bootstrap.base-version", Value: l.Base.Version},
-		{Arg: "CODEFLY_BOOTSTRAP_APK_REPOSITORY", Label: "dev.codefly.bootstrap.apk-repository", Value: l.Packages.Repository},
+		{Arg: "CODEFLY_BOOTSTRAP_APK_REPOSITORIES", Label: "dev.codefly.bootstrap.apk-repositories", Value: strings.Join(l.Packages.Repositories, " ")},
 		{Arg: "CODEFLY_BOOTSTRAP_APK_PACKAGES", Label: "dev.codefly.bootstrap.apk-packages", Value: l.Packages.Specs()},
 		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_VERSION", Label: "dev.codefly.bootstrap.migrate-version", Value: l.Migrate.Version},
 		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_ARCHIVES", Label: "dev.codefly.bootstrap.migrate-archives", Value: strings.Join(archives, ",")},
@@ -117,10 +140,10 @@ func (l *bootstrapImageLock) Provenance() []bootstrapProvenance {
 }
 
 // RecipeBuildArgs exposes the same resolved identities through the build recipe's
-// typed build arguments. They carry the locked values the Dockerfile already
-// defaults to, so the recipe records what it was built from without becoming the
-// thing that decides it: the digests and checksums the build verifies against are
-// literals in the Dockerfile, not arguments a caller can override.
+// typed build arguments, where core folds them into the plan's aggregate digest.
+// Nothing in the Dockerfile reads them: every input the build resolves, verifies
+// against, or records as a label is a rendered literal, so no caller can pass an
+// argument that changes what the image is or what it claims to be.
 func (l *bootstrapImageLock) RecipeBuildArgs() map[string]string {
 	provenance := l.Provenance()
 	buildArgs := make(map[string]string, len(provenance))
@@ -140,7 +163,11 @@ func parseBootstrapImageLock(content []byte) (*bootstrapImageLock, error) {
 	if err := lock.validate(); err != nil {
 		return nil, err
 	}
-	document := sha256.Sum256(content)
+	canonical, err := json.Marshal(lock)
+	if err != nil {
+		return nil, fmt.Errorf("encode bootstrap image lock: %w", err)
+	}
+	document := sha256.Sum256(canonical)
 	lock.LockDigest = "sha256:" + hex.EncodeToString(document[:])
 	return &lock, nil
 }
@@ -152,7 +179,7 @@ func (l *bootstrapImageLock) validate() error {
 	if l.Base.Version == "" {
 		return fmt.Errorf("bootstrap base image version is required")
 	}
-	if err := validateBootstrapDigest("bootstrap base image digest", l.Base.Digest); err != nil {
+	if err := validateSHA256Digest("bootstrap base image digest", l.Base.Digest); err != nil {
 		return err
 	}
 	if err := l.validatePackages(); err != nil {
@@ -162,18 +189,23 @@ func (l *bootstrapImageLock) validate() error {
 }
 
 func (l *bootstrapImageLock) validatePackages() error {
-	if !strings.HasPrefix(l.Packages.Repository, "https://") {
-		return fmt.Errorf("bootstrap apk repository must be an https URL, got %q", l.Packages.Repository)
+	if len(l.Packages.Repositories) == 0 {
+		return fmt.Errorf("bootstrap apk repositories are required")
 	}
 	branch, err := alpineReleaseBranch(l.Base.Version)
 	if err != nil {
 		return err
 	}
-	// A base bumped to a new Alpine release while the package repository stays on
-	// the previous branch resolves packages that were never built against that
-	// base, so the lock only accepts both moving together.
-	if !strings.Contains(l.Packages.Repository, "/"+branch+"/") {
-		return fmt.Errorf("bootstrap apk repository %q does not serve the locked Alpine %s branch", l.Packages.Repository, branch)
+	for _, repository := range l.Packages.Repositories {
+		if !strings.HasPrefix(repository, "https://") {
+			return fmt.Errorf("bootstrap apk repository must be an https URL, got %q", repository)
+		}
+		// A base bumped to a new Alpine release while a package repository stays on
+		// the previous branch resolves packages that were never built against that
+		// base, so the lock only accepts both moving together.
+		if !strings.Contains(repository, "/"+branch+"/") {
+			return fmt.Errorf("bootstrap apk repository %q does not serve the locked Alpine %s branch", repository, branch)
+		}
 	}
 	if len(l.Packages.Pinned) == 0 {
 		return fmt.Errorf("bootstrap apk packages are required")
@@ -209,7 +241,7 @@ func (l *bootstrapImageLock) validateMigrate() error {
 			return fmt.Errorf("bootstrap migrate archive for %s is locked twice", archive.Architecture)
 		}
 		locked[archive.Architecture] = true
-		if err := validateBootstrapChecksum(
+		if err := validateSHA256Checksum(
 			fmt.Sprintf("bootstrap migrate %s archive checksum", archive.Architecture),
 			archive.SHA256,
 		); err != nil {
@@ -233,18 +265,25 @@ func alpineReleaseBranch(version string) (string, error) {
 	return "v" + major + "." + minor, nil
 }
 
-func validateBootstrapDigest(field, value string) error {
+// validateSHA256Digest accepts an "sha256:<hex>" reference, the form both image
+// locks pin by.
+func validateSHA256Digest(field, value string) error {
 	algorithm, encoded, found := strings.Cut(value, ":")
-	if !found || algorithm != "sha256" {
+	if !found || algorithm != "sha256" || !isSHA256Hex(encoded) {
 		return fmt.Errorf("%s must be a sha256 digest", field)
 	}
-	return validateBootstrapChecksum(field, encoded)
+	return nil
 }
 
-func validateBootstrapChecksum(field, value string) error {
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(decoded) != sha256.Size {
+// validateSHA256Checksum accepts the bare hex a checksum file publishes.
+func validateSHA256Checksum(field, value string) error {
+	if !isSHA256Hex(value) {
 		return fmt.Errorf("%s must be a sha256 checksum", field)
 	}
 	return nil
+}
+
+func isSHA256Hex(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
