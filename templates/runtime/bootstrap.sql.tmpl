@@ -12,15 +12,22 @@
 -- concurrent bootstrap pods are reachable in production.
 --
 -- Session-scoped rather than transaction-scoped: it must be held across the
--- migrate child process below, which runs outside any transaction here.
+-- migrate child processes below, which run outside any transaction here.
 SELECT pg_advisory_lock({{ .RuntimeAccessLockID }});
-{{- if .WithMigration }}
 
--- Runs while the lock above is held: psql keeps this session, and therefore the
--- lock, open for the lifetime of the child process. ON_ERROR_STOP does NOT
--- cover \!, so the exit status is checked explicitly -- otherwise a failed
--- migration would fall through and grant access over a schema that was never
--- migrated.
+-- Extensions first, so migration files can rely on them. Same ordering, and the
+-- same required/optional outcome, as the local runtime's applySchema.
+\i /app/bootstrap/extensions.sql
+{{- range .Lineages }}
+
+-- Source {{ .Label }} into its own ledger {{ .Ledger }}. Every lineage is
+-- applied inside this one session, so they share the lock above with the grants
+-- rather than racing them.
+--
+-- Runs while the lock is held: psql keeps this session, and therefore the lock,
+-- open for the lifetime of the child process. ON_ERROR_STOP does NOT cover \!,
+-- so the exit status is checked explicitly -- otherwise a failed migration would
+-- fall through and grant access over a schema that was never migrated.
 --
 -- The libpq settings below are stripped from the child environment. psql
 -- exports PGSYSCONFDIR to its children, and migrate's driver (lib/pq) PANICS
@@ -28,10 +35,13 @@ SELECT pg_advisory_lock({{ .RuntimeAccessLockID }});
 -- PGSYSCONFDIR not supported" -- which running migrate as a psql child would
 -- otherwise turn into a crash. Exactly lib/pq's unsupported set is unset, so
 -- every setting it does honour (PGSSLROOTCERT and friends) still reaches it.
-\! env -u PGSERVICE -u PGSERVICEFILE -u PGREALM -u PGREQUIRESSL -u PGSSLCRL -u PGREQUIREPEER -u PGKRBSRVNAME -u PGGSSLIB -u PGSYSCONFDIR -u PGLOCALEDIR /usr/local/bin/migrate -path /app/migrations -database "${{ .MigrationConnectionKeyHolder }}" up
+--
+-- CODEFLY_LEDGER_SEPARATOR is exported by bootstrap.sh: the ledger is a query
+-- parameter and the connection string may already carry one.
+\! env -u PGSERVICE -u PGSERVICEFILE -u PGREALM -u PGREQUIRESSL -u PGSSLCRL -u PGREQUIREPEER -u PGKRBSRVNAME -u PGGSSLIB -u PGSYSCONFDIR -u PGLOCALEDIR /usr/local/bin/migrate -path /app/bootstrap/sources/{{ .Stage }} -database "{{ printf "${%s}" $.MigrationConnectionEnvironment }}${CODEFLY_LEDGER_SEPARATOR}x-migrations-table={{ .Ledger }}" up
 \if :SHELL_ERROR
 DO $codefly_bootstrap$ BEGIN
-    RAISE EXCEPTION 'schema migration failed; refusing to reconcile runtime access';
+    RAISE EXCEPTION 'schema migration failed for source {{ .Label }}; refusing to reconcile runtime access';
 END $codefly_bootstrap$;
 \endif
 {{- end }}

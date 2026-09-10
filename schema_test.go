@@ -238,8 +238,11 @@ func TestOwnMigrationLayoutIsValidated(t *testing.T) {
 	})
 
 	// The builder creates an empty migrations/ so the bootstrap image's COPY
-	// resolves; that must stay legal.
-	t.Run("empty directory stays legal", func(t *testing.T) {
+	// resolves; that must stay legal. It must also not be APPLIED: golang-migrate
+	// reports an empty source as a missing first version rather than "no change",
+	// so handing one to Up() fails the run that this emptiness is supposed to be
+	// legal for.
+	t.Run("empty directory stays legal and is not applied", func(t *testing.T) {
 		s := NewRuntime()
 		s.Location = t.TempDir()
 		if err := os.MkdirAll(filepath.Join(s.Location, "migrations"), 0o755); err != nil {
@@ -249,8 +252,8 @@ func TestOwnMigrationLayoutIsValidated(t *testing.T) {
 		if err != nil {
 			t.Fatalf("an empty own migrations directory must stay legal: %v", err)
 		}
-		if len(prerequisites.sources) != 1 {
-			t.Errorf("expected the own lineage to resolve, got %+v", prerequisites.sources)
+		if len(prerequisites.sources) != 0 {
+			t.Errorf("a lineage with no migration must not be applied, got %+v", prerequisites.sources)
 		}
 	})
 }

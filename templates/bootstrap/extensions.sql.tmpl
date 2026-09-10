@@ -1,0 +1,20 @@
+\set ON_ERROR_STOP on
+{{- range .Extensions }}
+{{- if .Required }}
+
+-- Declared as required: the bootstrap fails when this cannot be created, exactly
+-- as the local runtime fails readiness for it.
+CREATE EXTENSION IF NOT EXISTS "{{ .Name }}";
+{{- else }}
+
+-- Optional: reported and skipped when the server image does not ship its
+-- library, matching what the local runtime records as a skipped prerequisite.
+DO $codefly$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS "{{ .Name }}";
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'optional extension "{{ .Name }}" is unavailable in this server image: %', SQLERRM;
+END;
+$codefly$;
+{{- end }}
+{{- end }}

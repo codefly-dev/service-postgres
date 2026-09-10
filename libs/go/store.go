@@ -154,6 +154,8 @@ type config struct {
 	operationTimeout    time.Duration
 	readIsolation       pgx.TxIsoLevel
 	accessTokenProvider AccessTokenProvider
+	restrictedSession   bool
+	deniedRoles         []string
 }
 
 // Option configures the RLS settings used by application policies.

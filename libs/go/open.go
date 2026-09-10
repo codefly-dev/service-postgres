@@ -40,6 +40,8 @@ func Open(
 		installAccessTokenProvider(readerConfig, configuration.accessTokenProvider)
 		installAccessTokenProvider(writerConfig, configuration.accessTokenProvider)
 	}
+	installRestrictedSession(readerConfig, configuration)
+	installRestrictedSession(writerConfig, configuration)
 	readerPool, err := pgxpool.NewWithConfig(ctx, readerConfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open read-only Postgres capability: %w", err)
