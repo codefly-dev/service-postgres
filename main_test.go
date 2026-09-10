@@ -6,12 +6,9 @@ import (
 	"fmt"
 
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
-	"github.com/codefly-dev/core/network"
 	"github.com/codefly-dev/core/resources"
 	runners "github.com/codefly-dev/core/runners/base"
-	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/core/wool"
 	scoped "github.com/codefly-dev/service-postgres/libs/go"
 	pgcontrol "github.com/codefly-dev/service-postgres/libs/go/controlplane"
@@ -50,97 +47,10 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	wool.SetGlobalLogLevel(wool.DEBUG)
 	ctx := context.Background()
 
-	workspace := &resources.Workspace{Name: "test"}
+	fixture := newPostgresFixture(t, ctx, runtimeContext)
+	serviceName := fixture.serviceName
 
-	tmpDir := t.TempDir()
-	defer func(path string) {
-		err := os.RemoveAll(path)
-		require.NoError(t, err)
-	}(tmpDir)
-
-	serviceName := fmt.Sprintf("svc-%v", time.Now().UnixMilli())
-	service := resources.Service{Name: serviceName, Version: "test-me"}
-	err := service.SaveAtDir(ctx, path.Join(tmpDir, "mod", service.Name))
-
-	require.NoError(t, err)
-
-	identity := &basev0.ServiceIdentity{
-		Name:                service.Name,
-		Module:              "mod",
-		Workspace:           workspace.Name,
-		WorkspacePath:       tmpDir,
-		RelativeToWorkspace: fmt.Sprintf("mod/%s", service.Name),
-	}
-	builder := NewBuilder()
-
-	resp, err := builder.Load(ctx, &builderv0.LoadRequest{DisableCatch: true, Identity: identity, CreationMode: &builderv0.CreationMode{Communicate: false}})
-	require.NoError(t, err)
-	require.NotNil(t, resp)
-
-	_, err = builder.Create(ctx, &builderv0.CreateRequest{})
-	require.NoError(t, err)
-
-	// Now run it
-	runtime := NewRuntime()
-
-	// Create temporary network mappings
-	networkManager, err := network.NewRuntimeManager(ctx, nil)
-	require.NoError(t, err)
-	networkManager.WithTemporaryPorts()
-
-	env := resources.LocalEnvironment()
-
-	_, err = runtime.Load(ctx, &runtimev0.LoadRequest{
-		Identity:     identity,
-		Environment:  shared.Must(env.Proto()),
-		DisableCatch: true})
-	require.NoError(t, err)
-
-	require.Equal(t, 1, len(runtime.Endpoints))
-
-	networkMappings, err := networkManager.GenerateNetworkMappings(
-		ctx,
-		env,
-		workspace,
-		runtime.Identity,
-		runtime.Endpoints,
-		runtimeContext,
-	)
-	require.NoError(t, err)
-	require.Equal(t, 1, len(networkMappings))
-
-	// Configurations are passed in
-	conf := &basev0.Configuration{
-		Origin:         fmt.Sprintf("mod/%s", service.Name),
-		RuntimeContext: resources.NewRuntimeContextFree(),
-		Infos: []*basev0.ConfigurationInformation{
-			{Name: "postgres",
-				ConfigurationValues: []*basev0.ConfigurationValue{
-					{Key: "POSTGRES_USER", Value: "postgres"},
-					{Key: "POSTGRES_PASSWORD", Value: "owner-password"},
-					{Key: "POSTGRES_READ_ONLY_PASSWORD", Value: "read-only-password"},
-					{Key: "POSTGRES_READ_WRITE_PASSWORD", Value: "read-write-password"},
-				},
-			},
-		},
-	}
-
-	init, err := runtime.Init(ctx, &runtimev0.InitRequest{
-		RuntimeContext:          runtimeContext,
-		Configuration:           conf,
-		ProposedNetworkMappings: networkMappings,
-	})
-	require.NoError(t, err)
-	require.NotNil(t, init)
-
-	defer func() {
-		_, err = runtime.Destroy(ctx, &runtimev0.DestroyRequest{})
-	}()
-
-	// Extract logs
-
-	_, err = runtime.Start(ctx, &runtimev0.StartRequest{})
-	require.NoError(t, err)
+	runtime, init := fixture.start(t, ctx)
 	assertMigrationConnectionsAreOwned(t, ctx, runtime)
 
 	// Get the configuration and connect to postgres
@@ -204,7 +114,7 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	// rolled down and back up here without ever exporting the owner connection
 	// to a dependent service.
 	migrationRelation := serviceName + "_migration_replay"
-	migrationDirectory := path.Join(tmpDir, "mod", service.Name, "migrations")
+	migrationDirectory := path.Join(fixture.workspaceDir, "mod", serviceName, "migrations")
 	migrationUp := path.Join(migrationDirectory, "2_replay.up.sql")
 	migrationDown := path.Join(migrationDirectory, "2_replay.down.sql")
 	quotedMigrationRelation := pq.QuoteIdentifier(migrationRelation)
@@ -302,17 +212,7 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	assertExternalIdentityTokenAuthentication(t, ctx, readOnlyConnection, readWriteConnection)
 
 	if runtimeContext.Kind == resources.RuntimeContextContainer {
-		assertDockerStateSurvivesContainerRecreation(
-			t,
-			ctx,
-			runtime,
-			identity,
-			env,
-			conf,
-			networkMappings,
-			serviceName,
-			fixtureID,
-		)
+		assertDockerStateSurvivesContainerRecreation(t, ctx, fixture, runtime, serviceName, fixtureID)
 	}
 }
 
@@ -359,11 +259,8 @@ func assertMigrationConnectionsAreOwned(t *testing.T, ctx context.Context, runti
 func assertDockerStateSurvivesContainerRecreation(
 	t *testing.T,
 	ctx context.Context,
+	fixture *postgresFixture,
 	initial *Runtime,
-	identity *basev0.ServiceIdentity,
-	env *resources.Environment,
-	configuration *basev0.Configuration,
-	networkMappings []*basev0.NetworkMapping,
 	relation string,
 	fixtureID string,
 ) {
@@ -372,28 +269,7 @@ func assertDockerStateSurvivesContainerRecreation(
 	_, err := initial.Destroy(ctx, &runtimev0.DestroyRequest{})
 	require.NoError(t, err)
 
-	restarted := NewRuntime()
-	_, err = restarted.Load(ctx, &runtimev0.LoadRequest{
-		Identity:     identity,
-		Environment:  shared.Must(env.Proto()),
-		DisableCatch: true,
-	})
-	require.NoError(t, err)
-
-	init, err := restarted.Init(ctx, &runtimev0.InitRequest{
-		RuntimeContext:          resources.NewRuntimeContextContainer(),
-		Configuration:           configuration,
-		ProposedNetworkMappings: networkMappings,
-	})
-	require.NoError(t, err)
-	require.NotNil(t, init)
-	defer func() {
-		_, destroyErr := restarted.Destroy(context.Background(), &runtimev0.DestroyRequest{})
-		require.NoError(t, destroyErr)
-	}()
-
-	_, err = restarted.Start(ctx, &runtimev0.StartRequest{})
-	require.NoError(t, err)
+	restarted, init := fixture.start(t, ctx)
 
 	nativeConfiguration, err := resources.ExtractConfiguration(
 		init.RuntimeConfigurations,
@@ -414,6 +290,7 @@ func assertDockerStateSurvivesContainerRecreation(
 	found, err := reader.HasFixture(ctx, relation, fixtureID)
 	require.NoError(t, err)
 	require.True(t, found, "data written before container recreation must remain available")
+	require.NotEmpty(t, restarted.retainedDataPath)
 }
 
 // assertExternalIdentityReconciliation drives the runtime role reconciler in

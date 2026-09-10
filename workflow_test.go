@@ -67,6 +67,14 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 
 	unitTests := findWorkflowStep(t, workflow.Jobs["image"], "Run unit tests")
 	require.Empty(t, unitTests.If)
+	// The lifecycle contract drives a real agent against the LOCKED runtime
+	// image, so it cannot run in the pre-publish unit-test step: a commit that
+	// relocks the digest would send it pulling an image this job has not pushed
+	// yet. It runs unconditionally once that image is verified present.
+	require.Contains(t, unitTests.Run, "TestLifecycleContractDocker")
+	lifecycle := findWorkflowStep(t, workflow.Jobs["image"], "Run runtime lifecycle tests")
+	require.Empty(t, lifecycle.If)
+	require.Contains(t, lifecycle.Run, "^TestLifecycleContractDocker$")
 
 	smoke := findWorkflowStep(t, workflow.Jobs["image"], "Smoke test runtime image")
 	require.Contains(t, smoke.Run, "--read-only")
@@ -83,11 +91,13 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	candidateIndex, candidate := findWorkflowStepAt(t, imageJob, "Publish runtime image candidate")
 	verifyCandidateIndex, verifyCandidate := findWorkflowStepAt(t, imageJob, "Verify runtime image candidate")
 	publishedIndex, _ := findWorkflowStepAt(t, imageJob, "Verify published runtime image")
+	lifecycleIndex, _ := findWorkflowStepAt(t, imageJob, "Run runtime lifecycle tests")
 	scanIndex, scan := findWorkflowStepAt(t, imageJob, "Scan published runtime image")
 	tagIndex, tag := findWorkflowStepAt(t, imageJob, "Tag verified runtime image")
 	require.Less(t, candidateIndex, verifyCandidateIndex)
 	require.Less(t, verifyCandidateIndex, publishedIndex)
-	require.Less(t, publishedIndex, scanIndex)
+	require.Less(t, publishedIndex, lifecycleIndex)
+	require.Less(t, lifecycleIndex, scanIndex)
 	require.Less(t, scanIndex, tagIndex)
 	require.Equal(t,
 		"type=image,name=${{ steps.runtime.outputs.name }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true",

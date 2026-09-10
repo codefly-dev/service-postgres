@@ -11,6 +11,31 @@ The bootstrap job applies migrations and reconciles runtime roles and grants on 
 
 Local database state survives ordinary stop/start and container recreation. In Docker mode, the agent mounts the official image's data directory from a Codefly-owned persistent runtime directory scoped by workspace, service, and naming scope. Stable and development scopes therefore keep independent databases even when they run from the same checkout.
 
+## Lifecycle: stop, keep-running, destroy
+
+Stop and destroy have one state-ownership contract, and it is the same on Docker and Nix:
+
+| operation | execution resources | database state |
+| --- | --- | --- |
+| stop | released — the postmaster is terminated (Nix) or the container is stopped (Docker), freeing the published port | retained |
+| stop with `keep-running: true` (Docker only) | retained — the container stays up for the next invocation to reuse | retained |
+| destroy | released; the Docker container is also removed | retained |
+
+No operation deletes data. Dropping a database or a data directory needs an explicit authorization that the state is disposable and owned by the caller, which the stop and destroy calls do not carry — so a destroy is never read as permission to drop your database. A disposable reset arrives with the shared lifecycle contract in `codefly-dev/core#424`.
+
+Stop releases only what the running invocation itself started. A session that never configured this service stops nothing.
+
+**Behavior change:** Docker stop used to leave the container running, so a following run reattached to a warm server. It now stops the container, matching Nix. Set `keep-running: true` in the service settings to ask for warm reuse explicitly:
+
+```yaml
+spec:
+  keep-running: true
+```
+
+`keep-running` applies to the Docker runtime only. Reuse means the next invocation reattaches to a live server, and only Docker can do that — the Nix runtime always launches a new postmaster, so a retained one would make the next start fail on a data directory another process still holds. On Nix the setting is reported and ignored: postgres stops and its data is retained.
+
+Test fixtures should own disposable state instead of depending on a warm server: give the fixture its own naming scope so its database is separate, and let stop retain it or discard the scope wholesale. Reading a sentinel row back after stop and re-init is the supported way to prove retention.
+
 ## External-identity mode
 
 Set `auth-mode: external-identity` for managed cloud Postgres with password authentication disabled. Login principals are created out-of-band by the cloud identity provider (Entra ID / Cloud SQL IAM); the service generates, requires, and exports no passwords. The deploy build promotes no credential `secretKeyRef`s, and the exported `owner-connection`, `read-only-connection`, and `read-write-connection` strings are passwordless DSNs (`postgresql://<principal>@host/db`) that carry the principal but no secret.
