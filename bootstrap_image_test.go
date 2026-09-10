@@ -492,18 +492,26 @@ func requireDocker(t *testing.T) {
 	}
 }
 
-// requireDockerPlatform skips when the host cannot run images for platform, because
-// a foreign architecture needs emulation a developer machine may not have. Under CI
-// it fails instead: that is the run whose green result is taken as proof both
-// architectures were verified, so it must not be able to quietly verify one.
+// requireDockerPlatform skips when the host cannot build images for platform,
+// because a foreign architecture needs emulation a developer machine may not have.
+// Under CI it fails instead: that is the run whose green result is taken as proof
+// both architectures were verified, so it must not be able to quietly verify one.
+//
+// The probe builds rather than runs, matching what it gates. `docker run
+// --platform` against the locked base is refused outright ("cannot overwrite
+// digest") whenever the requested platform is not the one the pinned index digest
+// resolves to by default, so it reports a missing emulator on every host for every
+// foreign architecture. A build resolves the per-platform manifest out of the index
+// the way the real build does, and its RUN still needs the emulator.
 func requireDockerPlatform(t *testing.T, platform string) {
 	t.Helper()
-	probe := exec.Command("docker", "run", "--rm", "--platform", platform, bootstrapLock.Base.Reference(), "true")
+	probe := exec.Command("docker", "build", "--platform", platform, "--quiet", "-")
+	probe.Stdin = strings.NewReader("FROM " + bootstrapLock.Base.Reference() + "\nRUN true\n")
 	output, err := probe.CombinedOutput()
 	if err == nil {
 		return
 	}
-	message := fmt.Sprintf("docker cannot run %s images on this host: %v\n%s", platform, err, output)
+	message := fmt.Sprintf("docker cannot build %s images on this host: %v\n%s", platform, err, output)
 	if os.Getenv("CI") != "" {
 		t.Fatal(message + "\nCI must register emulation (docker/setup-qemu-action) before running these tests")
 	}
