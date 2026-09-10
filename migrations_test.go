@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -67,7 +66,7 @@ func TestMigrationSources_Resolution(t *testing.T) {
 		{Name: "billing", Path: "../billing/db/migrations"},
 	}
 
-	sources, skipped, err := s.resolveMigrationSources(context.Background())
+	sources, skipped, err := s.resolveMigrationSources()
 	if err != nil {
 		t.Fatalf("resolveMigrationSources: %v", err)
 	}

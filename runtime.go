@@ -283,7 +283,7 @@ func (s *Runtime) migrateOnInit(ctx context.Context) error {
 	// Resolve the declared prerequisites BEFORE waiting on the database: a typo
 	// in a source path, a duplicate lineage, or an unsafe name must fail without
 	// touching a schema.
-	prerequisites, err := s.resolveSchemaPrerequisites(ctx)
+	prerequisites, err := s.resolveSchemaPrerequisites()
 	if err != nil {
 		return err
 	}
@@ -301,6 +301,10 @@ func (s *Runtime) migrateOnInit(ctx context.Context) error {
 // Extensions are not migrations — they are ensured even when NoMigration is set,
 // so "port reachable" also implies "declared extensions available".
 func (s *Runtime) applySchema(ctx context.Context, prerequisites *schemaPrerequisites) error {
+	// Deferred so a skipped prerequisite is reported even when a later step
+	// fails: a migration that needs an extension reports only the missing
+	// function, and the skip is the reason it is missing.
+	defer s.reportSchemaPrerequisites(prerequisites)
 	if err := s.ensureExtensions(ctx, prerequisites); err != nil {
 		return err
 	}
@@ -309,7 +313,6 @@ func (s *Runtime) applySchema(ctx context.Context, prerequisites *schemaPrerequi
 			return err
 		}
 	}
-	s.reportSchemaPrerequisites(prerequisites)
 	return nil
 }
 
@@ -473,7 +476,7 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 
 	s.Wool.Debug("waiting for ready")
 
-	prerequisites, err := s.resolveSchemaPrerequisites(ctx)
+	prerequisites, err := s.resolveSchemaPrerequisites()
 	if err != nil {
 		return s.Runtime.StartError(err)
 	}

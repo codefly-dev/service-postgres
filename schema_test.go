@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/codefly-dev/core/wool"
 	"gopkg.in/yaml.v3"
 )
 
@@ -57,7 +59,7 @@ func TestDeclaredMigrationSourcesFailClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := newSchemaRuntime(t)
 			s.Settings.MigrationSources = tc.declared
-			_, err := s.resolveSchemaPrerequisites(context.Background())
+			_, err := s.resolveSchemaPrerequisites()
 			if err == nil {
 				t.Fatalf("expected %s to be rejected", tc.name)
 			}
@@ -77,7 +79,7 @@ func TestMigrationSourceNameFitsTrackingTable(t *testing.T) {
 	mustMigrationDir(t, filepath.Join(root, longest, "migrations"))
 	s.Settings.MigrationSources = []MigrationSource{{Name: longest}}
 
-	sources, _, err := s.resolveMigrationSources(context.Background())
+	sources, _, err := s.resolveMigrationSources()
 	if err != nil {
 		t.Fatalf("longest fitting name rejected: %v", err)
 	}
@@ -92,7 +94,7 @@ func TestRequiredMigrationSourceDirectoryFailsClosed(t *testing.T) {
 	t.Run("missing directory", func(t *testing.T) {
 		s, _ := newSchemaRuntime(t)
 		s.Settings.MigrationSources = []MigrationSource{{Name: "ghost"}}
-		_, err := s.resolveSchemaPrerequisites(context.Background())
+		_, err := s.resolveSchemaPrerequisites()
 		if err == nil || !strings.Contains(err.Error(), "does not exist") {
 			t.Fatalf("missing directory must fail: %v", err)
 		}
@@ -104,7 +106,7 @@ func TestRequiredMigrationSourceDirectoryFailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.Settings.MigrationSources = []MigrationSource{{Name: "api"}}
-		_, err := s.resolveSchemaPrerequisites(context.Background())
+		_, err := s.resolveSchemaPrerequisites()
 		if err == nil || !strings.Contains(err.Error(), "holds no migration") {
 			t.Fatalf("empty directory must fail: %v", err)
 		}
@@ -123,7 +125,7 @@ func TestRequiredMigrationSourceDirectoryFailsClosed(t *testing.T) {
 		}
 		for _, optional := range []bool{false, true} {
 			s.Settings.MigrationSources = []MigrationSource{{Name: "api", Optional: optional}}
-			_, err := s.resolveSchemaPrerequisites(context.Background())
+			_, err := s.resolveSchemaPrerequisites()
 			if err == nil || !strings.Contains(err.Error(), "cannot read migration directory") {
 				t.Fatalf("optional=%v: a non-directory path must fail: %v", optional, err)
 			}
@@ -140,7 +142,7 @@ func TestRequiredMigrationSourceDirectoryFailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.Settings.MigrationSources = []MigrationSource{{Name: "api"}}
-		_, err := s.resolveSchemaPrerequisites(context.Background())
+		_, err := s.resolveSchemaPrerequisites()
 		if err == nil || !strings.Contains(err.Error(), "ignored by the migration engine") {
 			t.Fatalf("misnamed migration must fail: %v", err)
 		}
@@ -159,7 +161,7 @@ func TestOptionalMigrationSourceReportsSkip(t *testing.T) {
 		{Name: "empty", Optional: true},
 	}
 
-	prerequisites, err := s.resolveSchemaPrerequisites(context.Background())
+	prerequisites, err := s.resolveSchemaPrerequisites()
 	if err != nil {
 		t.Fatalf("optional sources must not fail: %v", err)
 	}
@@ -183,9 +185,74 @@ func TestOptionalMigrationSourceReportsSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Settings.MigrationSources = []MigrationSource{{Name: "broken", Optional: true}}
-	if _, err := s.resolveSchemaPrerequisites(context.Background()); err == nil {
+	if _, err := s.resolveSchemaPrerequisites(); err == nil {
 		t.Error("an optional source with a misnamed migration must still fail")
 	}
+}
+
+// TestOwnMigrationLayoutIsValidated proves the own lineage is held to the same
+// layout standard as a declared one. The migration engine drops a file it
+// cannot parse without a trace, so a service would otherwise report ready with
+// a migration that never ran.
+func TestOwnMigrationLayoutIsValidated(t *testing.T) {
+	t.Run("misnamed migration file", func(t *testing.T) {
+		s := NewRuntime()
+		s.Location = t.TempDir()
+		if err := os.MkdirAll(filepath.Join(s.Location, "migrations"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(s.Location, "migrations", "001-init.up.sql"), []byte("SELECT 1;"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.resolveSchemaPrerequisites()
+		if err == nil || !strings.Contains(err.Error(), "ignored by the migration engine") {
+			t.Fatalf("a misnamed own migration must fail: %v", err)
+		}
+	})
+
+	t.Run("migrations path is not a directory", func(t *testing.T) {
+		s := NewRuntime()
+		s.Location = t.TempDir()
+		if err := os.WriteFile(filepath.Join(s.Location, "migrations"), []byte("oops"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.resolveSchemaPrerequisites()
+		if err == nil || !strings.Contains(err.Error(), "cannot read migration directory") {
+			t.Fatalf("a non-directory own migrations path must fail: %v", err)
+		}
+	})
+
+	// A dangling symlink is something present but unusable. Reading it as
+	// "authors no migrations" would silently drop the whole lineage.
+	t.Run("migrations is a dangling symlink", func(t *testing.T) {
+		s := NewRuntime()
+		s.Location = t.TempDir()
+		if err := os.Symlink(filepath.Join(s.Location, "gone"), filepath.Join(s.Location, "migrations")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.resolveSchemaPrerequisites()
+		if err == nil || !strings.Contains(err.Error(), "cannot read migration directory") {
+			t.Fatalf("a dangling own migrations symlink must fail: %v", err)
+		}
+	})
+
+	// The builder creates an empty migrations/ so the bootstrap image's COPY
+	// resolves; that must stay legal.
+	t.Run("empty directory stays legal", func(t *testing.T) {
+		s := NewRuntime()
+		s.Location = t.TempDir()
+		if err := os.MkdirAll(filepath.Join(s.Location, "migrations"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		prerequisites, err := s.resolveSchemaPrerequisites()
+		if err != nil {
+			t.Fatalf("an empty own migrations directory must stay legal: %v", err)
+		}
+		if len(prerequisites.sources) != 1 {
+			t.Errorf("expected the own lineage to resolve, got %+v", prerequisites.sources)
+		}
+	})
 }
 
 // TestOwnMigrationsStayOptional locks the documented legacy behavior: a service
@@ -195,7 +262,7 @@ func TestOwnMigrationsStayOptional(t *testing.T) {
 	s.Location = t.TempDir()
 	s.Settings.DatabaseName = "app"
 
-	prerequisites, err := s.resolveSchemaPrerequisites(context.Background())
+	prerequisites, err := s.resolveSchemaPrerequisites()
 	if err != nil {
 		t.Fatalf("absent own migrations must stay compatible: %v", err)
 	}
@@ -301,5 +368,53 @@ migration-sources:
 	}
 	if !s.MigrationSources[1].Optional {
 		t.Error("optional was not populated")
+	}
+}
+
+// capturingLogger records what a run reported, so a test can assert on the run
+// plan rather than on a side effect of it.
+type capturingLogger struct {
+	mutex    sync.Mutex
+	messages []string
+}
+
+func (c *capturingLogger) Process(log *wool.Log) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.messages = append(c.messages, log.Message)
+}
+
+func (c *capturingLogger) saw(message string) bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	for _, seen := range c.messages {
+		if strings.Contains(seen, message) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSkippedPrerequisitesAreReportedWhenALaterStepFails proves the run plan is
+// reported even when applying the schema fails. A skipped prerequisite is often
+// the reason the next step failed, so reporting it only on success hides the
+// explanation exactly when it is needed.
+func TestSkippedPrerequisitesAreReportedWhenALaterStepFails(t *testing.T) {
+	s, _ := newSchemaRuntime(t)
+	s.Settings.Extensions = []Extension{{Name: "absent_extension", Optional: true}}
+	// Unreachable: every extension records a skip, then migrations fail.
+	s.connection = "postgres://someone:secret@127.0.0.1:1/app?sslmode=disable"
+	sink := &capturingLogger{}
+	s.Wool.WithLogger(sink)
+
+	prerequisites, err := s.resolveSchemaPrerequisites()
+	if err != nil {
+		t.Fatalf("resolveSchemaPrerequisites: %v", err)
+	}
+	if err := s.applySchema(context.Background(), prerequisites); err == nil {
+		t.Fatal("expected applying the schema against an unreachable database to fail")
+	}
+	if !sink.saw("schema prerequisite skipped") {
+		t.Error("a skipped prerequisite was not reported when a later step failed")
 	}
 }

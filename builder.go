@@ -160,12 +160,13 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	}
 	// The declared schema prerequisites are validated here as well as at runtime,
 	// so a typo'd source path or a colliding lineage fails the build instead of
-	// producing a bootstrap image that quietly ships an incomplete schema.
-	prerequisites, err := s.resolveSchemaPrerequisites(ctx)
-	if err != nil {
+	// producing a bootstrap image that quietly ships an incomplete schema. The
+	// resolved plan is deliberately not reported here: this build packages only
+	// this service's own migrations, so listing the declared sources would claim
+	// an image content that does not exist.
+	if _, err := s.resolveSchemaPrerequisites(); err != nil {
 		return s.Builder.BuildError(err)
 	}
-	s.reportSchemaPrerequisites(prerequisites)
 	docker := DockerTemplating{
 		MigrationConnectionKeyHolder: fmt.Sprintf("{%s}", migrationConnectionEnvironmentKey),
 		WithMigration:                s.WithMigration(),

@@ -661,7 +661,7 @@ func assertSchemaPrerequisitesFailClosed(
 	} {
 		candidate := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
 		candidate.Settings.MigrationSources = declared
-		_, resolveErr := candidate.resolveSchemaPrerequisites(ctx)
+		_, resolveErr := candidate.resolveSchemaPrerequisites()
 		require.Errorf(t, resolveErr, "declaration %q must be rejected", name)
 		requireNoMigrationSideEffect()
 	}
@@ -672,7 +672,7 @@ func assertSchemaPrerequisitesFailClosed(
 	writeMigrationDirectory(t, filepath.Join(accepted.Location, "..", "api", "migrations"),
 		"CREATE TABLE IF NOT EXISTS prerequisite_api (id integer);")
 	accepted.Settings.MigrationSources = []MigrationSource{{Name: "api"}}
-	prerequisites, err := accepted.resolveSchemaPrerequisites(ctx)
+	prerequisites, err := accepted.resolveSchemaPrerequisites()
 	require.NoError(t, err)
 	require.NoError(t, accepted.applySchema(ctx, prerequisites))
 	for _, ledger := range []string{"schema_migrations", "schema_migrations_api"} {
@@ -686,14 +686,14 @@ func assertSchemaPrerequisitesFailClosed(
 
 	unavailable := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
 	unavailable.Settings.Extensions = []Extension{{Name: absentExtension}}
-	prerequisites, err = unavailable.resolveSchemaPrerequisites(ctx)
+	prerequisites, err = unavailable.resolveSchemaPrerequisites()
 	require.NoError(t, err)
 	require.ErrorContains(t, unavailable.applySchema(ctx, prerequisites),
 		`cannot create required extension "`+absentExtension+`"`)
 
 	optional := newRuntimeForDatabase(t, ownerConnection, isolate.Name)
 	optional.Settings.Extensions = []Extension{{Name: absentExtension, Optional: true}}
-	prerequisites, err = optional.resolveSchemaPrerequisites(ctx)
+	prerequisites, err = optional.resolveSchemaPrerequisites()
 	require.NoError(t, err)
 	require.NoError(t, optional.applySchema(ctx, prerequisites))
 	require.Contains(t, skippedPrerequisiteNames(prerequisites, prerequisiteExtension), absentExtension,
@@ -703,7 +703,7 @@ func assertSchemaPrerequisitesFailClosed(
 	// rather than reporting a database that silently lacks the extension.
 	unprivileged := newRuntimeForDatabase(t, unprivilegedConnection, isolate.Name)
 	unprivileged.Settings.Extensions = []Extension{{Name: "hstore"}}
-	prerequisites, err = unprivileged.resolveSchemaPrerequisites(ctx)
+	prerequisites, err = unprivileged.resolveSchemaPrerequisites()
 	require.NoError(t, err)
 	require.ErrorContains(t, unprivileged.applySchema(ctx, prerequisites),
 		`cannot create required extension "hstore"`)

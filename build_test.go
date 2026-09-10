@@ -10,6 +10,7 @@ import (
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	"github.com/codefly-dev/core/resources"
+	"github.com/codefly-dev/core/wool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -54,6 +55,52 @@ func buildRequest(outputDirectory string) *builderv0.BuildRequest {
 		},
 		OutputDirectory: outputDirectory,
 	}
+}
+
+// TestBuildRejectsUnresolvableSchemaDeclaration proves the build fails on a
+// declaration the runtime would also reject, rather than emitting a bootstrap
+// image that quietly omits the declared schema.
+func TestBuildRejectsUnresolvableSchemaDeclaration(t *testing.T) {
+	ctx := context.Background()
+	for name, declared := range map[string][]MigrationSource{
+		"missing directory": {{Name: "api", Path: "../nowhere/migrations"}},
+		"duplicate lineage": {{Name: "api"}, {Name: "api", Path: "../other/migrations"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			builder := newBuildTestBuilder(t)
+			builder.Settings.MigrationSources = declared
+
+			response, err := builder.Build(ctx, buildRequest(t.TempDir()))
+			require.NoError(t, err)
+			require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState(),
+				"a declaration the runtime rejects must fail the build")
+		})
+	}
+}
+
+// TestBuildDoesNotClaimSchemaItDoesNotPackage locks the other half: the build
+// validates declared sources but packages only this service's own migrations,
+// so reporting the resolved plan here would tell an operator the bootstrap
+// image carries schema it does not.
+func TestBuildDoesNotClaimSchemaItDoesNotPackage(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+	sibling := filepath.Join(filepath.Dir(builder.Location), "api", "migrations")
+	require.NoError(t, os.MkdirAll(sibling, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(sibling, "1_init.up.sql"), []byte("SELECT 1;"), 0o600))
+	builder.Settings.MigrationSources = []MigrationSource{{Name: "api", Path: sibling}}
+
+	sink := &capturingLogger{}
+	builder.Wool.WithLogger(sink)
+	// The run plan is reported at DEBUG; without this the assertion would pass
+	// against a line the level filter dropped rather than one never emitted.
+	builder.Wool.WithLoglevel(wool.DEBUG)
+
+	response, err := builder.Build(ctx, buildRequest(t.TempDir()))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.False(t, sink.saw("schema prerequisites resolved"),
+		"the build reported a resolved plan for schema it does not package")
 }
 
 func TestBuildEmitsRecipeToOutputDirectory(t *testing.T) {

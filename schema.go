@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -9,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/core/wool"
 	"github.com/golang-migrate/migrate/v4/source"
 )
@@ -60,8 +58,8 @@ type skippedPrerequisite struct {
 // resolveSchemaPrerequisites validates every declared schema prerequisite and
 // resolves it against the filesystem. It opens no database: a typo, a duplicate
 // lineage, or an over-long name fails here, before any schema is touched.
-func (s *Service) resolveSchemaPrerequisites(ctx context.Context) (*schemaPrerequisites, error) {
-	sources, skipped, err := s.resolveMigrationSources(ctx)
+func (s *Service) resolveSchemaPrerequisites() (*schemaPrerequisites, error) {
+	sources, skipped, err := s.resolveMigrationSources()
 	if err != nil {
 		return nil, err
 	}
@@ -78,59 +76,66 @@ func (s *Service) resolveSchemaPrerequisites(ctx context.Context) (*schemaPrereq
 // An explicitly declared source is REQUIRED: a missing directory, an unreadable
 // one, a layout golang-migrate would ignore, or a directory holding no migration
 // is a configuration error. Declaring `optional: true` turns the absent and
-// empty cases — and only those — into a reported skip. The own ./migrations dir
-// keeps its legacy behavior: this service may author no migrations at all.
-func (s *Service) resolveMigrationSources(ctx context.Context) ([]migrationSource, []skippedPrerequisite, error) {
+// empty cases — and only those — into a reported skip.
+//
+// The own dir is declared by existence rather than by configuration, so its
+// absence and its emptiness stay legal (the builder creates an empty one so the
+// bootstrap image's COPY resolves). Its LAYOUT is held to the same standard as
+// any other lineage: the migration engine drops a file it cannot parse without
+// a trace, whichever lineage owns it.
+func (s *Service) resolveMigrationSources() ([]migrationSource, []skippedPrerequisite, error) {
 	declared, err := s.declaredMigrationSources()
 	if err != nil {
 		return nil, nil, err
 	}
+	lineages := append([]migrationSource{{dir: s.Local("migrations")}}, declared...)
 
 	var sources []migrationSource
 	var skipped []skippedPrerequisite
 
-	own := s.Local("migrations")
-	exists, err := shared.DirectoryExists(ctx, own)
-	if err != nil {
-		return nil, nil, s.Wool.Wrapf(err, "cannot check migration directory")
-	}
-	if exists {
-		sources = append(sources, migrationSource{dir: own})
-	} else {
-		s.Wool.Debug("no own migration folder found", wool.DirField(own))
-	}
-
-	for _, declaration := range declared {
-		count, err := countMigrations(declaration.dir)
+	for _, lineage := range lineages {
+		own := lineage.name == ""
+		if own {
+			// Lstat, not a read: something present but unusable — a dangling
+			// symlink, a regular file — must reach the checks below rather than
+			// read as "this service authors no migrations".
+			if _, err := os.Lstat(lineage.dir); errors.Is(err, fs.ErrNotExist) {
+				s.Wool.Debug("no own migration folder found", wool.DirField(lineage.dir))
+				continue
+			}
+		}
+		count, err := countMigrations(lineage.dir)
 		switch {
+		case own && err != nil:
+			return nil, nil, fmt.Errorf("migration source %q: %w", lineage.label(), err)
 		case errors.Is(err, fs.ErrNotExist):
-			if !declaration.optional {
+			if !lineage.optional {
 				return nil, nil, fmt.Errorf(
 					"migration source %q declares directory %s, which does not exist: fix the path, or declare the source optional if it may ship no migrations yet",
-					declaration.name, declaration.dir)
+					lineage.name, lineage.dir)
 			}
 			skipped = append(skipped, skippedPrerequisite{
 				kind:   prerequisiteMigrationSource,
-				name:   declaration.name,
-				reason: fmt.Sprintf("optional source directory %s does not exist", declaration.dir),
+				name:   lineage.name,
+				reason: fmt.Sprintf("optional source directory %s does not exist", lineage.dir),
 			})
 		case err != nil:
 			// A path that is a file, or a directory this process may not read, is
 			// a misconfiguration even for an optional source.
-			return nil, nil, fmt.Errorf("migration source %q: %w", declaration.name, err)
-		case count == 0:
-			if !declaration.optional {
+			return nil, nil, fmt.Errorf("migration source %q: %w", lineage.name, err)
+		case count == 0 && !own:
+			if !lineage.optional {
 				return nil, nil, fmt.Errorf(
 					"migration source %q declares directory %s, which holds no migration: add a <version>_<title>.up.sql file, or declare the source optional",
-					declaration.name, declaration.dir)
+					lineage.name, lineage.dir)
 			}
 			skipped = append(skipped, skippedPrerequisite{
 				kind:   prerequisiteMigrationSource,
-				name:   declaration.name,
-				reason: fmt.Sprintf("optional source directory %s holds no migration", declaration.dir),
+				name:   lineage.name,
+				reason: fmt.Sprintf("optional source directory %s holds no migration", lineage.dir),
 			})
 		default:
-			sources = append(sources, declaration)
+			sources = append(sources, lineage)
 		}
 	}
 	return sources, skipped, nil
