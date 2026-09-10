@@ -19,8 +19,10 @@ type workflowDefinition struct {
 }
 
 type workflowConcurrency struct {
-	Group            string `yaml:"group"`
-	CancelInProgress bool   `yaml:"cancel-in-progress"`
+	Group string `yaml:"group"`
+	// Actions accepts either a literal or an expression here, so a bool-typed
+	// field would fail to parse a workflow that varies it per event.
+	CancelInProgress any `yaml:"cancel-in-progress"`
 }
 
 type workflowJob struct {
@@ -135,18 +137,35 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 // resolves the same one and the ref-keyed concurrency group does not serialize
 // branches against each other. Only a push may move it: a PR build that did
 // would race every other PR on that single tag, and would repoint what releases
-// consume before merging. The candidate publish keeps the wider guard — it
-// pushes by digest, moves no tag, and the verification below it needs that push
-// for a same-repo PR that relocks the digest.
+// consume before merging. (The candidate publish keeps the wider guard, which is
+// why the asymmetry above it is deliberate: it pushes by digest, moves no tag,
+// and the verification after it needs that push for a same-repo PR that relocks
+// the digest.)
+//
+// The guard is matched loosely because Actions treats `${{ ... }}` around it as
+// equivalent; what must not reappear is any pull_request term.
 func TestCIWorkflowMovesTheSharedRuntimeTagOnlyOnPush(t *testing.T) {
-	imageJob := readWorkflow(t, ".github/workflows/ci.yml").Jobs["image"]
+	tag := findWorkflowStep(t, readWorkflow(t, ".github/workflows/ci.yml").Jobs["image"],
+		"Tag verified runtime image")
 
-	tag := findWorkflowStep(t, imageJob, "Tag verified runtime image")
-	require.Equal(t, "github.event_name == 'push'", tag.If)
+	require.Contains(t, tag.If, "github.event_name == 'push'")
+	require.NotContains(t, tag.If, "pull_request",
+		"a pull request must not move the tag every other branch resolves")
+}
 
-	candidate := findWorkflowStep(t, imageJob, "Publish runtime image candidate")
-	require.Contains(t, candidate.If,
-		"github.event.pull_request.head.repo.full_name == github.repository")
+// Restricting the tag to pushes leaves exactly one run able to move it, so that
+// run must survive to reach the step. Cancelling it on the next merge would
+// strand the tag on the previous digest with nothing to retry it, and pull
+// requests — which move no tag — stay cancellable. Queueing pushes instead of
+// cancelling them is what makes the job timeout load-bearing: without it a hung
+// registry read blocks every later merge, not just its own run.
+func TestCIWorkflowNeverCancelsTheRunThatMovesTheTag(t *testing.T) {
+	workflow := readWorkflow(t, ".github/workflows/ci.yml")
+
+	require.Equal(t, "${{ github.workflow }}-${{ github.ref }}", workflow.Concurrency.Group)
+	require.Equal(t, "${{ github.event_name == 'pull_request' }}", workflow.Concurrency.CancelInProgress)
+	require.NotZero(t, workflow.Jobs["image"].TimeoutMinutes,
+		"a queued push must not wait out GitHub's six-hour default")
 }
 
 func TestReleaseWorkflowRetagsLockedImageWithLeastPrivilege(t *testing.T) {
@@ -175,7 +194,7 @@ func TestReleaseWorkflowRetagsLockedImageWithLeastPrivilege(t *testing.T) {
 	// Two releases publishing at once each see the other's digest on the shared
 	// runtime tag, and the read-back retry holds that window open for minutes.
 	require.Equal(t, "${{ github.workflow }}", workflow.Concurrency.Group)
-	require.False(t, workflow.Concurrency.CancelInProgress,
+	require.Equal(t, false, workflow.Concurrency.CancelInProgress,
 		"cancelling would abandon a half-published release")
 	require.NotZero(t, imageJob.TimeoutMinutes,
 		"a hung registry read must not run to GitHub's six-hour default")
