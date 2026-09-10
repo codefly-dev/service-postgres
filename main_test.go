@@ -215,6 +215,58 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 		"delegated writer must mutate through an explicitly configured role",
 	)
 
+	// #94: the exported credential must write with nothing asked of the consumer.
+	// A fresh connection is the observable unit — the default role is applied at
+	// login, so `writer`'s pooled connections predate the reconciliation above.
+	_, managedReadWriteRole := runtimeRoleNames(runtime.DatabaseName)
+	delegatedWriterProbe, err := openPostgresCapabilityProbe(ctx, readWriteConnection)
+	require.NoError(t, err)
+	defer delegatedWriterProbe.Close()
+	require.NoError(
+		t,
+		delegatedWriterProbe.AppendFixture(ctx, serviceName, "00000000-0000-0000-0000-000000000007"),
+		"a connection opened after reconciliation must write without the consumer selecting a role",
+	)
+
+	// A default role the principal cannot assume must degrade to a denied write on
+	// a working connection, never to a connection the consumer cannot open at all:
+	// consumers race the bootstrap Job that grants the membership, and a refused
+	// connection takes their reads and health checks down with their writes.
+	require.NoError(t, owner.RevokeRoleMembership(ctx, delegatedWriter, managedReadWriteRole))
+	unassumableProbe, err := openPostgresCapabilityProbe(ctx, readWriteConnection)
+	require.NoError(t, err, "an unassumable default role must not make the credential unconnectable")
+	require.Error(
+		t,
+		unassumableProbe.AppendFixture(ctx, serviceName, "00000000-0000-0000-0000-000000000008"),
+		"an unassumable default role must leave the session as the unprivileged principal",
+	)
+	require.NoError(t, unassumableProbe.Close())
+
+	// Reconciliation restores it, and dropping the delegated roles clears the
+	// default rather than leaving the principal pointed at a role it has lost.
+	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
+	restoredProbe, err := openPostgresCapabilityProbe(ctx, readWriteConnection)
+	require.NoError(t, err)
+	require.NoError(
+		t,
+		restoredProbe.AppendFixture(ctx, serviceName, "00000000-0000-0000-0000-000000000009"),
+		"reconciliation must restore the delegated writer's default role",
+	)
+	require.NoError(t, restoredProbe.Close())
+
+	runtime.RuntimeReadWriteRoles = nil
+	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
+	genericProbe, err := openPostgresCapabilityProbe(ctx, readWriteConnection)
+	require.NoError(t, err)
+	require.NoError(
+		t,
+		genericProbe.AppendFixture(ctx, serviceName, "00000000-0000-0000-0000-00000000000a"),
+		"removing the delegated roles must restore direct write authority",
+	)
+	require.NoError(t, genericProbe.Close())
+	runtime.RuntimeReadWriteRoles = []string{delegatedWriter}
+	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
+
 	assertExternalIdentityReconciliation(t, ctx, migrationControl)
 	assertExternalIdentityTokenAuthentication(t, ctx, readOnlyConnection, readWriteConnection)
 

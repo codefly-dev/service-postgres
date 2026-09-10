@@ -112,6 +112,9 @@ type DockerTemplating struct {
 	ReadWriteRole                string
 	Schemas                      []string
 	ReadWriteRoles               []string
+	// DefaultReadWriteRole is the application role the managed read-write login
+	// selects on connect. See defaultRuntimeReadWriteRole.
+	DefaultReadWriteRole string
 }
 
 // Bootstrap resolves the locked bootstrap inputs the Dockerfile renders from. A
@@ -164,6 +167,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		ReadWriteRole:                readWriteRole,
 		Schemas:                      schemas,
 		ReadWriteRoles:               readWriteRoles,
+		DefaultReadWriteRole:         defaultRuntimeReadWriteRole(readWriteRoles),
 	}
 
 	if outputDirectory := req.GetOutputDirectory(); outputDirectory != "" {

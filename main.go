@@ -92,6 +92,12 @@ type Settings struct {
 	// grants. The roles must be created by migrations. This lets an application
 	// keep request, worker, and RLS capabilities in its own schema contract
 	// without exporting the database-owner credential.
+	//
+	// The FIRST entry is the principal's session default (see
+	// defaultRuntimeReadWriteRole), so a consumer of read-write-connection writes
+	// without selecting anything. Order is therefore part of the contract:
+	// appending a role is safe, reordering changes what every consumer of the
+	// exported credential starts as.
 	RuntimeReadWriteRoles []string `yaml:"runtime-read-write-roles"`
 
 	// MigrationSources lets SEVERAL services share this ONE database while each
@@ -307,6 +313,13 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 	readOnlyConnection := postgresConnectionString(instance.Address, s.DatabaseName, readOnlyRole, s.readOnlyPassword, withSSL, passwordless)
 	readWriteConnection := postgresConnectionString(instance.Address, s.DatabaseName, readWriteRole, s.readWritePassword, withSSL, passwordless)
 
+	// The delegated read-write principal reaches its write authority through the
+	// application role it defaults to on login, not through anything encoded in
+	// this DSN: ensureRuntimeAccess and runtime-access.sql set that default
+	// server-side (see ensureDefaultRole). A `role` startup parameter here would
+	// make a role the principal cannot yet assume a FATAL that refuses the
+	// connection outright, and would never reach the restricted deploy profile,
+	// which exports these keys without values.
 	outputConf := &basev0.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),

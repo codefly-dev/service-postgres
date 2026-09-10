@@ -107,4 +107,19 @@ END;
 $codefly$;
 {{- end }}
 
+-- The delegated login is NOINHERIT and owns no write capabilities directly, so
+-- its authority is reachable only by selecting the application role. Make that
+-- the login default here rather than encoding it in the exported DSN: this runs
+-- in every deploy profile, including the restricted one whose connection strings
+-- the agent never authors, and a role the principal cannot assume degrades to a
+-- WARNING plus a permission-denied write instead of a FATAL that refuses the
+-- connection. Runs after the GRANTs above so the membership already exists.
+{{- if .DefaultReadWriteRole }}
+SELECT format('ALTER ROLE %I SET role = %L', '{{ .ReadWriteRole }}', '{{ .DefaultReadWriteRole }}')
+\gexec
+{{- else }}
+SELECT format('ALTER ROLE %I RESET role', '{{ .ReadWriteRole }}')
+\gexec
+{{- end }}
+
 COMMIT;

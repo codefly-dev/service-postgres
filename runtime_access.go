@@ -197,6 +197,22 @@ func normalizedRuntimeReadWriteRoles(configured []string, managedRoles ...string
 	return roles, nil
 }
 
+// defaultRuntimeReadWriteRole is the application role the managed read-write
+// principal selects on login: the FIRST configured runtime read-write role,
+// whatever else is configured alongside it. Keying it to the first entry rather
+// than to "there is exactly one" keeps the exported credential's behavior stable
+// when a second role is appended — otherwise adding `app_worker` next to
+// `app_documents` would silently drop every consumer back to "permission denied"
+// on its first write with no change on the consumer's side. Consumers that need
+// one of the other roles still SET ROLE; the default only decides where a
+// session starts.
+func defaultRuntimeReadWriteRole(roles []string) string {
+	if len(roles) == 0 {
+		return ""
+	}
+	return roles[0]
+}
+
 func validSQLIdentifier(value string) bool {
 	if value == "" {
 		return false
@@ -278,6 +294,13 @@ func (s *Runtime) ensureRuntimeAccess(ctx context.Context) error {
 	}); err != nil {
 		return s.Wool.Wrapf(err, "cannot reconcile runtime grants")
 	}
+	// Runs after ReconcileRuntimeAccess, in its transaction: the membership the
+	// default role depends on has just been proven and granted there, and a
+	// reconciliation that failed rolls this back with it, leaving the principal's
+	// prior default — and so its prior authority — untouched.
+	if err := ensureDefaultRole(ctx, tx, access.readWriteRole, defaultRuntimeReadWriteRole(access.readWriteRoles)); err != nil {
+		return s.Wool.Wrapf(err, "cannot set the read-write default role")
+	}
 	if err := tx.Commit(); err != nil {
 		return s.Wool.Wrapf(err, "cannot commit runtime access transaction")
 	}
@@ -304,5 +327,39 @@ func ensureLoginRole(ctx context.Context, tx *sql.Tx, role, password string, rea
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` RESET default_transaction_read_only`)
+	return err
+}
+
+// ensureDefaultRole makes role the session default of a login principal, or
+// clears it when role is empty.
+//
+// With runtime-read-write-roles configured the principal is NOINHERIT and holds
+// no table privileges of its own — ReconcileRuntimeAccess revokes them and grants
+// only membership of the application role — so its write authority is reachable
+// only by selecting that role. Setting it as the login default is the same
+// server-side mechanism ensureLoginRole already uses for the read-only role's
+// default_transaction_read_only, and it reaches every consumer of the exported
+// credential whatever driver or DSN it uses, including the restricted deploy
+// profile whose connection strings this agent never authors (#94).
+//
+// It also degrades the way the DSN `options=-c role=<role>` form cannot: a role
+// the principal cannot assume — not yet granted, or dropped by a later migration
+// — logs `WARNING: permission denied to set role` and leaves the session as the
+// principal, so the connection still opens and only writes fail. The startup
+// parameter makes that same state a FATAL that refuses the connection, taking
+// reads and health checks down with it.
+//
+// The value is a GUC string, not an identifier, so it is quoted as a literal;
+// role has already passed validSQLIdentifier.
+func ensureDefaultRole(ctx context.Context, tx *sql.Tx, principal, role string) error {
+	quotedPrincipal := pq.QuoteIdentifier(principal)
+	if role == "" {
+		// Generic mode: the principal holds its DML grants directly. Clearing the
+		// default matters on the delegated -> generic transition, where a stale
+		// default would name a role the principal is no longer a member of.
+		_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedPrincipal+` RESET role`)
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedPrincipal+` SET role = `+pq.QuoteLiteral(role))
 	return err
 }
