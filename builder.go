@@ -28,10 +28,31 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// bootstrapDirectory is the agent-owned staging root written into the build
-// context. It carries the generated bootstrap program, the plan identity, and
-// one immutable copy of every packaged migration source.
-const bootstrapDirectory = "bootstrap"
+const (
+	// bootstrapDirectory is the agent-owned staging root written into the build
+	// context. It carries the generated bootstrap program, the plan identity, and
+	// one immutable copy of every packaged migration source.
+	bootstrapDirectory = "bootstrap"
+	// stagedChecksumFile is the sha256sum manifest the bootstrap program verifies
+	// before it applies anything.
+	stagedChecksumFile = "sources.sha256"
+	// bootstrapMarkerFile doubles as the staged tree's git ignore rule: the
+	// directory is regenerated on every build, so it must never be committed,
+	// and existing services get that for free without editing their own
+	// .gitignore.
+	bootstrapMarkerFile = ".gitignore"
+	// bootstrapMarker identifies a bootstrap directory this agent generated and
+	// may therefore replace.
+	bootstrapMarker = "# codefly-generated postgres bootstrap"
+	// runtimeAccessFile is rendered at the build context root, beside the staged
+	// bootstrap tree, because the Dockerfile COPYs it root-relative.
+	runtimeAccessFile = "runtime-access.sql"
+	// bootstrapIgnoreFile keeps the build context down to what the image
+	// actually copies. The context is the whole service directory, which carries
+	// local configuration and secrets, and a context is transferred to the
+	// daemon and cached whether or not the Dockerfile copies from it.
+	bootstrapIgnoreFile = "dockerignore"
+)
 
 type Builder struct {
 	services.BuilderServer
@@ -246,6 +267,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	builder, err := dockerhelpers.NewBuilder(dockerhelpers.BuilderConfiguration{
 		Root:        s.Location,
 		Dockerfile:  "builder/Dockerfile",
+		Ignorefile:  bootstrapDirectory + "/" + bootstrapIgnoreFile,
 		Destination: img,
 		Output:      s.Wool,
 	})
@@ -298,11 +320,12 @@ func (s *Builder) buildRecipe(
 	}
 
 	buildPlan, err := services.BuildDockerBuildPlan(outputDirectory, []*builderv0.DockerBuildRecipe{{
-		Name:       "bootstrap",
-		Dockerfile: "builder/Dockerfile",
-		Context:    ".",
-		Image:      img.FullName(),
-		Platforms:  bootstrapRecipePlatforms(),
+		Name:         "bootstrap",
+		Dockerfile:   "builder/Dockerfile",
+		Context:      ".",
+		Dockerignore: bootstrapDirectory + "/" + bootstrapIgnoreFile,
+		Image:        img.FullName(),
+		Platforms:    bootstrapRecipePlatforms(),
 		// The recipe carries the resolved bootstrap inputs it was rendered from, so a
 		// consumer reads the base, package and migrate identities off the plan
 		// instead of re-resolving them.
@@ -317,10 +340,15 @@ func (s *Builder) buildRecipe(
 }
 
 // stageBootstrapContext writes the complete bootstrap artifact into a build
-// context root: the generated bootstrap program and SQL, the plan identity, and
-// one immutable copy of every resolved migration source under its own staged
-// directory. Sibling sources live outside the build context, so staging is what
-// makes them reachable at all — a Dockerfile COPY cannot leave its context.
+// context root: the generated bootstrap program and SQL, the plan identity, the
+// checksum manifest, and one immutable copy of every resolved migration source
+// under its own staged directory. Sibling sources live outside the build
+// context, so staging is what makes them reachable at all — a Dockerfile COPY
+// cannot leave its context.
+//
+// The tree is built beside its destination and swapped in, never mutated in
+// place. The image is built later by a separate process reading this same
+// directory, so a reader must never observe a half-written tree.
 func (s *Builder) stageBootstrapContext(
 	ctx context.Context,
 	plan *schemaPlan,
@@ -328,18 +356,22 @@ func (s *Builder) stageBootstrapContext(
 	contextRoot string,
 ) error {
 	root := filepath.Join(contextRoot, bootstrapDirectory)
-	// A source removed from the settings must disappear from the image, so the
-	// agent-owned staging root is rebuilt rather than merged into.
-	if err := os.RemoveAll(root); err != nil {
+	if err := assertBootstrapDirectoryIsAgentOwned(root); err != nil {
 		return err
 	}
-	if err := s.Templates(ctx, docker, services.WithTemplate(bootstrapFS, "bootstrap", "").WithDestination("%s", root)); err != nil {
+	staging, err := os.MkdirTemp(contextRoot, ".bootstrap-staging-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(staging) }()
+
+	if err = s.Templates(ctx, docker, services.WithTemplate(bootstrapFS, "bootstrap", "").WithDestination("%s", staging)); err != nil {
 		return err
 	}
 	// Every resolved lineage is staged, including one that carries no migration
 	// yet, so the plan artifact's staged paths always describe real directories.
 	for _, lineage := range plan.lineages {
-		if err := stageLineage(ctx, lineage, filepath.Join(root, "sources", lineage.stage)); err != nil {
+		if err = stageLineage(ctx, lineage, filepath.Join(staging, "sources", lineage.stage)); err != nil {
 			return fmt.Errorf("stage migration source %q: %w", lineage.label(), err)
 		}
 	}
@@ -347,15 +379,69 @@ func (s *Builder) stageBootstrapContext(
 	if err != nil {
 		return err
 	}
-	if err = os.WriteFile(filepath.Join(root, "plan.json"), append(artifact, '\n'), 0o644); err != nil {
+	if err = os.WriteFile(filepath.Join(staging, "plan.json"), append(artifact, '\n'), 0o644); err != nil {
 		return err
 	}
-	return s.renderRuntimeAccess(ctx, docker, contextRoot)
+	if err = os.WriteFile(filepath.Join(staging, stagedChecksumFile), plan.stagedChecksums(), 0o644); err != nil {
+		return err
+	}
+	// The recipe digest covers each file's mode and the bootstrap Job reads this
+	// tree as a non-root user, so the emitting machine's umask must not decide
+	// either the published digest or whether the Job can read its own program.
+	if err = normalizeStagedModes(staging); err != nil {
+		return err
+	}
+
+	if err = os.RemoveAll(root); err != nil {
+		return err
+	}
+	if err = os.Rename(staging, root); err != nil {
+		return err
+	}
+	if err = s.renderRuntimeAccess(ctx, docker, contextRoot); err != nil {
+		return err
+	}
+	return os.Chmod(filepath.Join(contextRoot, runtimeAccessFile), 0o644)
+}
+
+// assertBootstrapDirectoryIsAgentOwned refuses to replace a bootstrap directory
+// the agent did not write. The staging root sits in the user's service
+// directory, where "bootstrap" is a plausible name for hand-authored seed SQL,
+// and staging deletes the directory it claims — so a directory without the
+// agent's marker fails the build instead of being destroyed.
+func assertBootstrapDirectoryIsAgentOwned(root string) error {
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	marker, err := os.ReadFile(filepath.Join(root, bootstrapMarkerFile))
+	if err == nil && strings.HasPrefix(string(marker), bootstrapMarker) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s already exists and was not generated by codefly; move it aside — the postgres build owns that directory and regenerates it on every build",
+		root)
+}
+
+// normalizeStagedModes gives every staged file and directory a fixed mode.
+func normalizeStagedModes(root string) error {
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0o755)
+		}
+		return os.Chmod(path, 0o644)
+	})
 }
 
 // stageLineage copies one lineage's inventoried files into its staged directory
-// and re-checks each digest, so the plan artifact describes exactly the bytes
-// the image carries even if a file changed while the build was running.
+// and re-checks each digest, so the plan artifact and the checksum manifest
+// describe exactly the bytes the image carries even if a file changed while the
+// build was running.
 func stageLineage(ctx context.Context, lineage schemaLineage, destination string) error {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return err
@@ -668,7 +754,10 @@ var factoryFS embed.FS
 //go:embed templates/builder
 var builderFS embed.FS
 
-//go:embed templates/bootstrap
+// all: so the staged tree's .gitignore (a dotfile go:embed skips by default) is
+// carried into the bootstrap tree it marks as agent-generated.
+//
+//go:embed all:templates/bootstrap
 var bootstrapFS embed.FS
 
 //go:embed templates/runtime

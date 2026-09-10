@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/codefly-dev/core/agents/services"
@@ -137,6 +139,9 @@ func TestBuildEmitsRecipeToOutputDirectory(t *testing.T) {
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "bootstrap.sh"))
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "extensions.sql"))
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "plan.json"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources.sha256"))
+	require.Equal(t, "bootstrap/dockerignore", recipe.GetDockerignore(),
+		"the build context is the service directory, so the recipe must declare an ignore that keeps local secrets out of it")
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_create_table.down.sql"))
 
@@ -403,6 +408,145 @@ func mustReadFile(t *testing.T, path string) []byte {
 	content, err := os.ReadFile(path)
 	require.NoError(t, err)
 	return content
+}
+
+// TestBuildRefusesToReplaceAForeignBootstrapDirectory covers the staging root
+// living in the user's service directory: "bootstrap" is a plausible name for
+// hand-authored seed SQL, and staging deletes the directory it claims.
+func TestBuildRefusesToReplaceAForeignBootstrapDirectory(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+	handAuthored := filepath.Join(builder.Location, "bootstrap", "seed.sql")
+	require.NoError(t, os.MkdirAll(filepath.Dir(handAuthored), 0o755))
+	require.NoError(t, os.WriteFile(handAuthored, []byte("INSERT INTO example VALUES (1);\n"), 0o644))
+
+	response, err := builder.Build(ctx, buildRequest(t.TempDir()))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState())
+	require.FileExists(t, handAuthored, "the build destroyed a directory it did not generate")
+
+	// A directory the agent generated is replaced without complaint.
+	require.NoError(t, os.RemoveAll(filepath.Join(builder.Location, "bootstrap")))
+	response, err = builder.Build(ctx, buildRequest(t.TempDir()))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	response, err = builder.Build(ctx, buildRequest(t.TempDir()))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+}
+
+// TestBuildStagesTreeThatGitIgnoresItself covers services that already exist:
+// they never re-render the factory .gitignore, so the staged tree — which is
+// regenerated every build and holds copies of sibling migrations — has to carry
+// its own ignore rule or it gets committed as a second source of truth.
+func TestBuildStagesTreeThatGitIgnoresItself(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+
+	response, err := builder.Build(ctx, buildRequest(t.TempDir()))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	ignore := string(mustReadFile(t, filepath.Join(builder.Location, "bootstrap", ".gitignore")))
+	require.Contains(t, ignore, "*")
+	require.Contains(t, ignore, "codefly-generated postgres bootstrap")
+}
+
+// TestBuildStagesModesIndependentOfUmask covers two failures with one cause: the
+// recipe digest covers each file's mode, so a umask would otherwise make the
+// published digest machine-dependent, and the bootstrap Job reads this tree as
+// uid 65534, which cannot read a 0600 root-owned file.
+func TestBuildStagesModesIndependentOfUmask(t *testing.T) {
+	ctx := context.Background()
+	previous := syscall.Umask(0o077)
+	builder := newBuildTestBuilder(t)
+	outputDirectory := t.TempDir()
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	syscall.Umask(previous)
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	require.NoError(t, filepath.WalkDir(filepath.Join(outputDirectory, "bootstrap"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, infoErr := entry.Info()
+		require.NoError(t, infoErr)
+		expected := os.FileMode(0o644)
+		if entry.IsDir() {
+			expected = 0o755
+		}
+		require.Equal(t, expected, info.Mode().Perm(), path)
+		return nil
+	}))
+	runtimeAccess, err := os.Stat(filepath.Join(outputDirectory, "runtime-access.sql"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o644), runtimeAccess.Mode().Perm())
+}
+
+// TestBuildArtifactIsIdenticalAcrossCheckouts covers the published identity: two
+// machines building one commit must emit the same plan and the same recipe
+// digest, or every deploy from a different machine churns the bootstrap Job.
+// An absolutely declared source is the case that breaks it.
+func TestBuildArtifactIsIdenticalAcrossCheckouts(t *testing.T) {
+	ctx := context.Background()
+	emit := func() (string, string) {
+		t.Helper()
+		builder := newBuildTestBuilder(t)
+		external := filepath.Join(t.TempDir(), "external", "migrations")
+		writeMigration(t, external, "1_external.up.sql")
+		builder.Settings.MigrationSources = []MigrationSource{{Name: "external", Path: external}}
+		outputDirectory := t.TempDir()
+		response, err := builder.Build(ctx, buildRequest(outputDirectory))
+		require.NoError(t, err)
+		require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		return string(mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "plan.json"))),
+			response.GetResult().GetDockerBuildPlan().GetDigest()
+	}
+
+	firstPlan, firstDigest := emit()
+	secondPlan, secondDigest := emit()
+	require.Equal(t, firstPlan, secondPlan, "the published plan carries the emitting machine's paths")
+	require.Equal(t, firstDigest, secondDigest, "the recipe digest depends on where the sources happen to live")
+	require.NotContains(t, firstPlan, t.TempDir())
+	require.NotContains(t, firstPlan, "declared-path")
+}
+
+// TestBuildChecksumManifestCoversEveryStagedSource is what makes a drifted or
+// partly written context loud: the bootstrap program verifies this manifest
+// before it applies anything.
+func TestBuildChecksumManifestCoversEveryStagedSource(t *testing.T) {
+	ctx := context.Background()
+	builder := newBuildTestBuilder(t)
+	writeMigration(t, filepath.Join(filepath.Dir(builder.Location), "api", "migrations"), "1_api.up.sql")
+	builder.Settings.MigrationSources = []MigrationSource{{Name: "api"}}
+	outputDirectory := t.TempDir()
+
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	manifest := string(mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "sources.sha256")))
+	for _, staged := range []string{
+		"sources/00-store/1_create_table.up.sql",
+		"sources/00-store/1_create_table.down.sql",
+		"sources/01-api/1_api.up.sql",
+	} {
+		require.Contains(t, manifest, staged)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(manifest), "\n") {
+		digest, path, found := strings.Cut(line, "  ")
+		require.True(t, found, line)
+		require.Len(t, digest, 64, "sha256sum -c expects a bare hex digest")
+		require.Equal(t, "sha256:"+digest, mustFileDigest(t, filepath.Join(outputDirectory, "bootstrap", path)))
+	}
+}
+
+func mustFileDigest(t *testing.T, path string) string {
+	t.Helper()
+	digest, err := fileDigest(path)
+	require.NoError(t, err)
+	return digest
 }
 
 // TestBuildRecipeLocksBootstrapInputs covers the recipe a consumer builds without

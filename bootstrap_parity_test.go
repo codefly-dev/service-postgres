@@ -306,3 +306,126 @@ func writeFixtureMigration(t *testing.T, dir, name, up, down string) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, name+".up.sql"), []byte(up+"\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, name+".down.sql"), []byte(down+"\n"), 0o644))
 }
+
+// TestBootstrapImageRefusesDriftedStagedSources is the behavioral half of the
+// staging guarantee. The image is built from the service directory by a
+// separate process, long after the plan was emitted, so staged content can
+// drift or be only partly written. Without verification the run applies fewer
+// migrations and exits successfully — a silently under-migrated database. The
+// check runs before the database is even contacted, so no cluster is needed.
+func TestBootstrapImageRefusesDriftedStagedSources(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+
+	location := filepath.Join(t.TempDir(), "module", "store")
+	require.NoError(t, os.MkdirAll(location, 0o755))
+	writeFixtureMigration(t, filepath.Join(location, "migrations"), "1_store",
+		`CREATE TABLE store_item (id UUID PRIMARY KEY);`, `DROP TABLE store_item;`)
+	settings := &Settings{DatabaseName: parityDatabase}
+
+	builder := NewBuilder()
+	require.NoError(t, builder.HeadlessLoad(ctx, &basev0.ServiceIdentity{
+		Workspace: "workspace", Module: "module", Name: "store", Version: "1.2.3",
+	}))
+	builder.Information = &services.Information{
+		Service: resources.ToServiceWithCase(builder.Identity),
+		Module:  resources.ToModuleWithCase(builder.Identity),
+	}
+	builder.Location = location
+	builder.Settings = settings
+
+	outputDirectory := t.TempDir()
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	// Exactly what a concurrent build, a stray editor write, or a partly copied
+	// context leaves behind.
+	drifted := filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_store.up.sql")
+	require.NoError(t, os.WriteFile(drifted, []byte("CREATE TABLE something_else (id UUID PRIMARY KEY);\n"), 0o644))
+
+	tag := fmt.Sprintf("service-postgres-drift:%d", time.Now().UnixNano())
+	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", "--force", tag).Run() })
+	runDocker(t, "build", "--file", filepath.Join(outputDirectory, "builder", "Dockerfile"),
+		"--tag", tag, outputDirectory)
+
+	// A reachable database, so the run gets past the readiness gate and the
+	// verification is what stops it.
+	database := startBootstrapPostgres(t)
+	output, err := exec.Command("docker", "run", "--rm",
+		"--network", "container:"+database,
+		"--env", migrationConnectionEnvironmentKey+"=postgres://postgres:bootstrap-test@127.0.0.1:5432/postgres?sslmode=disable",
+		"--env", "POSTGRES_USER=postgres",
+		"--env", "POSTGRES_READ_ONLY_PASSWORD=read-only-secret",
+		"--env", "POSTGRES_READ_WRITE_PASSWORD=read-write-secret",
+		tag).CombinedOutput()
+	require.Error(t, err, "the bootstrap applied drifted migration content instead of failing:\n%s", output)
+	require.Contains(t, string(output), "1_store.up.sql")
+
+	// Nothing may reach the database: not the drifted statement, not the
+	// migration it replaced.
+	for _, relation := range []string{"public.something_else", "public.store_item"} {
+		require.Equal(t, "f",
+			queryBootstrapPostgres(t, database, fmt.Sprintf("SELECT to_regclass('%s') IS NOT NULL", relation)),
+			"a drifted staged source reached the database")
+	}
+}
+
+// TestBootstrapImageBuildsTheWayTheCLIBuildsIt exercises the recipe the way the
+// CLI consumes it: the build context is the service directory, not the recipe
+// tree, and the recipe's declared ignore is staged next to the Dockerfile
+// first. Building only from the recipe tree would never apply that ignore, so
+// an ignore that excluded something the Dockerfile copies would break every
+// deploy while the suite stayed green.
+func TestBootstrapImageBuildsTheWayTheCLIBuildsIt(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+
+	location := filepath.Join(t.TempDir(), "module", "store")
+	require.NoError(t, os.MkdirAll(location, 0o755))
+	writeFixtureMigration(t, filepath.Join(location, "migrations"), "1_store",
+		`CREATE TABLE store_item (id UUID PRIMARY KEY);`, `DROP TABLE store_item;`)
+	secrets := filepath.Join(location, "configurations", "local")
+	require.NoError(t, os.MkdirAll(secrets, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(secrets, "postgres.secret.env"),
+		[]byte("POSTGRES_PASSWORD=super-secret\n"), 0o600))
+
+	builder := NewBuilder()
+	require.NoError(t, builder.HeadlessLoad(ctx, &basev0.ServiceIdentity{
+		Workspace: "workspace", Module: "module", Name: "store", Version: "1.2.3",
+	}))
+	builder.Information = &services.Information{
+		Service: resources.ToServiceWithCase(builder.Identity),
+		Module:  resources.ToModuleWithCase(builder.Identity),
+	}
+	builder.Location = location
+	builder.Settings = &Settings{DatabaseName: parityDatabase}
+
+	outputDirectory := t.TempDir()
+	response, err := builder.Build(ctx, buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	recipe := response.GetResult().GetDockerBuildPlan().GetRecipes()[0]
+	require.NotEmpty(t, recipe.GetDockerignore())
+	dockerfile := filepath.Join(outputDirectory, filepath.FromSlash(recipe.GetDockerfile()))
+	ignore := filepath.Join(outputDirectory, filepath.FromSlash(recipe.GetDockerignore()))
+	require.NoError(t, os.WriteFile(dockerfile+".dockerignore", mustReadFile(t, ignore), 0o644))
+
+	tag := fmt.Sprintf("service-postgres-cli-shape:%d", time.Now().UnixNano())
+	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", "--force", tag).Run() })
+	runDocker(t, "build", "--file", dockerfile, "--tag", tag, location)
+
+	listing := runDocker(t, "run", "--rm", "--entrypoint", "/bin/sh", tag,
+		"-c", "ls -A /app && ls -A /app/bootstrap")
+	require.Contains(t, listing, "runtime-access.sql")
+	require.Contains(t, listing, "sources.sha256")
+	require.NotContains(t, listing, "configurations")
+
+	// /app is the whole of what this build adds to the base image, so scanning it
+	// is exhaustive for content the build could have leaked. Scanning from / would
+	// descend into /proc and /dev and block on their pseudo-files.
+	secretSearch := runDocker(t, "run", "--rm", "--entrypoint", "/bin/sh", tag,
+		"-c", "grep -rl super-secret /app 2>/dev/null; exit 0")
+	require.Empty(t, strings.TrimSpace(secretSearch), "the image carries the service directory's local secret")
+}

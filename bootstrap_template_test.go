@@ -376,6 +376,11 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 		"docker", "run", "--rm",
 		"--network", "container:"+database,
 		"--env", migrationConnectionEnvironmentKey+"=postgres://postgres:bootstrap-test@127.0.0.1:5432/postgres?sslmode=disable",
+		// The recipe renders the real runtime-access program, which reconciles
+		// the runtime roles from these; only a hand-stubbed context can omit them.
+		"--env", "POSTGRES_USER=postgres",
+		"--env", "POSTGRES_READ_ONLY_PASSWORD=read-only-secret",
+		"--env", "POSTGRES_READ_WRITE_PASSWORD=read-write-secret",
 		tag,
 	)
 	if output, err := bootstrap.CombinedOutput(); err != nil {

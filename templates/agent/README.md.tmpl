@@ -11,28 +11,6 @@ The migration owner is private to the Postgres service and its bootstrap job. It
 
 The bootstrap job applies migrations and reconciles runtime roles and grants on every deployment. Local Docker and Nix runtimes enforce the same contract.
 
-## Migration sources
-
-Several services can share one database while each owns its migrations. The service resolves one schema plan — ordered lineages, their ledgers, the required extensions, and the runtime-role grant inputs — and the local runtimes and the deployed bootstrap image both execute that same plan.
-
-```yaml
-database-name: app
-extensions:
-  - hstore
-runtime-schemas:
-  - public
-migration-sources:
-  - name: api                          # ../api/migrations
-  - name: billing
-    path: ../billing/db/migrations     # relative to this service's directory
-```
-
-- **Paths** are relative to this service's directory, or absolute. An omitted `path` defaults to `../<name>/migrations`, the sibling layout used inside a module.
-- **Order** is this service's own `./migrations` first, then each declared source in the order it appears. Later sources may depend on relations earlier ones create.
-- **Ledgers** are independent: the own source keeps golang-migrate's `schema_migrations`, and each declared source gets `schema_migrations_<name>`. Per-source version counters therefore never collide, and a source's numbering is its own.
-- A source with **no own `./migrations`** directory is normal — a database whose tables all come from siblings declares none.
-- A declared source whose directory is **missing** is skipped with a warning while developing, and **fails the build**: the image stages each source's bytes, so a declaration that cannot be resolved would otherwise ship a database without those tables.
-
 Local database state survives ordinary stop/start and container recreation. In Docker mode, the agent mounts the official image's data directory from a Codefly-owned persistent runtime directory scoped by workspace, service, and naming scope. Stable and development scopes therefore keep independent databases even when they run from the same checkout.
 
 ## Lifecycle: stop, keep-running, destroy
@@ -83,6 +61,10 @@ A declared source is **required**: a directory that does not exist, cannot be re
 A declared extension is likewise **required**: if the configured image does not ship its shared library, or the migration owner may not install it, startup fails rather than reporting a ready database that silently lacks it. Mark it `optional: true` to get a reported skip instead. The always-on convenience extensions (`vector`, `pgcrypto`, `uuid-ossp`, `pg_trgm`, `citext`, `btree_gin`) remain best-effort; naming one under `extensions` makes it required.
 
 **Upgrading.** Declarations that were previously tolerated with a warning now fail. A `migration-sources` entry pointing at a path that never existed, or a duplicated name, was silently dropped before and must be corrected or marked optional. An extension the image does not ship was skipped before and must now be removed, marked optional, or supplied by pointing `docker-image` at an image that ships it. A file that claims to be a migration but has no version prefix, in any `migrations/` directory — including this service's own — was silently ignored before and now fails; rename it to `<version>_<title>.up.sql`.
+
+Each lineage keeps its **own** golang-migrate ledger: this service's `migrations/` uses `schema_migrations` and each declared source uses `schema_migrations_<name>`, so per-source version numbers never collide and a source's numbering is its own. They are applied in declared order, this service's own directory first, so a later source may depend on relations an earlier one creates.
+
+The deployed bootstrap image packages exactly what that resolution returned. Every resolved source's migration files are copied into the image under their own staged directory and applied to their own ledger, and the declared extensions are created with the same required/optional outcome as local startup — a service whose tables come from sibling sources therefore deploys with those tables. `bootstrap/plan.json` inside the image records the packaged lineages, their ledgers, and a content digest per staged file, and the image verifies those digests before it applies anything.
 
 ## External-identity mode
 
