@@ -151,7 +151,8 @@ func (l lineage) write(t *testing.T, version int64, name, up, down string) {
 }
 
 // migrationRuntime is the production agent wired to one disposable database:
-// applyMigration, applySource, openMigration and runUp are the real code paths.
+// resolveMigrationSources, applyMigration, applySource, openMigration and runUp
+// are the real code paths.
 func migrationRuntime(t *testing.T, server *disposableServer, database, root string, sources ...MigrationSource) *Runtime {
 	t.Helper()
 	runtime := NewRuntime()
@@ -160,6 +161,18 @@ func migrationRuntime(t *testing.T, server *disposableServer, database, root str
 	runtime.Settings.MigrationSources = sources
 	runtime.connection = server.dsn(database)
 	return runtime
+}
+
+// applyMigrations drives the production two-step path: resolve and validate the
+// declared lineages first — as Init and Start do, before any connection — then
+// apply the resolved set. A resolution failure is a test-setup bug, not the
+// dirty-ledger behavior under test, so it fails the test rather than being
+// returned as the migration result.
+func applyMigrations(t *testing.T, ctx context.Context, runtime *Runtime) error {
+	t.Helper()
+	sources, _, err := runtime.resolveMigrationSources()
+	require.NoError(t, err, "the declared lineages must resolve before migrating")
+	return runtime.applyMigration(ctx, sources)
 }
 
 // disposableDatabase creates a uniquely named database and drops it on cleanup.
@@ -248,12 +261,12 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		require.NoError(t, err)
 
 		runtime := migrationRuntime(t, server, database.Name, root)
-		require.NoError(t, runtime.applyMigration(ctx), "lineage A must apply cleanly first")
+		require.NoError(t, applyMigrations(t, ctx, runtime), "lineage A must apply cleanly first")
 
 		markLedgerDirty(t, database.DB, "schema_migrations_other", 1)
 
 		runtime = migrationRuntime(t, server, database.Name, root, MigrationSource{Name: "other", Path: other.dir})
-		requireDirty(t, runtime.applyMigration(ctx), "other", "schema_migrations_other", 1)
+		requireDirty(t, applyMigrations(t, ctx, runtime), "other", "schema_migrations_other", 1)
 
 		require.True(t, relationPresent(t, database.DB, "sentinel"), "unrelated table must survive a dirty lineage")
 		require.Equal(t, 1, countRows(t, database.DB, "sentinel"))
@@ -285,10 +298,10 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		}
 
 		runtime := migrationRuntime(t, server, database.Name, root)
-		require.NoError(t, runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, runtime))
 
 		markLedgerDirty(t, database.DB, postgres.DefaultMigrationsTable, 5)
-		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, 5)
+		requireDirty(t, applyMigrations(t, ctx, runtime), "store", postgres.DefaultMigrationsTable, 5)
 
 		for version := 1; version <= 5; version++ {
 			require.True(t, relationPresent(t, database.DB, fmt.Sprintf("step_%d", version)),
@@ -311,11 +324,11 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		own.write(t, second, "second", `CREATE TABLE stamped_second (id int PRIMARY KEY);`, `DROP TABLE stamped_second;`)
 
 		runtime := migrationRuntime(t, server, database.Name, root)
-		require.NoError(t, runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, runtime))
 		require.True(t, relationPresent(t, database.DB, "stamped_second"))
 
 		markLedgerDirty(t, database.DB, postgres.DefaultMigrationsTable, second)
-		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, int(second))
+		requireDirty(t, applyMigrations(t, ctx, runtime), "store", postgres.DefaultMigrationsTable, int(second))
 
 		require.True(t, relationPresent(t, database.DB, "stamped_first"))
 		require.True(t, relationPresent(t, database.DB, "stamped_second"))
@@ -340,7 +353,7 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		markLedgerDirty(t, database.DB, postgres.DefaultMigrationsTable, 1)
 
 		runtime := migrationRuntime(t, server, database.Name, root)
-		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, 1)
+		requireDirty(t, applyMigrations(t, ctx, runtime), "store", postgres.DefaultMigrationsTable, 1)
 
 		require.True(t, relationPresent(t, database.DB, "committed_effect"))
 		require.Equal(t, 1, countRows(t, database.DB, "committed_effect"), "the committed migration must not be replayed")
@@ -360,12 +373,12 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		own.write(t, 2, "bad", `CREATE TABLE kept (id int PRIMARY KEY);`, `SELECT 1;`)
 
 		runtime := migrationRuntime(t, server, database.Name, root)
-		err := runtime.applyMigration(ctx)
+		err := applyMigrations(t, ctx, runtime)
 		require.Error(t, err, "the broken migration must surface as an ordinary SQL failure")
 		var dirty migrate.ErrDirty
 		require.False(t, errors.As(err, &dirty), "an SQL error is not a dirty-state report: %v", err)
 
-		requireDirty(t, runtime.applyMigration(ctx), "store", postgres.DefaultMigrationsTable, 2)
+		requireDirty(t, applyMigrations(t, ctx, runtime), "store", postgres.DefaultMigrationsTable, 2)
 
 		require.True(t, relationPresent(t, database.DB, "kept"))
 		require.Equal(t, 1, countRows(t, database.DB, "kept"))
@@ -392,7 +405,7 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		runtime := migrationRuntime(t, server, database.Name, root,
 			MigrationSource{Name: "second", Path: second.dir},
 			MigrationSource{Name: "third", Path: third.dir})
-		requireDirty(t, runtime.applyMigration(ctx), "second", "schema_migrations_second", 1)
+		requireDirty(t, applyMigrations(t, ctx, runtime), "second", "schema_migrations_second", 1)
 
 		require.True(t, relationPresent(t, database.DB, "first_lineage"))
 		require.False(t, relationPresent(t, database.DB, "third_lineage"), "a lineage after the failure must not be applied")
@@ -431,11 +444,11 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 		other.write(t, 1, "b", `CREATE TABLE clean_b (id int PRIMARY KEY);`, `DROP TABLE clean_b;`)
 
 		runtime := migrationRuntime(t, server, database.Name, root, MigrationSource{Name: "other", Path: other.dir})
-		require.NoError(t, runtime.applyMigration(ctx))
+		require.NoError(t, applyMigrations(t, ctx, runtime))
 		require.True(t, relationPresent(t, database.DB, "clean_a"))
 		require.True(t, relationPresent(t, database.DB, "clean_b"))
 
-		require.NoError(t, runtime.applyMigration(ctx), "an already-current database must succeed")
+		require.NoError(t, applyMigrations(t, ctx, runtime), "an already-current database must succeed")
 		version, dirty := readLedger(t, database.DB, postgres.DefaultMigrationsTable)
 		require.Equal(t, int64(1), version)
 		require.False(t, dirty)

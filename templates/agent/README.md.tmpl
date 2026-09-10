@@ -37,6 +37,30 @@ spec:
 `keep-running` applies to the Docker runtime only. Reuse means the next invocation reattaches to a live server, and only Docker can do that — the Nix runtime always launches a new postmaster, so a retained one would make the next start fail on a data directory another process still holds. On Nix the setting is reported and ignored: postgres stops and its data is retained.
 
 Test fixtures should own disposable state instead of depending on a warm server: give the fixture its own naming scope so its database is separate, and let stop retain it or discard the scope wholesale. Reading a sentinel row back after stop and re-init is the supported way to prove retention.
+## Schema prerequisites
+
+The service applies migrations from its own `migrations/` directory plus every source declared in `migration-sources`, and creates every extension declared in `extensions`. Both are resolved and validated before a database connection is opened, so a typo fails the build and local startup instead of leaving the database with a partial schema.
+
+```yaml
+migration-sources:
+  - name: api                          # applies ../api/migrations
+  - name: billing
+    path: ../billing/db/migrations
+  - name: reporting
+    optional: true                     # may ship no migrations yet
+extensions:
+  - postgis                            # required
+  - name: pg_stat_statements
+    optional: true
+```
+
+A source name may contain only letters, digits, and underscore, must be unique, and must be short enough for its tracking table `schema_migrations_<name>` to fit PostgreSQL's 63-byte identifier limit — at most 45 characters. PostgreSQL truncates longer identifiers, so two lineages that differ only past that boundary would silently share one version ledger.
+
+A declared source is **required**: a directory that does not exist, cannot be read, holds no migration, or holds a file that claims to be a migration but carries no version prefix (`init.up.sql`, `001-init.up.sql`) fails. Editor leftovers beside a migration (`2_x.up.sql~`, `.bak`, `.orig`, `.swp`) are ignored, and any plain extension counts as a migration (`.sql`, `.pgsql`, `.psql`) — the same definition the migration engine is given. `optional: true` turns the absent and empty cases into a reported skip; a directory that exists but is broken still fails. This service's own `migrations/` directory stays optional — a Postgres service that authors no migrations of its own is not a misconfiguration, and an empty `migrations/` is legal. Its *layout* is held to the same standard as any declared source: a misnamed file there fails too, because the migration engine would otherwise drop it silently.
+
+A declared extension is likewise **required**: if the configured image does not ship its shared library, or the migration owner may not install it, startup fails rather than reporting a ready database that silently lacks it. Mark it `optional: true` to get a reported skip instead. The always-on convenience extensions (`vector`, `pgcrypto`, `uuid-ossp`, `pg_trgm`, `citext`, `btree_gin`) remain best-effort; naming one under `extensions` makes it required.
+
+**Upgrading.** Declarations that were previously tolerated with a warning now fail. A `migration-sources` entry pointing at a path that never existed, or a duplicated name, was silently dropped before and must be corrected or marked optional. An extension the image does not ship was skipped before and must now be removed, marked optional, or supplied by pointing `docker-image` at an image that ships it. A file that claims to be a migration but has no version prefix, in any `migrations/` directory — including this service's own — was silently ignored before and now fails; rename it to `<version>_<title>.up.sql`.
 
 ## External-identity mode
 
