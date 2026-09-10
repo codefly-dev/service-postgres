@@ -21,11 +21,38 @@ type workflowJob struct {
 }
 
 type workflowStep struct {
-	Name string         `yaml:"name"`
-	If   string         `yaml:"if"`
-	Uses string         `yaml:"uses"`
-	Run  string         `yaml:"run"`
-	With map[string]any `yaml:"with"`
+	Name string            `yaml:"name"`
+	If   string            `yaml:"if"`
+	Uses string            `yaml:"uses"`
+	Run  string            `yaml:"run"`
+	With map[string]any    `yaml:"with"`
+	Env  map[string]string `yaml:"env"`
+}
+
+// TestCIWorkflowEnforcesMigrationRegression locks the wiring that keeps the
+// dirty-migration fail-closed regression actually running in CI. It must run
+// unconditionally, after the runtime image is built locally (so it needs no
+// registry credentials, which this job only acquires later), and it must declare
+// SERVICE_POSTGRES_TEST_IMAGE — the flag that turns a missing docker daemon into
+// a failure instead of a skip. Without these, the regression can silently stop
+// enforcing anything while the build stays green.
+func TestCIWorkflowEnforcesMigrationRegression(t *testing.T) {
+	imageJob := readWorkflow(t, ".github/workflows/ci.yml").Jobs["image"]
+
+	buildIndex, _ := findWorkflowStepAt(t, imageJob, "Build runtime image")
+	regressionIndex, regression := findWorkflowStepAt(t, imageJob, "Migration fail-closed regression")
+	require.Less(t, buildIndex, regressionIndex, "the regression must run after the image it uses is built")
+
+	require.Empty(t, regression.If, "the regression must never be conditionally skipped")
+	require.Equal(t, "service-postgres:test", regression.Env["SERVICE_POSTGRES_TEST_IMAGE"],
+		"the regression must run against the locally built image, which also makes the prerequisite mandatory")
+	require.Contains(t, regression.Run, "TestDirtyMigrationFailsClosed")
+
+	// The unit-test step deliberately carries no container-booting test; the
+	// regression must therefore be excluded there and present here, not neither.
+	unitTests := findWorkflowStep(t, imageJob, "Run unit tests")
+	require.Contains(t, unitTests.Run, "TestDirtyMigrationFailsClosed",
+		"the unit-test step must exclude the container-booting regression")
 }
 
 func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
@@ -40,6 +67,14 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 
 	unitTests := findWorkflowStep(t, workflow.Jobs["image"], "Run unit tests")
 	require.Empty(t, unitTests.If)
+	// The lifecycle contract drives a real agent against the LOCKED runtime
+	// image, so it cannot run in the pre-publish unit-test step: a commit that
+	// relocks the digest would send it pulling an image this job has not pushed
+	// yet. It runs unconditionally once that image is verified present.
+	require.Contains(t, unitTests.Run, "TestLifecycleContractDocker")
+	lifecycle := findWorkflowStep(t, workflow.Jobs["image"], "Run runtime lifecycle tests")
+	require.Empty(t, lifecycle.If)
+	require.Contains(t, lifecycle.Run, "^TestLifecycleContractDocker$")
 
 	smoke := findWorkflowStep(t, workflow.Jobs["image"], "Smoke test runtime image")
 	require.Contains(t, smoke.Run, "--read-only")
@@ -56,11 +91,13 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	candidateIndex, candidate := findWorkflowStepAt(t, imageJob, "Publish runtime image candidate")
 	verifyCandidateIndex, verifyCandidate := findWorkflowStepAt(t, imageJob, "Verify runtime image candidate")
 	publishedIndex, _ := findWorkflowStepAt(t, imageJob, "Verify published runtime image")
+	lifecycleIndex, _ := findWorkflowStepAt(t, imageJob, "Run runtime lifecycle tests")
 	scanIndex, scan := findWorkflowStepAt(t, imageJob, "Scan published runtime image")
 	tagIndex, tag := findWorkflowStepAt(t, imageJob, "Tag verified runtime image")
 	require.Less(t, candidateIndex, verifyCandidateIndex)
 	require.Less(t, verifyCandidateIndex, publishedIndex)
-	require.Less(t, publishedIndex, scanIndex)
+	require.Less(t, publishedIndex, lifecycleIndex)
+	require.Less(t, lifecycleIndex, scanIndex)
 	require.Less(t, scanIndex, tagIndex)
 	require.Equal(t,
 		"type=image,name=${{ steps.runtime.outputs.name }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true",
@@ -122,6 +159,7 @@ func TestRuntimeDockerfilePinsReproducibleBuildInputs(t *testing.T) {
 	require.Contains(t, dockerfile, "llvm21-dev=21.1.8-r1")
 	require.Contains(t, dockerfile, "libcrypto3=3.5.8-r0")
 	require.Contains(t, dockerfile, "libssl3=3.5.8-r0")
+	require.Contains(t, dockerfile, "libuuid=2.42.3-r1")
 	require.Contains(t, dockerfile, "su-exec=0.3-r0")
 	require.Contains(t, dockerfile, "RUN rm /usr/local/bin/gosu")
 	require.Contains(t, dockerfile, "ln -s /sbin/su-exec /usr/local/bin/gosu")

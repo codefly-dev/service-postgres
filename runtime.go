@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codefly-dev/core/agents/helpers/code"
@@ -28,9 +29,11 @@ type persistentCacheMounter interface {
 	WithPersistentCacheMount(context.Context, string, string) (string, error)
 }
 
-func mountPersistentPostgresData(ctx context.Context, runner persistentCacheMounter) error {
-	_, err := runner.WithPersistentCacheMount(ctx, postgresDataCacheKey, postgresDataDirectory)
-	return err
+// mountPersistentPostgresData layers the Codefly-owned persistent directory
+// over the image's data directory and returns that host path, which is where
+// the database survives every lifecycle operation.
+func mountPersistentPostgresData(ctx context.Context, runner persistentCacheMounter) (string, error) {
+	return runner.WithPersistentCacheMount(ctx, postgresDataCacheKey, postgresDataDirectory)
 }
 
 type Runtime struct {
@@ -46,6 +49,26 @@ type Runtime struct {
 	nixRuntime *nixPostgres
 
 	postgresPort uint16
+
+	// lifecycleMu serializes Stop and Destroy. Both act on runnerEnvironment,
+	// and the CLI can overlap them: it bounds each Stop at ten seconds and then
+	// fans out Destroy as soon as that deadline passes, while the abandoned Stop
+	// handler is still inside the docker client. DockerEnvironment.instance is
+	// written by Shutdown and read by Stop with no lock of its own, so without
+	// this the two race on the same handle.
+	lifecycleMu sync.Mutex
+
+	// released records that Stop already gave up this invocation's execution
+	// resources. Start probes the database for ninety seconds before giving up,
+	// which is a long way to discover that the server it is waiting for was
+	// deliberately stopped.
+	released bool
+
+	// retainedDataPath is where this invocation's database state lives on disk —
+	// the Codefly-owned cache directory bind-mounted into the container, or the
+	// nix cluster's data directory. Reported in Stop/Destroy results so a caller
+	// sees what was kept without having to inspect the backend.
+	retainedDataPath string
 }
 
 func NewRuntime() *Runtime {
@@ -159,6 +182,8 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 			return s.Runtime.InitError(errNix)
 		}
 		s.nixRuntime = nixpg
+		s.retainedDataPath = nixpg.dataDir
+		s.released = false
 		s.Wool.Debug("nix postgres init successful")
 		if errNix = s.migrateOnInit(ctx); errNix != nil {
 			return s.Runtime.InitError(errNix)
@@ -171,9 +196,11 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
-	if err = mountPersistentPostgresData(ctx, runner); err != nil {
+	dataPath, err := mountPersistentPostgresData(ctx, runner)
+	if err != nil {
 		return s.Runtime.InitError(s.Wool.Wrapf(err, "cannot configure persistent postgres data"))
 	}
+	s.retainedDataPath = dataPath
 
 	runner.WithOutput(newPGLogWriter(s.Wool))
 	runner.WithPortMapping(ctx, uint16(instance.Port), s.postgresPort)
@@ -208,6 +235,8 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	if err != nil {
 		return s.Runtime.InitError(err)
 	}
+
+	s.released = false
 
 	s.Wool.Debug("init successful")
 	if err := s.migrateOnInit(ctx); err != nil {
@@ -348,6 +377,14 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 
 	s.Wool.Debug("starting")
 
+	// Stop released this invocation's postmaster or container, and nothing but
+	// Init brings one back. Without this, WaitForReady spends ninety seconds
+	// probing a database that was deliberately shut down before reporting a
+	// generic timeout.
+	if s.released {
+		return s.Runtime.StartError(s.Wool.NewError("postgres was stopped by this invocation: run Init before Start"))
+	}
+
 	s.Wool.Debug("waiting for ready")
 
 	err := s.WaitForReady(ctx)
@@ -412,55 +449,173 @@ func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationReq
 	return s.Runtime.InformationResponse(ctx, req)
 }
 
+// Postgres lifecycle operations share one state-ownership contract, and it is
+// the same contract on both backends:
+//
+//	operation             execution resources           database state
+//	Stop                  released                      retained
+//	Stop + keep-running   retained (docker only)        retained
+//	Destroy               released, container removed   retained
+//
+// keep-running is the one row that is not backend-independent: reuse means the
+// next invocation reattaches to a live server, and only the container backend
+// can do that. See Stop.
+//
+// Releasing execution resources means terminating the postmaster (nix) or
+// stopping the container (docker) so the assigned port is free again and a
+// later Init cannot end up running a second postmaster against the same data
+// directory.
+//
+// No operation deletes data. Dropping a database or a data directory requires
+// an explicit authorization proving that state is disposable and owned by the
+// caller; neither StopRequest nor DestroyRequest carries one, so an agent must
+// never infer the right to reset from the fact that it started the process
+// (codefly-dev/core#424).
+//
+// Stop releases only what THIS invocation holds a handle to: a runtime that
+// never ran Init owns no postmaster and no container, and stops nothing.
 func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtimev0.StopResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
-	// ARCHITECTURE: Nix postgres is a host process, not a persistent container.
-	// Stop must terminate it while retaining dataDir so validation/CI flows can
-	// release the assigned port and a later Init can safely reuse the cluster.
-	// Leaving it alive makes the next phase launch a second postmaster against
-	// the same port and data directory. Docker retains its historical behavior:
-	// its Codefly-owned stateful container stays available for fast reuse.
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	// keep-running asks for a server the NEXT invocation reattaches to, and only
+	// the container backend can reattach: GetContainer adopts an existing
+	// container by name. nixPostgres has no such path — Init always launches a
+	// new postmaster, and clearStalePostmasterPid deliberately leaves a live
+	// owner's lock file alone, so a retained nix postmaster makes the next Init
+	// start a second postmaster against the same data directory and port, which
+	// postgres refuses. Honouring the setting there would trade a cold start for
+	// a broken one, so nix stops and keeps the half of the contract it can: the
+	// data.
+	if s.Settings.KeepRunning {
+		if s.nixRuntime == nil && !s.Runtime.IsNixRuntime() {
+			s.Wool.Debug("keep-running is set: leaving postgres up for reuse")
+			return s.stopResponse("kept postgres running for reuse")
+		}
+		s.Wool.Warn("keep-running is not available on the nix runtime: stopping postgres, its data is retained")
+	}
+
 	if s.nixRuntime != nil {
 		if err := s.nixRuntime.Stop(ctx); err != nil {
 			return s.Runtime.StopError(err)
 		}
+		// Stop removes the handle's socket directory, so it can never serve a
+		// second run — drop it instead of leaving a dead handle behind.
 		s.nixRuntime = nil
-		s.Wool.Debug("stopped nix postgres runtime; persistent data retained")
-		return s.Runtime.StopResponse()
+		s.released = true
+		return s.stopResponse("stopped native postgres")
 	}
 
-	s.Wool.Debug("nothing to stop: keep docker environment alive")
+	if s.runnerEnvironment != nil {
+		if err := s.stopContainer(ctx); err != nil {
+			return s.Runtime.StopError(err)
+		}
+		// The docker handle stays usable after its container stops: stopping
+		// twice is a no-op, and Destroy still needs it to close the client and
+		// log stream this invocation opened.
+		s.released = true
+		return s.stopResponse("stopped postgres container")
+	}
 
-	return s.Runtime.StopResponse()
+	return s.stopResponse("no postgres owned by this invocation")
 }
 
 func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*runtimev0.DestroyResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.Wool.Debug("Destroying")
 
-	// Nix runtime: stop the native postgres process.
 	if s.nixRuntime != nil {
 		if err := s.nixRuntime.Stop(ctx); err != nil {
 			return s.Runtime.DestroyError(err)
 		}
-		return s.Runtime.DestroyResponse()
+		s.nixRuntime = nil
+		s.released = true
+		return s.destroyResponse("stopped native postgres")
+	}
+	// A nix invocation has no container to remove, and reaching for one would
+	// demand a docker daemon from a host that was very likely chosen for not
+	// having one.
+	if s.Runtime.IsNixRuntime() {
+		return s.destroyResponse("native postgres already stopped")
 	}
 
-	// Get the runner environment
-	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
-	if err != nil {
+	// Prefer the environment this invocation started: shutting that one down
+	// also closes the docker client and log stream it opened. Resolving the
+	// container by name remains the fallback so destroy keeps working for a
+	// caller that only loaded the service.
+	runner := s.runnerEnvironment
+	if runner == nil {
+		var err error
+		runner, err = dockerrun.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
+		if err != nil {
+			return s.Runtime.DestroyError(err)
+		}
+	}
+	if err := runner.Shutdown(ctx); err != nil {
 		return s.Runtime.DestroyError(err)
 	}
+	s.runnerEnvironment = nil
+	s.released = true
+	return s.destroyResponse("removed postgres container")
+}
 
-	err = runner.Shutdown(ctx)
-	if err != nil {
-		return s.Runtime.DestroyError(err)
+// stopContainer stops the container, retrying once for a caller that is still
+// listening. Core bounds its stop call at ten seconds against the docker
+// daemon, and a loaded daemon can blow that deadline after it has already
+// accepted the stop: the container is on its way down but the call reports
+// failure. A second call is a no-op against a container that has since stopped
+// and a real second attempt against one that has not.
+//
+// The retry is only worth spending when someone will still read the answer.
+// codefly's own teardown bounds Stop at ten seconds — the same budget the first
+// attempt just consumed — so by now it has abandoned this call and moved on to
+// Destroy; retrying would spend another ten seconds producing a status nobody
+// receives, while holding the handle Destroy is waiting for. Callers without
+// that deadline (the MCP stop tool passes its request context straight through)
+// do still get the second attempt.
+func (s *Runtime) stopContainer(ctx context.Context) error {
+	err := s.runnerEnvironment.Stop(ctx)
+	if err == nil {
+		return nil
 	}
-	return s.Runtime.DestroyResponse()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return err
+	}
+	s.Wool.Warn("postgres container stop did not confirm; retrying", wool.ErrField(err))
+	return s.runnerEnvironment.Stop(ctx)
+}
+
+// stopResponse and destroyResponse report SUCCESS together with what the
+// operation released and where the state it kept now lives, so a caller learns
+// the retention outcome from the result instead of by inspecting the backend.
+// Only paths are reported, never a credential or a connection string.
+func (s *Runtime) stopResponse(action string) (*runtimev0.StopResponse, error) {
+	return &runtimev0.StopResponse{Status: &runtimev0.StopStatus{
+		State:   runtimev0.StopStatus_SUCCESS,
+		Message: s.retentionSummary(action),
+	}}, nil
+}
+
+func (s *Runtime) destroyResponse(action string) (*runtimev0.DestroyResponse, error) {
+	return &runtimev0.DestroyResponse{Status: &runtimev0.DestroyStatus{
+		State:   runtimev0.DestroyStatus_SUCCESS,
+		Message: s.retentionSummary(action),
+	}}, nil
+}
+
+func (s *Runtime) retentionSummary(action string) string {
+	if s.retainedDataPath == "" {
+		return action + "; database state retained"
+	}
+	return action + "; database state retained at " + s.retainedDataPath
 }
 
 func (s *Runtime) Test(ctx context.Context, req *runtimev0.TestRequest) (*runtimev0.TestResponse, error) {
