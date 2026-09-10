@@ -107,7 +107,12 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	require.Equal(t, false, candidate.With["sbom"])
 	require.Contains(t, verifyCandidate.Run, `"$ACTUAL_DIGEST" != "$EXPECTED_DIGEST"`)
 	require.Contains(t, scan.Run, `docker save --output /tmp/service-postgres-image.tar "$RUNTIME_IMAGE"`)
-	require.Contains(t, tag.Run, `docker buildx imagetools create --tag "$RUNTIME_TAG" "$RUNTIME_IMAGE"`)
+	require.Equal(t, ".github/scripts/tag-runtime-image.sh", strings.TrimSpace(tag.Run))
+	require.Equal(t, map[string]string{
+		"EXPECTED_DIGEST": "${{ steps.runtime.outputs.digest }}",
+		"RUNTIME_IMAGE":   "${{ steps.runtime.outputs.reference }}",
+		"RUNTIME_TAG":     "${{ steps.runtime.outputs.tag_reference }}",
+	}, tag.Env)
 
 	buildx := findWorkflowAction(t, imageJob, "docker/setup-buildx-action")
 	require.Equal(t,

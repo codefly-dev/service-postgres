@@ -207,12 +207,4 @@ jobs:
           EXPECTED_DIGEST: ${{ steps.runtime.outputs.digest }}
           RUNTIME_IMAGE: ${{ steps.runtime.outputs.reference }}
           RUNTIME_TAG: ${{ steps.runtime.outputs.tag_reference }}
-        run: |
-          set -euo pipefail
-          docker buildx imagetools create --tag "$RUNTIME_TAG" "$RUNTIME_IMAGE"
-          tagged_digest=$(docker buildx imagetools inspect "$RUNTIME_TAG" |
-            awk '$1 == "Digest:" { print $2; exit }')
-          if [[ "$tagged_digest" != "$EXPECTED_DIGEST" ]]; then
-            echo "tagged digest $tagged_digest does not match $EXPECTED_DIGEST" >&2
-            exit 1
-          fi
+        run: .github/scripts/tag-runtime-image.sh
