@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import time
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,17 @@ def main():
             f"postgres://postgres@127.0.0.1:{int(binding['HostPort'])}/postgres"
         )
         env["SESSION_POLICY_TEST_DSN"] = env["SERVICE_POSTGRES_CONTROLPLANE_TEST_DSN"]
+        with tempfile.TemporaryDirectory(prefix="postgres-bootstrap-tools-") as tool_dir:
+            migrate = str(Path(tool_dir) / "migrate")
+            bootstrap = str(Path(tool_dir) / "managed-bootstrap")
+            subprocess.run(["go", "build", "-tags", "postgres", "-o", migrate,
+                            "github.com/golang-migrate/migrate/v4/cmd/migrate"], cwd=ROOT, check=True, timeout=180)
+            subprocess.run(["go", "build", "-o", bootstrap, "./cmd/managed-bootstrap"],
+                           cwd=ROOT, check=True, timeout=180)
+            env["SERVICE_POSTGRES_MIGRATE_EXECUTABLE"] = migrate
+            env["SERVICE_POSTGRES_BOOTSTRAP_EXECUTABLE"] = bootstrap
+            subprocess.run(["go", "test", "-race", "-count=1", "-v", "-tags", "controlplaneintegration",
+                            "./libs/go/bootstrap"], cwd=ROOT, env=env, check=True, timeout=120)
         print(f"Fixture image: {image}", flush=True)
         subprocess.run(
             ["go", "test", "-race", "-count=1", "-v", "./libs/go", "-run", "^TestRestrictedSession"],

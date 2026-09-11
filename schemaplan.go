@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/codefly-dev/service-postgres/libs/go/schemaplan"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,7 +14,7 @@ import (
 
 // schemaPlanContractVersion identifies the bootstrap artifact's plan format. A
 // consumer reading bootstrap/plan.json checks it before interpreting the fields.
-const schemaPlanContractVersion = "codefly.dev/postgres-schema-plan/v1"
+const schemaPlanContractVersion = schemaplan.ContractVersion
 
 // schemaPlan is the packaged form of the resolved schema prerequisites: what the
 // bootstrap image carries, and what it applies. Resolving and validating the
@@ -186,34 +187,14 @@ func fileDigest(path string) (string, error) {
 // digest is the plan's content identity: a deterministic function of every
 // lineage's ledger, staged location and file contents, the required extensions,
 // and the runtime-role grant inputs. Mutating one migration file changes it.
-func (p *schemaPlan) digest() string {
-	hasher := sha256.New()
-	write := func(values ...string) {
-		for _, value := range values {
-			_, _ = hasher.Write([]byte(value))
-			_, _ = hasher.Write([]byte{0})
-		}
-	}
-	write(schemaPlanContractVersion, p.database)
-	for _, extension := range p.extensions {
-		write(extension.name, fmt.Sprint(extension.required))
-	}
-	write(p.access.readOnlyRole, p.access.readWriteRole)
-	write(p.access.schemas...)
-	write(p.access.readWriteRoles...)
-	for _, lineage := range p.lineages {
-		write(lineage.label(), lineage.trackingTable(), lineage.stage, lineage.digest)
-	}
-	return "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-}
+func (p *schemaPlan) digest() string { return p.artifactWithoutDigest().ContentDigest() }
 
-func lineageDigest(lineage schemaLineage) string {
-	hasher := sha256.New()
-	_, _ = hasher.Write([]byte(lineage.label() + "\x00" + lineage.trackingTable() + "\x00"))
-	for _, file := range lineage.files {
-		_, _ = hasher.Write([]byte(file.name + "\x00" + file.digest + "\x00"))
+func lineageDigest(l schemaLineage) string {
+	artifact := schemaLineageArtifact{Label: l.label(), Ledger: l.trackingTable()}
+	for _, f := range l.files {
+		artifact.Files = append(artifact.Files, schemaFileArtifact{Name: f.name, Digest: f.digest})
 	}
-	return "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	return artifact.ContentDigest()
 }
 
 // stagedChecksums renders the staged content as a sha256sum manifest, relative
@@ -258,41 +239,19 @@ func resolveSchemaAccess(settings *Settings) (schemaAccess, error) {
 // It is deliberately machine-independent and secret-free: staged locations and
 // content digests rather than filesystem provenance, role names rather than
 // credentials. Two machines building one commit must publish identical bytes.
-type schemaPlanArtifact struct {
-	ContractVersion string                    `json:"contract-version"`
-	Database        string                    `json:"database"`
-	Extensions      []schemaExtensionArtifact `json:"extensions"`
-	Lineages        []schemaLineageArtifact   `json:"lineages"`
-	Access          schemaAccessArtifact      `json:"access"`
-	Digest          string                    `json:"digest"`
-}
-
-type schemaExtensionArtifact struct {
-	Name     string `json:"name"`
-	Required bool   `json:"required"`
-}
-
-type schemaLineageArtifact struct {
-	Label  string               `json:"label"`
-	Ledger string               `json:"ledger"`
-	Stage  string               `json:"stage"`
-	Digest string               `json:"digest"`
-	Files  []schemaFileArtifact `json:"files"`
-}
-
-type schemaFileArtifact struct {
-	Name   string `json:"name"`
-	Digest string `json:"digest"`
-}
-
-type schemaAccessArtifact struct {
-	ReadOnlyRole   string   `json:"read-only-role"`
-	ReadWriteRole  string   `json:"read-write-role"`
-	Schemas        []string `json:"schemas"`
-	ReadWriteRoles []string `json:"read-write-roles"`
-}
+type schemaPlanArtifact = schemaplan.Plan
+type schemaExtensionArtifact = schemaplan.Extension
+type schemaLineageArtifact = schemaplan.Lineage
+type schemaFileArtifact = schemaplan.File
+type schemaAccessArtifact = schemaplan.Access
 
 func (p *schemaPlan) artifact() schemaPlanArtifact {
+	a := p.artifactWithoutDigest()
+	a.Digest = a.ContentDigest()
+	return a
+}
+
+func (p *schemaPlan) artifactWithoutDigest() schemaPlanArtifact {
 	extensions := make([]schemaExtensionArtifact, 0, len(p.extensions))
 	for _, extension := range p.extensions {
 		extensions = append(extensions, schemaExtensionArtifact{Name: extension.name, Required: extension.required})
@@ -322,6 +281,5 @@ func (p *schemaPlan) artifact() schemaPlanArtifact {
 			Schemas:        p.access.schemas,
 			ReadWriteRoles: p.access.readWriteRoles,
 		},
-		Digest: p.digest(),
 	}
 }

@@ -78,9 +78,11 @@ existing generated runtime-access program rewrites password-authenticated login
 roles, which is incompatible with cloud-managed identities. Rejection occurs
 before staged output is changed or Docker runs. Do not switch to password mode
 or patch the emitted SQL to get a managed deployment through this gate; a
-primitive-owned external-identity bootstrap must integrate the canonical managed
-role contract first. The shared schema-plan packaging does not itself establish
-that compatibility.
+the explicit `cmd/managed-bootstrap` preview in service-postgres integrates the
+canonical role engine separately. See the owning repository's
+`docs/managed-bootstrap.md` for its bindings and local qualification. Managed
+image/Job packaging and cloud qualification remain separate; schema-plan
+packaging alone does not establish that compatibility.
 
 For tenant isolation, application migrations must enable row-level security and define policies against transaction-local tenant/user settings. Go services should use the service-owned library at `github.com/codefly-dev/service-postgres/libs/go`, which resolves an authenticated principal from context, issues separate read-only/read-write stores without exposing raw pools, and provides tenant-scoped transaction advisory locks without exposing tenant identity to repository code.
 
