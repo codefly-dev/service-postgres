@@ -7,7 +7,7 @@ database primitive. Application services supply their domain migration files;
 they do not copy this runner or the role engine.
 
 This preview is qualified on disposable PostgreSQL 16 with a restricted
-CREATEROLE migration owner and a passwordless loopback endpoint. Managed cloud
+CREATEROLE migration owner and a passwordless TCP and private Unix-socket endpoints. Managed cloud
 execution, identity proxies, container packaging and deployment integration are
 separate qualification steps. The ordinary agent `Build` still rejects
 `auth-mode: external-identity`; its password bootstrap must not be used for this
@@ -67,14 +67,23 @@ go build -trimpath -tags postgres -o /tmp/migrate \
 ```
 
 Supply `CODEFLY_POSTGRES_MIGRATION_CONNECTION` privately through the deployment
-composition. This preview accepts an explicit passwordless TCP URL, for example
+composition. This preview accepts an explicit passwordless URL, for example
 `postgres://migration_owner@127.0.0.1:5432/example?sslmode=disable` for a disposable
 local fixture or an already authenticated local proxy. Direct network endpoints
 should use their reviewed TLS mode and trust configuration. The supported query
-keys are `sslmode`, `sslrootcert`, `sslcert` and `sslkey`; the runner owns connection,
+keys are `sslmode`, `sslrootcert`, `sslcert`, `sslkey` and the private socket `host`; the runner owns connection,
 lock and statement budgets. Static passwords, hidden service files, implicit
 principals, alternate databases and arbitrary connection options are rejected.
 Inherited password/role configuration is not forwarded to the child.
+
+For an existing identity proxy's private Unix socket use, for example,
+`postgres://migration_owner@/example?host=/private/proxy&sslmode=disable`.
+The host must be one absolute socket directory, the authority host must be empty,
+and the socket port is fixed to 5432. This mode requires `sslmode=disable` because
+the separately qualified proxy owns remote authentication and TLS. The socket
+mount must be private to this owner workload and its approved identity proxy;
+this does not authorize an unauthenticated network endpoint. The local fixture
+also executes the actual Linux binaries over a Unix socket.
 
 ```sh
 /tmp/managed-bootstrap \
@@ -131,7 +140,7 @@ POSTGRES_TEST_IMAGE=postgres@sha256:fe03a7605299a34ddf5e4f285dff78c3d7190a576b3c
 ```
 
 The harness builds the actual command and pinned migration CLI, and exercises
-concurrent jobs, command replay, one migration execution, unchanged external
+concurrent jobs, TCP and Unix-socket command replay, one migration execution, unchanged external
 passwords, reader/writer DML, denied runtime DDL, default sequence privileges,
 missing-principal and LOGIN-group rejection, bounded shared-lock contention,
 dirty-state preservation, cancellation and child-session cleanup. Failure tests

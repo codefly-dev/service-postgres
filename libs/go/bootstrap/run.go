@@ -6,10 +6,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/codefly-dev/service-postgres/libs/go/controlplane"
@@ -19,7 +21,7 @@ import (
 	"github.com/lib/pq"
 )
 
-// Options accepts a passwordless TCP endpoint supplied by an authenticated
+// Options accepts a passwordless TCP or private Unix-socket endpoint supplied by an authenticated
 // proxy/tunnel. Cloud authentication and the executable's immutable packaging
 // remain deployment-owner responsibilities. This runner never obtains tokens.
 type Options struct {
@@ -180,9 +182,9 @@ func preflight(ctx context.Context, db querier, p schemaplan.Plan, b Binding) er
 }
 
 func connection(o Options, p schemaplan.Plan) (string, error) {
-	invalid := errors.New("managed connection requires an explicit passwordless postgres TCP URL matching the plan and owner")
+	invalid := errors.New("managed connection requires an explicit passwordless postgres URL matching the plan and owner")
 	u, e := url.Parse(o.Connection)
-	if e != nil || u == nil || u.Scheme != "postgres" || u.User == nil || u.User.Username() != o.Binding.OwnerRole || u.Hostname() == "" || u.Path != "/"+p.Database || u.Fragment != "" {
+	if e != nil || u == nil || u.Scheme != "postgres" || u.User == nil || u.User.Username() != o.Binding.OwnerRole || u.Path != "/"+p.Database || u.Fragment != "" {
 		return "", invalid
 	}
 	if _, password := u.User.Password(); password {
@@ -194,7 +196,7 @@ func connection(o Options, p schemaplan.Plan) (string, error) {
 	}
 	for key, values := range q {
 		switch key {
-		case "sslmode", "sslrootcert", "sslcert", "sslkey":
+		case "sslmode", "sslrootcert", "sslcert", "sslkey", "host":
 		default:
 			return "", invalid
 		}
@@ -202,9 +204,29 @@ func connection(o Options, p schemaplan.Plan) (string, error) {
 			return "", invalid
 		}
 	}
+	if _, present := q["host"]; present && q.Get("host") == "" {
+		return "", invalid
+	}
+	if strings.Contains(u.Hostname(), ",") {
+		return "", invalid
+	}
+	if socket := q.Get("host"); socket != "" {
+		if u.Host != "" || !filepath.IsAbs(socket) || strings.ContainsAny(socket, ",\x00") || q.Get("sslmode") != "disable" {
+			return "", invalid
+		}
+		q.Set("port", "5432")
+	} else {
+		if u.Hostname() == "" {
+			return "", invalid
+		}
+		if u.Port() == "" {
+			u.Host = net.JoinHostPort(u.Hostname(), "5432")
+		}
+	}
 	if q.Get("sslmode") == "" {
 		return "", invalid
 	}
+	q.Set("search_path", "public")
 	q.Set("connect_timeout", "5")
 	q.Set("lock_timeout", fmt.Sprint(o.LockTimeout.Milliseconds()))
 	q.Set("statement_timeout", fmt.Sprint(o.StatementTimeout.Milliseconds()))

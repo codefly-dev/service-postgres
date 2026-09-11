@@ -81,6 +81,21 @@ def main():
                             "github.com/golang-migrate/migrate/v4/cmd/migrate"], cwd=ROOT, check=True, timeout=180)
             subprocess.run(["go", "build", "-o", bootstrap, "./cmd/managed-bootstrap"],
                            cwd=ROOT, check=True, timeout=180)
+            architecture = subprocess.check_output(
+                ["docker", "inspect", "--format", "{{.Architecture}}", image], text=True).strip()
+            if architecture not in {"amd64", "arm64"}:
+                raise ValueError("unsupported fixture architecture")
+            linux_env = env.copy()
+            linux_env.update(GOOS="linux", GOARCH=architecture, CGO_ENABLED="0")
+            for name, package, tags in [
+                ("migrate", "github.com/golang-migrate/migrate/v4/cmd/migrate", ["-tags", "postgres"]),
+                ("managed-bootstrap", "./cmd/managed-bootstrap", []),
+            ]:
+                target = str(Path(tool_dir) / (name + "-linux"))
+                subprocess.run(["go", "build", *tags, "-o", target, package],
+                               cwd=ROOT, env=linux_env, check=True, timeout=180)
+                subprocess.run(["docker", "cp", target, f"{container}:/tmp/{name}"], check=True)
+            env["SERVICE_POSTGRES_FIXTURE_CONTAINER"] = container
             env["SERVICE_POSTGRES_MIGRATE_EXECUTABLE"] = migrate
             env["SERVICE_POSTGRES_BOOTSTRAP_EXECUTABLE"] = bootstrap
             subprocess.run(["go", "test", "-race", "-count=1", "-v", "-tags", "controlplaneintegration",

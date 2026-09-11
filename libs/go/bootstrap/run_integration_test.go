@@ -175,6 +175,36 @@ func TestManagedBootstrapRestrictedPostgres(t *testing.T) {
 			t.Fatal("command receipt mismatch")
 		}
 	})
+
+	t.Run("private proxy socket command replay", func(t *testing.T) {
+		container := os.Getenv("SERVICE_POSTGRES_FIXTURE_CONTAINER")
+		if container == "" {
+			t.Fatal("fixture container required")
+		}
+		binding := filepath.Join(t.TempDir(), "binding.json")
+		data, _ := json.Marshal(b)
+		if e := os.WriteFile(binding, data, 0600); e != nil {
+			t.Fatal(e)
+		}
+		for _, pair := range [][2]string{{dir, "/tmp/schema-package"}, {binding, "/tmp/binding.json"}} {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			output, e := exec.CommandContext(ctx, "docker", "cp", pair[0], container+":"+pair[1]).CombinedOutput()
+			cancel()
+			if e != nil {
+				t.Fatal("fixture copy:", e, string(output))
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		output, e := exec.CommandContext(ctx, "docker", "exec", "--env", "CODEFLY_POSTGRES_MIGRATION_CONNECTION=postgres://bootstrap_owner@/bootstrap_proof?host=/var/run/postgresql&sslmode=disable", container, "/tmp/managed-bootstrap", "-package", "/tmp/schema-package", "-binding", "/tmp/binding.json", "-migrate", "/tmp/migrate", "-timeout", "10s", "-lock-timeout", "3s", "-statement-timeout", "5s").CombinedOutput()
+		if e != nil {
+			t.Fatal("private socket command:", e, string(output))
+		}
+		var result Result
+		if e = json.Unmarshal(output, &result); e != nil || !result.AccessCommitted || result.PlanSHA256 != b.PlanSHA256 {
+			t.Fatal("socket receipt mismatch")
+		}
+	})
 	t.Run("dirty failure and cancellation skip access", func(t *testing.T) {
 		// Separate ledgers let this test exercise dirty recovery without forcing or
 		// repairing the successful lineage. The sentinel must never appear in logs.

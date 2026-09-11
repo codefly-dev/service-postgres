@@ -127,3 +127,24 @@ func TestConnectionIsExplicitAndPasswordless(t *testing.T) {
 		t.Fatal("invalid budgets accepted")
 	}
 }
+
+func TestPrivateSocketConnection(t *testing.T) {
+	_, p, b := packageFixture(t, "SELECT 1;")
+	good := "postgres://bootstrap_owner@/bootstrap_proof?host=/private/proxy&sslmode=disable"
+	dsn, e := connection(Options{Binding: b, Connection: good, LockTimeout: time.Second, StatementTimeout: time.Second}, p)
+	if e != nil || !strings.Contains(dsn, "port=5432") {
+		t.Fatal("private socket binding rejected:", e)
+	}
+	for _, dsn := range []string{
+		"postgres://bootstrap_owner@remote/bootstrap_proof?host=/private/proxy&sslmode=disable",
+		"postgres://bootstrap_owner@remote/bootstrap_proof?host=&sslmode=disable",
+		"postgres://bootstrap_owner@remote,other/bootstrap_proof?sslmode=disable",
+		"postgres://bootstrap_owner@/bootstrap_proof?host=relative&sslmode=disable",
+		"postgres://bootstrap_owner@/bootstrap_proof?host=/private/proxy,remote&sslmode=disable",
+		"postgres://bootstrap_owner@/bootstrap_proof?host=/private/proxy&sslmode=require",
+	} {
+		if _, e = connection(Options{Binding: b, Connection: dsn}, p); e == nil {
+			t.Fatal("ambiguous socket accepted")
+		}
+	}
+}
