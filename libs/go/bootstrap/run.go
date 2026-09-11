@@ -67,13 +67,10 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 	if e != nil {
 		return result, e
 	}
-	cfg, e := pgx.ParseConfig(dsn)
+	cfg, e := managedConfig(dsn, o)
 	if e != nil {
-		return result, errors.New("invalid managed connection")
+		return result, e
 	}
-	// pgx can otherwise discover a local .pgpass even though the URL is clean.
-	cfg.Password = ""
-	cfg.RuntimeParams = map[string]string{"lock_timeout": fmt.Sprint(o.LockTimeout.Milliseconds()), "statement_timeout": fmt.Sprint(o.StatementTimeout.Milliseconds()), "search_path": "public"}
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	db := stdlib.OpenDB(*cfg)
@@ -261,4 +258,34 @@ func drainChild(conn *sql.Conn, application string) error {
 		return errors.New("migration session cleanup uncertain; reconcile owner sessions before retry")
 	}
 	return nil
+}
+
+// pgx merges URL settings over environment/default files. Override identity,
+// TLS credential defaults and reject an ambient service selector before parsing, rather than clearing a
+// password only after an ambient service or client certificate was loaded.
+func managedConfig(dsn string, o Options) (*pgx.ConnConfig, error) {
+	if os.Getenv("PGSERVICE") != "" {
+		return nil, errors.New("ambient PostgreSQL service binding is unsupported")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return nil, errors.New("invalid managed connection")
+	}
+	q := u.Query()
+	for key, value := range map[string]string{"password": "", "passfile": "/dev/null", "servicefile": "/dev/null", "sslpassword": "", "sslsni": "1", "sslnegotiation": "postgres", "options": "", "target_session_attrs": "any"} {
+		q.Set(key, value)
+	}
+	for _, key := range []string{"sslcert", "sslkey", "sslrootcert"} {
+		if _, explicit := q[key]; !explicit {
+			q.Set(key, "")
+		}
+	}
+	u.RawQuery = q.Encode()
+	cfg, err := pgx.ParseConfig(u.String())
+	if err != nil {
+		return nil, errors.New("invalid managed connection")
+	}
+	cfg.Password = ""
+	cfg.RuntimeParams = map[string]string{"lock_timeout": fmt.Sprint(o.LockTimeout.Milliseconds()), "statement_timeout": fmt.Sprint(o.StatementTimeout.Milliseconds()), "search_path": "public"}
+	return cfg, nil
 }

@@ -74,7 +74,7 @@ should use their reviewed TLS mode and trust configuration. The supported query
 keys are `sslmode`, `sslrootcert`, `sslcert`, `sslkey` and the private socket `host`; the runner owns connection,
 lock and statement budgets. Static passwords, hidden service files, implicit
 principals, alternate databases and arbitrary connection options are rejected.
-Inherited password/role configuration is not forwarded to the child.
+The owner connection rejects ambient service selectors and clears ambient password, TLS-client credential and role configuration before parsing. The child receives no inherited configuration.
 
 For an existing identity proxy's private Unix socket use, for example,
 `postgres://migration_owner@/example?host=/private/proxy&sslmode=disable`.

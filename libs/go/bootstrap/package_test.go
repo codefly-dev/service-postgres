@@ -148,3 +148,32 @@ func TestPrivateSocketConnection(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedOwnerIgnoresAmbientCredentialsAndServices(t *testing.T) {
+	for key, value := range map[string]string{
+		"PGPASSWORD": "private sentinel", "PGPASSFILE": "/missing/passfile",
+		"PGSERVICE": "ambient-service", "PGSERVICEFILE": "/missing/service-file",
+		"PGSSLCERT": "/missing/client-certificate", "PGSSLKEY": "/missing/client-key",
+		"PGSSLROOTCERT": "/missing/trust-root", "PGSSLPASSWORD": "private sentinel",
+		"PGOPTIONS": "-c role=unintended-owner", "PGPORT": "6543",
+	} {
+		t.Setenv(key, value)
+	}
+	_, p, b := packageFixture(t, "SELECT 1;")
+	o := Options{Binding: b, Connection: "postgres://bootstrap_owner@127.0.0.1/bootstrap_proof?sslmode=require", LockTimeout: time.Second, StatementTimeout: time.Second}
+	dsn, e := connection(o, p)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e := managedConfig(dsn, o); e == nil {
+		t.Fatal("ambient service selector accepted")
+	}
+	t.Setenv("PGSERVICE", "")
+	cfg, e := managedConfig(dsn, o)
+	if e != nil {
+		t.Fatal("inherited ambient credential input:", e)
+	}
+	if cfg.Password != "" || cfg.Port != 5432 || cfg.User != "bootstrap_owner" || cfg.Database != "bootstrap_proof" || cfg.TLSConfig == nil || len(cfg.TLSConfig.Certificates) != 0 || cfg.RuntimeParams["role"] != "" || cfg.RuntimeParams["search_path"] != "public" {
+		t.Fatal("ambient configuration crossed the managed owner boundary")
+	}
+}
