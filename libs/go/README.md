@@ -117,3 +117,15 @@ It loads no cloud credentials and accepts no managed endpoint. The dedicated
 restricted-admin replay and membership replacement, existing/default table and
 sequence grants, runtime DDL denial, preserved external passwords/unrelated
 memberships, rollback, elevated-role rejection and authorized hardening.
+
+## Explicit managed schema bootstrap
+
+The [managed bootstrap preview](../../docs/managed-bootstrap.md) composes the
+shared schema-plan artifact, existing `golang-migrate` executable and canonical
+role engine under the database control-plane lock. It accepts an explicit
+passwordless owner endpoint and separately bound existing external principals.
+Use `cmd/managed-bootstrap` for this owner operation; it is not part of the
+request-scoped Store API. Its isolated PostgreSQL qualification is included in
+`scripts/qualify-controlplane.py`. Managed deployment packaging and cloud
+qualification remain separate, and the agent's external-identity Build guard
+continues to reject password-bootstrap generation.

@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "libs/go/**"
+      - "cmd/managed-bootstrap/**"
       - "go.mod"
       - "go.sum"
       - "scripts/qualify-controlplane.py"
@@ -13,6 +14,7 @@ on:
     branches: [main]
     paths:
       - "libs/go/**"
+      - "cmd/managed-bootstrap/**"
       - "go.mod"
       - "go.sum"
       - "scripts/qualify-controlplane.py"
@@ -33,6 +35,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go vet ./libs/go ./libs/go/controlplane
+      - run: go vet ./libs/go ./libs/go/controlplane ./libs/go/bootstrap ./libs/go/schemaplan ./cmd/managed-bootstrap
       - run: docker pull "$POSTGRES_TEST_IMAGE"
       - run: python3 scripts/qualify-controlplane.py

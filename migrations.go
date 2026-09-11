@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/codefly-dev/service-postgres/libs/go/schemaplan"
 	"io/fs"
 	"os"
 	"regexp"
@@ -59,7 +60,7 @@ func (m migrationSource) label() string {
 // the file it shadows and makes the source driver reject the entire lineage as a
 // duplicate. Requiring a plain extension excludes the leftovers while keeping
 // every real migration, whatever it is named (.sql, .pgsql, .psql).
-const migrationFileNamePattern = `^([0-9]+)_.+\.(up|down)\.[A-Za-z0-9]+$`
+const migrationFileNamePattern = schemaplan.MigrationFileNamePattern
 
 var migrationFileName = regexp.MustCompile(migrationFileNamePattern)
 
