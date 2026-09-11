@@ -48,8 +48,8 @@ github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJ
 github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
 github.com/cloudflare/circl v1.6.3 h1:9GPOhQGF9MCYUeXyMYlqTR6a5gTrgR/fBLXvUgtVcg8=
 github.com/cloudflare/circl v1.6.3/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
-github.com/codefly-dev/core v0.3.11 h1:FPYNQ3MysUeuZmXISBl7G2PEkzijE0wBWen2sF8pqMc=
-github.com/codefly-dev/core v0.3.11/go.mod h1:4V8BP4F5mnRDZvylhC9P5N7rfifpAma5n3dW4YD+gtQ=
+github.com/codefly-dev/core v0.3.27 h1:SI0EhUvGr+WlIkuLEuTDQuMjZX5ThgmPGJO2f0NPyzM=
+github.com/codefly-dev/core v0.3.27/go.mod h1:Z9//zS5LnN1MdX5Oi9AuPkXOHYSfzi25GyPi0JU044w=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
 github.com/containerd/errdefs v1.0.0 h1:tg5yIfIlQIrxYtu9ajqY42W3lpS19XqdxRQeEwYG8PI=
@@ -211,6 +211,8 @@ github.com/mitchellh/mapstructure v1.5.0 h1:jeMsZIYE/09sWLaz43PL7Gy6RuMjD2eJVyua
 github.com/mitchellh/mapstructure v1.5.0/go.mod h1:bFUtVrKA4DC2yAKiSyO/QUcy7e+RRV2QTWOzhPopBRo=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
 github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=
+github.com/moby/patternmatcher v0.6.0 h1:GmP9lR19aU5GqSSFko+5pRqHi+Ohk1O69aFiKkVGiPk=
+github.com/moby/patternmatcher v0.6.0/go.mod h1:hDPoyOpDY7OrrMDLaYoY3hf52gNCR/YOUYxkhApJIxc=
 github.com/moby/sys/atomicwriter v0.1.0 h1:kw5D/EqkBwsBFi0ss9v1VG3wIkVhzGvLklJ+w3A14Sw=
 github.com/moby/sys/atomicwriter v0.1.0/go.mod h1:Ul8oqv2ZMNHOceF643P6FKPXeCmYtlQMvpizfsSoaWs=
 github.com/moby/sys/sequential v0.7.0 h1:ASQNGNROJSuOO6LL6bPHbKvuZu6NU8P4ldPWk31zj/8=
