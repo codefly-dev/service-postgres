@@ -32,13 +32,13 @@ jobs:
     # than leave a hung read to GitHub's six-hour default.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
         with:
           driver-opts: image=moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
 
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -61,7 +61,7 @@ jobs:
     needs: image
     permissions:
       contents: read
-    uses: codefly-dev/core/.github/workflows/go-service-release.yml@f16e045805dbd213cdbebf98d5f7cbe802496d7c
+    uses: codefly-dev/core/.github/workflows/go-service-release.yml@80611aedc191d6fd5ec2f7b78709a1fad4db7de2
     with:
       # The bootstrap-image tests build linux/arm64 and refuse to run without
       # emulation registered ("CI must register emulation"). ci.yml gets it from
@@ -77,9 +77,9 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Check out release source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           ref: ${{ inputs.tag }}
@@ -88,7 +88,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: .github/scripts/release-backfill.sh validate-tag release-source
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: release-source/go.mod
           cache-dependency-path: release-source/go.sum
@@ -104,7 +104,7 @@ jobs:
         env:
           GOFLAGS: -modfile=${{ runner.temp }}/release.mod
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94
         with:
           version: '~> v2'
           args: release --clean --skip=publish,announce
