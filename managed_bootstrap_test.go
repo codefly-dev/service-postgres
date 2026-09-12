@@ -29,7 +29,7 @@ func TestExternalIdentityBuildRejectsPasswordBootstrapBeforeWriting(t *testing.T
 	require.True(t, os.IsNotExist(err), "rejection must precede staged output")
 }
 
-func TestExternalIdentityDirectBuildFailsBeforeDocker(t *testing.T) {
+func TestExternalIdentityBuildWithoutOutputRejectsPasswordBootstrap(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 	builder.AuthMode = authModeExternalIdentity
 	response, err := builder.Build(context.Background(), buildRequest(""))

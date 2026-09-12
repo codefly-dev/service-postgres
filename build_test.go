@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/codefly-dev/core/agents/services"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
@@ -15,6 +18,8 @@ import (
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/wool"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // newBuildTestBuilder loads a builder whose Location points at a temporary
@@ -594,4 +599,87 @@ func TestBuildRecipeResolvesIdenticalInputsAcrossEmissions(t *testing.T) {
 	require.Equal(t, firstPlan.GetRecipes()[0].GetBuildArgs(), secondPlan.GetRecipes()[0].GetBuildArgs())
 	require.NotEmpty(t, firstPlan.GetDigest())
 	require.Equal(t, firstPlan.GetDigest(), secondPlan.GetDigest())
+}
+
+func TestBuildRecipeContractOverGRPC(t *testing.T) {
+	for _, selection := range []string{"default", "explicit", "cache-selected"} {
+		for _, output := range []string{"recipe", "missing", "relative"} {
+			t.Run(selection+"/"+output, func(t *testing.T) {
+				builder := newBuildTestBuilder(t)
+				marker := filepath.Join(builder.Location, "builder", "Dockerfile")
+				require.NoError(t, os.MkdirAll(filepath.Dir(marker), 0o755))
+				require.NoError(t, os.WriteFile(marker, []byte("caller-owned"), 0o644))
+				server := grpc.NewServer()
+				builderv0.RegisterBuilderServer(server, builder)
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, err)
+				go func() { _ = server.Serve(listener) }()
+				t.Cleanup(server.Stop)
+				conn, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, conn.Close()) })
+				client := services.NewBuilderAgentClient(conn)
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+
+				t.Setenv("PATH", t.TempDir())
+				for _, executable := range []string{"docker", "buildx"} {
+					_, err := exec.LookPath(executable)
+					require.ErrorIs(t, err, exec.ErrNotFound)
+				}
+				capabilities, err := client.BuildCapabilities(ctx, &builderv0.BuildCapabilitiesRequest{})
+				require.NoError(t, err)
+				require.True(t, capabilities.GetBuildxSelection())
+
+				directory := t.TempDir()
+				request := buildRequest(directory)
+				docker := request.GetBuildContext().GetDockerBuildContext()
+				if selection != "default" {
+					docker.BuildxBuilder = "cli-owned-builder"
+				}
+				if selection == "cache-selected" {
+					docker.Cache = &builderv0.BuildCacheOptions{
+						Backend: "registry", Scope: "postgres",
+						Imports: []string{"registry.example.com/cache/import"},
+						Exports: []string{"registry.example.com/cache/export"},
+					}
+				}
+				switch output {
+				case "missing":
+					request.OutputDirectory = ""
+				case "relative":
+					request.OutputDirectory = "relative-output"
+				}
+				response, err := client.Build(ctx, request)
+				if output == "relative" {
+					require.ErrorContains(t, err, "must be absolute")
+				} else {
+					require.NoError(t, err)
+					if output == "missing" {
+						require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState())
+						require.Contains(t, response.GetState().GetMessage(), "output_directory is required")
+						require.Nil(t, response.GetResult())
+					} else {
+						require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+						plan := response.GetResult().GetDockerBuildPlan()
+						require.NotNil(t, plan)
+						require.NoError(t, services.VerifyDockerBuildPlan(directory, plan))
+						require.Len(t, plan.GetRecipes(), 1)
+						require.Equal(t, "registry.example.com/module/postgres", plan.GetRecipes()[0].GetImage())
+						require.Nil(t, response.GetResult().GetDockerBuildResult())
+						require.Empty(t, response.GetBuildxBuilder())
+						require.Empty(t, response.GetCacheContractVersion())
+					}
+				}
+				require.Equal(t, "caller-owned", string(mustReadFile(t, marker)))
+				if output != "recipe" {
+					require.NoDirExists(t, filepath.Join(builder.Location, "bootstrap"))
+					require.NoFileExists(t, filepath.Join(builder.Location, "runtime-access.sql"))
+					entries, err := os.ReadDir(directory)
+					require.NoError(t, err)
+					require.Empty(t, entries)
+				}
+			})
+		}
+	}
 }

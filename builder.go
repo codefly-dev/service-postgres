@@ -195,6 +195,10 @@ func bootstrapExtensions(plan *schemaPlan) []BootstrapExtension {
 	return extensions
 }
 
+func (*Builder) BuildCapabilities(context.Context, *builderv0.BuildCapabilitiesRequest) (*builderv0.BuildCapabilitiesResponse, error) {
+	return &builderv0.BuildCapabilitiesResponse{BuildxSelection: true}, nil
+}
+
 func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*builderv0.BuildResponse, error) {
 	defer s.Wool.Catch()
 
@@ -204,13 +208,17 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 
 	// The emitted bootstrap still owns password-authenticated login roles.
 	// External-identity deployment metadata does not make that SQL compatible
-	// with cloud-managed logins. Fail before deleting/staging caller output or
-	// invoking Docker until an external-identity bootstrap is implemented.
+	// with cloud-managed logins. Fail before deleting/staging caller output
+	// until an external-identity bootstrap is implemented.
 	if err := s.validateAuthMode(); err != nil {
 		return s.Builder.BuildError(err)
 	}
 	if s.externalIdentity() {
 		return s.Builder.BuildError(fmt.Errorf("external-identity bootstrap generation is unsupported: the password bootstrap must not rewrite cloud-managed login roles"))
+	}
+
+	if req.GetOutputDirectory() == "" {
+		return s.Builder.BuildError(fmt.Errorf("output_directory is required: the CLI executes bootstrap image builds"))
 	}
 
 	dockerRequest, err := s.Builder.DockerBuildRequest(ctx, req)
@@ -257,42 +265,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		Lineages:                       bootstrapLineages(plan),
 	}
 
-	if outputDirectory := req.GetOutputDirectory(); outputDirectory != "" {
-		return s.buildRecipe(ctx, outputDirectory, img, plan, docker)
-	}
-
-	err = shared.DeleteFile(ctx, s.Local("builder/Dockerfile"))
-	if err != nil {
-		return s.Builder.BuildError(err)
-	}
-
-	err = s.Templates(ctx, docker, services.WithBuilder(builderFS))
-	if err != nil {
-		return s.Builder.BuildError(err)
-	}
-
-	if err = s.stageBootstrapContext(ctx, plan, docker, s.Location); err != nil {
-		return s.Builder.BuildError(err)
-	}
-
-	builder, err := dockerhelpers.NewBuilder(dockerhelpers.BuilderConfiguration{
-		Root:        s.Location,
-		Dockerfile:  "builder/Dockerfile",
-		Ignorefile:  bootstrapDirectory + "/" + bootstrapIgnoreFile,
-		Destination: img,
-		Output:      s.Wool,
-	})
-	if err != nil {
-		return s.Builder.BuildError(err)
-	}
-	_, err = builder.Build(ctx)
-	if err != nil {
-		return s.Builder.BuildError(err)
-	}
-
-	s.Builder.WithDockerImages(img)
-
-	return s.Builder.BuildResponse()
+	return s.buildRecipe(ctx, req.GetOutputDirectory(), img, plan, docker)
 }
 
 // buildRecipe renders the bootstrap image's recipe into the caller-owned output
