@@ -179,13 +179,23 @@ const DatabaseName = "database-name"
 // pgvector via nix/flake.nix, keeping both runtimes at parity.
 var image = shared.Must(parseRuntimeImageLock(runtimeImageLockJSON))
 
-type runtimeImageLock struct {
-	Name   string `json:"name"`
-	Tag    string `json:"tag"`
-	Digest string `json:"digest"`
+// runtimeImage is the managed image's checked-in identity: the immutable
+// reference, and every platform the manifest list that digest names ships.
+// Image inventories describe one platform each, so the platform set has to be
+// part of the lock rather than something a scan is left to pick for itself.
+type runtimeImage struct {
+	*resources.DockerImage
+	Platforms []string
 }
 
-func parseRuntimeImageLock(content []byte) (*resources.DockerImage, error) {
+type runtimeImageLock struct {
+	Name      string   `json:"name"`
+	Tag       string   `json:"tag"`
+	Digest    string   `json:"digest"`
+	Platforms []string `json:"platforms"`
+}
+
+func parseRuntimeImageLock(content []byte) (*runtimeImage, error) {
 	var lock runtimeImageLock
 	if err := json.Unmarshal(content, &lock); err != nil {
 		return nil, fmt.Errorf("parse runtime image lock: %w", err)
@@ -202,10 +212,22 @@ func parseRuntimeImageLock(content []byte) (*resources.DockerImage, error) {
 	if err := validateSHA256Digest("runtime image digest", lock.Digest); err != nil {
 		return nil, err
 	}
-	return &resources.DockerImage{
-		Name:   lock.Name,
-		Tag:    lock.Tag,
-		Digest: lock.Digest,
+	if len(lock.Platforms) == 0 {
+		return nil, fmt.Errorf("runtime image platforms are required")
+	}
+	for _, platform := range lock.Platforms {
+		operatingSystem, architecture, found := strings.Cut(platform, "/")
+		if !found || operatingSystem == "" || architecture == "" {
+			return nil, fmt.Errorf("runtime image platform %q must be os/arch", platform)
+		}
+	}
+	return &runtimeImage{
+		DockerImage: &resources.DockerImage{
+			Name:   lock.Name,
+			Tag:    lock.Tag,
+			Digest: lock.Digest,
+		},
+		Platforms: lock.Platforms,
 	}, nil
 }
 
@@ -239,7 +261,7 @@ func (s *Service) dockerImage() *resources.DockerImage {
 	if s.Settings != nil && s.Settings.Image != "" {
 		return resources.NewDockerImage(s.Settings.Image)
 	}
-	return image
+	return image.DockerImage
 }
 
 type Service struct {

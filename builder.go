@@ -16,6 +16,7 @@ import (
 
 	"github.com/codefly-dev/core/agents/communicate"
 	dockerhelpers "github.com/codefly-dev/core/agents/helpers/docker"
+	"github.com/codefly-dev/core/agents/services/sbom"
 	v0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/standards"
@@ -110,10 +111,55 @@ func (s *Builder) Audit(ctx context.Context, req *builderv0.AuditRequest) (*buil
 	return s.Builder.AuditContainer(ctx, req, s.dockerImage().FullName())
 }
 
-func (s *Builder) SBOM(ctx context.Context, _ *builderv0.SBOMRequest) (*builderv0.SBOMResponse, error) {
+// SBOM inventories the service's software. Source scope keeps the package-level
+// scan of the configured postgres image; image scope serves evidence bound to
+// the digest and platform each shipped image was actually scanned from.
+func (s *Builder) SBOM(ctx context.Context, req *builderv0.SBOMRequest) (*builderv0.SBOMResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	return s.Builder.SBOMContainer(ctx, s.dockerImage().FullName())
+	if req.GetScope() != builderv0.SBOMScope_SBOM_SCOPE_IMAGE {
+		return s.Builder.SBOMContainer(ctx, s.dockerImage().FullName())
+	}
+	// The bootstrap image is built by the caller from the emitted recipe, so its
+	// digest exists only once that build has run. Covering the runtime image
+	// alone would report complete coverage of an image set this service does not
+	// fully ship, so the caller's subjects are a precondition rather than
+	// something to work around.
+	if len(req.GetSubjects()) == 0 {
+		return s.Builder.SBOMImageSubjectsRequired()
+	}
+	subjects := append(s.runtimeImageSubjects(), req.GetSubjects()...)
+	return s.Builder.SBOMImages(ctx, subjects, sbom.SourceRegistry)
+}
+
+// runtimeImageRole names the postgres image in evidence. The bootstrap image
+// carries its own role from the recipe that builds it.
+const runtimeImageRole = "runtime"
+
+// runtimeImageSubjects describes the postgres image the workload runs. It is
+// deployed rather than built, so it appears in no build plan and no caller
+// derives a subject for it — without this the image the database actually runs
+// would never be inventoried. The subjects carry no digest: evidence binds to
+// the platform's child manifest, not to the manifest list the deployment names.
+func (s *Service) runtimeImageSubjects() []*builderv0.ImageSubject {
+	// An override is a bring-your-own reference whose platforms are not locked
+	// here, so it names none and the scanner resolves what that reference
+	// carries, or fails asking for a platform it cannot pick on its own.
+	platforms := []string{""}
+	if s.Settings == nil || s.Settings.Image == "" {
+		platforms = image.Platforms
+	}
+	reference := s.dockerImage().FullName()
+	subjects := make([]*builderv0.ImageSubject, 0, len(platforms))
+	for _, platform := range platforms {
+		subjects = append(subjects, &builderv0.ImageSubject{
+			Reference: reference,
+			Platform:  platform,
+			Role:      runtimeImageRole,
+			Service:   s.Unique(),
+		})
+	}
+	return subjects
 }
 
 // Upgrade reports an available tag bump for the managed postgres image.
