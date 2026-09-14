@@ -90,7 +90,7 @@ type Attachment struct {
 	Digest             string      `json:"digest"`
 }
 
-var namePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+var namePattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
 var imagePattern = regexp.MustCompile(`^[^\s@]+@sha256:[a-f0-9]{64}$`)
 
 func validPath(value string) bool {

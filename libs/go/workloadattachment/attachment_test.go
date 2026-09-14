@@ -110,3 +110,23 @@ func TestMountPathsMustNotOverlap(t *testing.T) {
 		}
 	}
 }
+
+func TestKubernetesNamesMustEndInAlphanumeric(t *testing.T) {
+	for _, change := range []func(*Attachment){
+		func(a *Attachment) { a.Namespace = "invalid-" },
+		func(a *Attachment) { a.ServiceAccount = "invalid-" },
+		func(a *Attachment) { a.InitContainers[0].Name = "invalid-" },
+		func(a *Attachment) {
+			a.Volumes[0].Name = "invalid-"
+			a.VolumeMounts[0].Name = "invalid-"
+			a.InitContainers[0].VolumeMounts[0].Name = "invalid-"
+		},
+	} {
+		a, _ := Parse(fixture(t))
+		change(a)
+		_ = a.Seal()
+		if a.Validate() == nil {
+			t.Fatal("invalid Kubernetes name accepted")
+		}
+	}
+}

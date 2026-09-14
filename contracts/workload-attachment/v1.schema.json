@@ -88,7 +88,7 @@
             "type": "string"
           },
           "name": {
-            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
             "type": "string"
           },
           "resources": {
@@ -184,7 +184,7 @@
                   "type": "string"
                 },
                 "name": {
-                  "pattern": "^[a-z][a-z0-9-]{0,62}$",
+                  "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
                   "type": "string"
                 },
                 "readOnly": {
@@ -218,7 +218,7 @@
       "type": "array"
     },
     "namespace": {
-      "pattern": "^[a-z][a-z0-9-]{0,62}$",
+      "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
       "type": "string"
     },
     "pod_security_context": {
@@ -265,7 +265,7 @@
       "const": "codefly.dev/postgres-workload-attachment/v1"
     },
     "service_account": {
-      "pattern": "^[a-z][a-z0-9-]{0,62}$",
+      "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
       "type": "string"
     },
     "volume_mounts": {
@@ -277,7 +277,7 @@
             "type": "string"
           },
           "name": {
-            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
             "type": "string"
           },
           "readOnly": {
@@ -318,7 +318,7 @@
             "type": "object"
           },
           "name": {
-            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "pattern": "^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$",
             "type": "string"
           }
         },
