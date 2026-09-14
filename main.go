@@ -312,8 +312,7 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 			Nix:    true,
 			Docker: true,
 		},
-		ReadMe:     readme,
-		Validation: validationCapabilities(),
+		ReadMe: readme,
 		Config: []*agentv0.ConfigurationValueDetail{
 			{
 				Name: "postgres", Description: "capability-scoped Postgres workload bindings",
