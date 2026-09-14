@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 builds:
   - id: darwin
@@ -16,3 +16,8 @@ builds:
       - linux
     goarch:
       - amd64
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
