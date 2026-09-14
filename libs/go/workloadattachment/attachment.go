@@ -11,9 +11,12 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const Version = "codefly.dev/postgres-workload-attachment/v1"
@@ -101,8 +104,15 @@ func bounded(s string) bool {
 	return len(s) > 0 && len(s) <= 1024 && !strings.ContainsAny(s, "\x00\r\n")
 }
 
-// Parse rejects unknown fields and extra JSON documents before validating the seal.
+// Parse rejects duplicate or noncanonical fields before validating the seal.
 func Parse(data []byte) (*Attachment, error) {
+	if !utf8.Valid(data) || !validUnicodeEscapes(data) {
+		return nil, fmt.Errorf("attachment must be UTF-8")
+	}
+	raw, err := strictJSON(data)
+	if err != nil {
+		return nil, fmt.Errorf("invalid attachment: %w", err)
+	}
 	var a Attachment
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -115,7 +125,105 @@ func Parse(data []byte) (*Attachment, error) {
 	if err := a.Validate(); err != nil {
 		return nil, err
 	}
+	// encoding/json's struct decoder accepts case aliases and nulls for scalar
+	// fields. Neither may be silently normalized under a different document's
+	// seal. Compare complete decoded values, preserving optional field presence.
+	encoded, err := json.Marshal(a)
+	if err != nil {
+		return nil, err
+	}
+	canonical, err := strictJSON(encoded)
+	if err != nil || !reflect.DeepEqual(raw, canonical) {
+		return nil, fmt.Errorf("attachment fields must match the public contract exactly")
+	}
 	return &a, nil
+}
+
+// The standard decoder replaces unpaired UTF-16 escapes with U+FFFD. Reject
+// that lossy conversion, while accepting literal U+FFFD and valid surrogate pairs.
+func validUnicodeEscapes(data []byte) bool {
+	for i := 0; i < len(data); i++ {
+		if data[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(data) || data[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(data) {
+			return false
+		}
+		code, err := strconv.ParseUint(string(data[i+1:i+5]), 16, 16)
+		if err != nil || (code >= 0xdc00 && code <= 0xdfff) {
+			return false
+		}
+		i += 4
+		if code < 0xd800 || code > 0xdbff {
+			continue
+		}
+		if i+6 >= len(data) || data[i+1] != '\\' || data[i+2] != 'u' {
+			return false
+		}
+		low, err := strconv.ParseUint(string(data[i+3:i+7]), 16, 16)
+		if err != nil || low < 0xdc00 || low > 0xdfff {
+			return false
+		}
+		i += 6
+	}
+	return true
+}
+
+func strictJSON(data []byte) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value func() (any, error)
+	value = func() (any, error) {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		switch token {
+		case json.Delim('{'):
+			object := map[string]any{}
+			for decoder.More() {
+				key, err := decoder.Token()
+				if err != nil {
+					return nil, err
+				}
+				name := key.(string)
+				if _, exists := object[name]; exists {
+					return nil, fmt.Errorf("duplicate JSON field")
+				}
+				object[name], err = value()
+				if err != nil {
+					return nil, err
+				}
+			}
+			_, err := decoder.Token()
+			return object, err
+		case json.Delim('['):
+			array := []any{}
+			for decoder.More() {
+				item, err := value()
+				if err != nil {
+					return nil, err
+				}
+				array = append(array, item)
+			}
+			_, err := decoder.Token()
+			return array, err
+		default:
+			return token, nil
+		}
+	}
+	result, err := value()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, fmt.Errorf("attachment must contain one JSON document")
+	}
+	return result, nil
 }
 
 // Seal binds all supplied transport and identity fields. It is an integrity seal,
