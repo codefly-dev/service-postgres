@@ -27,6 +27,25 @@ func TestReconcileRuntimeAccessFailsClosedBeforeSQL(t *testing.T) {
 		"same role": func(access *RuntimeAccess) {
 			access.ReadWriteRole = access.ReadOnlyRole
 		},
+		"reader roles without opt in": func(access *RuntimeAccess) {
+			access.ReadOnlyRoles = []string{"app_reader"}
+		},
+		"reader role is owner": func(access *RuntimeAccess) {
+			access.ReconcileReadOnlyRoleMemberships = true
+			access.ReadOnlyRoles = []string{access.OwnerRole}
+		},
+		"reader role is writer": func(access *RuntimeAccess) {
+			access.ReconcileReadOnlyRoleMemberships = true
+			access.ReadOnlyRoles = []string{access.ReadWriteRole}
+		},
+		"reader role shared with writer": func(access *RuntimeAccess) {
+			access.ReconcileReadOnlyRoleMemberships, access.ReconcileReadWriteRoleMemberships = true, true
+			access.ReadOnlyRoles, access.ReadWriteRoles = []string{"app_role"}, []string{"app_role"}
+		},
+		"duplicate reader role": func(access *RuntimeAccess) {
+			access.ReconcileReadOnlyRoleMemberships = true
+			access.ReadOnlyRoles = []string{"app_role", "app_role"}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidate := valid

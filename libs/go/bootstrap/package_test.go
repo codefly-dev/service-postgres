@@ -114,6 +114,25 @@ func TestSnapshotRetainsVerifiedBytes(t *testing.T) {
 	}
 }
 
+func TestReaderRolePackageVersions(t *testing.T) {
+	for _, version := range []string{schemaplan.ContractVersion, schemaplan.ReaderRolesContractVersion, "codefly.dev/postgres-schema-plan/v3"} {
+		for _, roles := range [][]string{nil, {"app_reader"}, {"bootstrap_rw"}, {"app_reader", "app_reader"}} {
+			dir, p, b := packageFixture(t, "SELECT 1;")
+			p.ContractVersion, p.Access.ReadOnlyRoles = version, roles
+			writePlan(t, dir, p, &b)
+			_, tmp, err := snapshot(dir, b)
+			if tmp != "" {
+				os.RemoveAll(tmp)
+			}
+			valid := (version == schemaplan.ContractVersion && roles == nil) ||
+				(version == schemaplan.ReaderRolesContractVersion && (roles == nil || len(roles) == 1 && roles[0] == "app_reader"))
+			if (err == nil) != valid {
+				t.Fatalf("version %s roles %v: %v", version, roles, err)
+			}
+		}
+	}
+}
+
 func TestConnectionIsExplicitAndPasswordless(t *testing.T) {
 	_, p, b := packageFixture(t, "SELECT 1;")
 	for _, dsn := range []string{"postgres://bootstrap_owner:secret@127.0.0.1/bootstrap_proof?sslmode=disable", "postgres://bootstrap_owner@127.0.0.1/bootstrap_proof?password=secret&sslmode=disable", "postgres://other@127.0.0.1/bootstrap_proof?sslmode=disable", "postgres://bootstrap_owner@127.0.0.1/wrong?sslmode=disable", "postgres://bootstrap_owner@127.0.0.1/bootstrap_proof?sslmode=disable&options=secret", "postgres://bootstrap_owner@127.0.0.1/bootstrap_proof?sslmode=disable&sslmode=require"} {
