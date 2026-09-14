@@ -129,3 +129,77 @@ request-scoped Store API. Its isolated PostgreSQL qualification is included in
 `scripts/qualify-controlplane.py`. Managed deployment packaging and cloud
 qualification remain separate, and the agent's external-identity Build guard
 continues to reject password-bootstrap generation.
+# Explicit connection profiles
+
+`Open` can validate the exact parsed driver configurations it uses for its private
+reader/writer pools. Opt in with `WithConnectionProfiles(readerProfile,
+writerProfile)`. `OpenMaintenance` accepts the independent
+`WithMaintenanceConnectionProfile(profile)` option. No profile preserves existing
+driver parsing and defaults; it is a legacy compatibility mode, not a hosted TLS
+guarantee. Existing scope, token-provider, isolation and restricted-session options
+continue to compose with either constructor.
+
+```go
+reader := postgres.ConnectionProfile{Transport: postgres.VerifiedTLS}
+writer := postgres.ConnectionProfile{
+    Transport: postgres.VerifiedTLS,
+    ApplicationRole: "request_writer",
+}
+// The writer URL must contain exactly role=request_writer; the reader URL must
+// contain no role. Memberships and SQL grants remain separately provisioned.
+factory, close, err := postgres.Open(ctx, readerURL, writerURL, authenticator,
+    postgres.WithConnectionProfiles(reader, writer),
+    postgres.WithAccessTokenProvider(tokenProvider))
+```
+
+`VerifiedTLS` requires an explicit PostgreSQL URL, login, database, a single TCP
+host and `sslmode=verify-full`; every effective endpoint is checked and driver
+fallbacks are rejected. Explicit CA/client-certificate files and reviewed pool
+settings are supported. Absent CA settings use normal system trust rather than
+implicit home-directory certificates. Passfile lookup is disabled. There is no
+plaintext, service-file, ambient endpoint or unverified-TLS fallback.
+
+`LocalIdentityProxy` requires a canonical hostless URL with an absolute socket
+directory, explicit numeric port, `sslmode=disable` and `passfile=/dev/null`.
+Passwords, token hooks, TCP fallback and extra options are rejected. The service
+may require distinct reader/writer socket directories using
+`WithDistinctProxySockets()`. This checks the local binding only; the deployment
+owner must attest the proxy's remote TLS, identity and isolation separately.
+
+In either explicit profile, duplicate keys, case aliases, unknown options,
+session-authorization injection, endpoint/login/database overrides and any `PG*`
+environment variable (including an empty one) fail before pool creation. The only
+accepted startup role is the exact nonempty `ApplicationRole`; empty forbids a URL
+role. Optional `Host`, `Port`, `Database` and `User` fields additionally bind a
+capability to a trusted projection. These fields compare the effective parsed
+configuration; they do not rewrite its identity. `OpenMaintenance` retains its
+separate application-role selection and live restricted-role qualification.
+
+Explicit-profile parsing errors are `ErrConnectionProfile`; connection/token
+failures during constructor startup are redacted as `ErrConnectionUnavailable`.
+The legacy zero profile retains prior error behavior. `ParseConnection` is the
+same single parser for an intentional trusted raw-pool composition; its returned
+configuration must be used directly. Validating then discarding it and reparsing
+the original string defeats the contract. Parsing creates no pool, connects to no
+database and executes no SQL. Callers that mutate the returned config or install
+arbitrary hooks assume responsibility for those changes.
+
+The migration is opt-in. A consumer must explicitly choose its default transport,
+startup roles and required physical bindings. URLs that relied on ambient `PG*`,
+`.pgpass`, home-directory client certificates, unknown startup parameters or
+multiple hosts must be replaced with a reviewed explicit binding before enabling
+a profile. No database migration, role grant, schema-plan or engine/image update
+is performed by this API.
+
+Local qualification (requires a native PostgreSQL installation, Go and OpenSSL):
+
+```sh
+POSTGRES_BIN=/path/to/postgres/bin python3 qualification/connection-profiles/run.py \
+  --output /tmp/connection-profile-evidence
+```
+
+This creates disposable TLS and Unix-socket PostgreSQL fixtures and checks actual
+identity/role, RLS, maintenance separation, token reconnect, closure, wrong CA and
+hostname denial, and redacted failures. It does not qualify a real identity proxy
+or hosted provider. Ordinary `go test ./libs/go/...` also runs the parser matrix;
+the native fixture requires the runner and records whether its test actually ran.
