@@ -16,6 +16,7 @@ import (
 
 	"github.com/codefly-dev/core/agents/communicate"
 	dockerhelpers "github.com/codefly-dev/core/agents/helpers/docker"
+	"github.com/codefly-dev/core/agents/services/sbom"
 	v0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/standards"
@@ -52,6 +53,9 @@ const (
 	// local configuration and secrets, and a context is transferred to the
 	// daemon and cached whether or not the Dockerfile copies from it.
 	bootstrapIgnoreFile = "dockerignore"
+	// runtimeImageRole names the postgres image in SBOM evidence. The bootstrap
+	// image carries its own role from the recipe that builds it.
+	runtimeImageRole = "runtime"
 )
 
 type Builder struct {
@@ -110,10 +114,94 @@ func (s *Builder) Audit(ctx context.Context, req *builderv0.AuditRequest) (*buil
 	return s.Builder.AuditContainer(ctx, req, s.dockerImage().FullName())
 }
 
-func (s *Builder) SBOM(ctx context.Context, _ *builderv0.SBOMRequest) (*builderv0.SBOMResponse, error) {
+// SBOM inventories the service's software. Source scope keeps the package-level
+// scan of the configured postgres image; image scope serves evidence bound to
+// the digest and platform each shipped image was actually scanned from.
+func (s *Builder) SBOM(ctx context.Context, req *builderv0.SBOMRequest) (*builderv0.SBOMResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	return s.Builder.SBOMContainer(ctx, s.dockerImage().FullName())
+	if req.GetScope() != builderv0.SBOMScope_SBOM_SCOPE_IMAGE {
+		return s.Builder.SBOMContainer(ctx, s.dockerImage().FullName())
+	}
+	// The bootstrap image is built by the caller from the emitted recipe, so its
+	// digest exists only once that build has run. Covering the runtime image
+	// alone would report complete coverage of an image set this service does not
+	// fully ship, so the caller's subjects are a precondition rather than
+	// something to work around.
+	if len(req.GetSubjects()) == 0 {
+		return s.Builder.SBOMImageSubjectsRequired()
+	}
+	runtimeSubjects, err := s.runtimeImageSubjects()
+	if err != nil {
+		return s.Builder.SBOMImageError(err)
+	}
+	// The caller's own subjects lead, so a failure among the images it asked
+	// about is reported as itself rather than behind the one this agent adds.
+	return s.Builder.SBOMImages(ctx, distinctSubjects(req.GetSubjects(), runtimeSubjects), sbom.SourceRegistry)
+}
+
+// distinctSubjects drops subjects that are identical in every field. Each
+// subject costs a full image scan, and a repeated one carries no association
+// the first does not already have. Subjects that differ in service or role are
+// kept: that is how one digest still names every service it covers.
+func distinctSubjects(groups ...[]*builderv0.ImageSubject) []*builderv0.ImageSubject {
+	seen := map[string]bool{}
+	var subjects []*builderv0.ImageSubject
+	for _, group := range groups {
+		for _, subject := range group {
+			key := strings.Join([]string{
+				subject.GetReference(),
+				subject.GetDigest(),
+				subject.GetPlatform(),
+				subject.GetRole(),
+				subject.GetService(),
+			}, "|")
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			subjects = append(subjects, subject)
+		}
+	}
+	return subjects
+}
+
+// runtimeImageSubjects describes the postgres image the workload runs. It is
+// deployed rather than built, so it appears in no build plan and no caller
+// derives a subject for it — without this the image the database actually runs
+// would never be inventoried. The subjects carry no digest: evidence binds to
+// the platform's child manifest, not to the manifest list the deployment names.
+func (s *Service) runtimeImageSubjects() ([]*builderv0.ImageSubject, error) {
+	configured := s.dockerImage()
+	if configured == nil {
+		return nil, fmt.Errorf("docker-image %q is not a name:tag reference", s.Settings.Image)
+	}
+	platforms := image.Platforms
+	if s.Settings != nil && s.Settings.Image != "" {
+		for _, platform := range s.Settings.ImagePlatforms {
+			if err := validatePlatform("docker-image-platforms", platform); err != nil {
+				return nil, err
+			}
+		}
+		// An override that declares no platforms leaves the platform unstated:
+		// exact for a single-platform image, and for a multi-platform one the
+		// scanner refuses to pick one rather than mislabel the evidence.
+		platforms = s.Settings.ImagePlatforms
+		if len(platforms) == 0 {
+			platforms = []string{""}
+		}
+	}
+	reference := configured.FullName()
+	subjects := make([]*builderv0.ImageSubject, 0, len(platforms))
+	for _, platform := range platforms {
+		subjects = append(subjects, &builderv0.ImageSubject{
+			Reference: reference,
+			Platform:  platform,
+			Role:      runtimeImageRole,
+			Service:   s.Unique(),
+		})
+	}
+	return subjects, nil
 }
 
 // Upgrade reports an available tag bump for the managed postgres image.

@@ -34,7 +34,7 @@ func testRuntimeImage(t *testing.T) *resources.DockerImage {
 	t.Helper()
 	override := strings.TrimSpace(os.Getenv(testRuntimeImageEnv))
 	if override == "" {
-		return image
+		return image.DockerImage
 	}
 	parsed := resources.NewDockerImage(override)
 	require.NotNil(t, parsed, "%s=%q is not a name:tag reference", testRuntimeImageEnv, override)

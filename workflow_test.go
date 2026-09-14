@@ -111,6 +111,27 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	require.Less(t, publishedIndex, lifecycleIndex)
 	require.Less(t, lifecycleIndex, scanIndex)
 	require.Less(t, scanIndex, tagIndex)
+	// Producing image evidence pulls every platform from the registry, so it
+	// must not stand between the verified digest and the tag move: a transient
+	// registry failure would strand the shared tag on the previous digest with
+	// nothing to retry it. The vulnerability scan above reads a local tar and
+	// keeps its place ahead of the tag for exactly that reason.
+	inventoryIndex, inventory := findWorkflowStepAt(t, imageJob, "Inventory published runtime image")
+	uploadIndex, upload := findWorkflowStepAt(t, imageJob, "Upload image SBOM evidence")
+	require.Less(t, tagIndex, inventoryIndex)
+	require.Less(t, inventoryIndex, uploadIndex)
+	require.Empty(t, inventory.If, "image evidence must never be conditionally skipped")
+	require.Contains(t, inventory.Run, `jq -er '.platforms[]' runtime-image.json`,
+		"every locked platform is inventoried, not just the one the runner happens to be")
+	require.Contains(t, inventory.Run, "anchore/syft@sha256:")
+	require.Contains(t, inventory.Run, ".platform.variant",
+		"a platform's variant is part of its identity, or one selection matches two manifests")
+	require.Contains(t, inventory.Run, "expected exactly one manifest",
+		"a selection matching several manifests must fail rather than name two digests")
+	require.Contains(t, inventory.Run, `"registry:$RUNTIME_NAME@$child"`,
+		"evidence is scanned from the platform's child digest")
+	require.Regexp(t, `@[0-9a-f]{40}$`, upload.Uses)
+	require.Equal(t, "/tmp/image-sbom", upload.With["path"])
 	require.Equal(t,
 		"type=image,name=${{ steps.runtime.outputs.name }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true",
 		candidate.With["outputs"],
