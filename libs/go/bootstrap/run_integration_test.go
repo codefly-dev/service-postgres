@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/codefly-dev/service-postgres/libs/go/schemaplan"
 )
 
 func fixtureDB(t *testing.T, database, user string) *sql.DB {
@@ -252,4 +254,62 @@ func TestManagedBootstrapRestrictedPostgres(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestManagedBootstrapDelegatedReaderPlan(t *testing.T) {
+	admin := fixtureDB(t, "postgres", "postgres")
+	statement(t, admin, "CREATE ROLE delegated_owner LOGIN CREATEROLE NOSUPERUSER NOBYPASSRLS")
+	statement(t, admin, "CREATE ROLE delegated_reader LOGIN INHERIT")
+	statement(t, admin, "CREATE ROLE delegated_writer LOGIN INHERIT")
+	statement(t, admin, "CREATE DATABASE delegated_proof OWNER delegated_owner")
+	statement(t, fixtureDB(t, "delegated_proof", "postgres"), "ALTER SCHEMA public OWNER TO delegated_owner")
+	owner := fixtureDB(t, "delegated_proof", "delegated_owner")
+	dir, p, b := packageFixture(t, `
+ CREATE ROLE delegated_app_reader NOLOGIN;
+ CREATE TABLE receipts(value text);
+ INSERT INTO receipts VALUES ('once');
+ GRANT USAGE ON SCHEMA public TO delegated_app_reader;
+ GRANT SELECT ON receipts TO delegated_app_reader;
+ `)
+	p.ContractVersion = schemaplan.ReaderRolesContractVersion
+	p.Database = "delegated_proof"
+	p.Access.ReadOnlyRole, p.Access.ReadWriteRole = "delegated_ro", "delegated_rw"
+	p.Access.ReadOnlyRoles = []string{"delegated_app_reader"}
+	b.OwnerRole = "delegated_owner"
+	b.ReadOnlyPrincipals, b.ReadWritePrincipals = []string{"delegated_reader"}, []string{"delegated_writer"}
+	writePlan(t, dir, p, &b)
+	u, _ := url.Parse(os.Getenv("SERVICE_POSTGRES_CONTROLPLANE_TEST_DSN"))
+	u.Path, u.User, u.RawQuery = "/delegated_proof", url.User(b.OwnerRole), "sslmode=disable"
+	o := Options{Directory: dir, Binding: b, Connection: u.String(), MigrateExecutable: os.Getenv("SERVICE_POSTGRES_MIGRATE_EXECUTABLE"), Timeout: 10 * time.Second, LockTimeout: 3 * time.Second, StatementTimeout: 5 * time.Second}
+	for i := 0; i < 2; i++ {
+		result, err := Run(context.Background(), o)
+		if err != nil || !result.AccessCommitted {
+			t.Fatalf("v2 bootstrap %d: %+v %v", i, result, err)
+		}
+	}
+	if value(t, owner, "SELECT count(*)::text FROM receipts") != "1" {
+		t.Fatal("migration replay duplicated receipt")
+	}
+	if value(t, owner, "SELECT pg_has_role('delegated_reader','delegated_app_reader','MEMBER')::text") != "true" {
+		t.Fatal("reader role not bound")
+	}
+	if value(t, owner, "SELECT has_table_privilege('delegated_ro','receipts','SELECT')::text") != "false" {
+		t.Fatal("v2 restored blanket reader authority")
+	}
+	oldDigest := b.PlanDigest
+	p.Access.ReadOnlyRoles = nil
+	writePlan(t, dir, p, &b)
+	if b.PlanDigest == oldDigest {
+		t.Fatal("role removal did not change plan digest")
+	}
+	o.Binding = b
+	if result, err := Run(context.Background(), o); err != nil || !result.AccessCommitted {
+		t.Fatalf("v2 removal: %+v %v", result, err)
+	}
+	if value(t, owner, "SELECT pg_has_role('delegated_reader','delegated_app_reader','MEMBER')::text") != "false" {
+		t.Fatal("reader removal was not reconciled")
+	}
+	if value(t, owner, "SELECT has_table_privilege('delegated_ro','receipts','SELECT')::text") != "false" {
+		t.Fatal("reader removal restored direct SELECT")
+	}
 }

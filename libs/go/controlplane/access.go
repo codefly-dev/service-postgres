@@ -43,6 +43,11 @@ type RuntimeAccess struct {
 	ReadWriteRole  string
 	Schemas        []string
 	ReadWriteRoles []string
+	// ReconcileReadOnlyRoleMemberships selects exclusive delegated reader access.
+	// An empty list revokes old memberships without restoring blanket SELECT.
+	// False preserves legacy direct SELECT grants and leaves memberships alone.
+	ReadOnlyRoles                    []string
+	ReconcileReadOnlyRoleMemberships bool
 	// ReconcileReadWriteRoleMemberships controls cluster-wide membership
 	// reconciliation. The service runtime enables it; isolated database drills
 	// leave it disabled because memberships are not database-local.
@@ -61,6 +66,8 @@ type RuntimeAccess struct {
 // schema creation, and installs matching default privileges. The read-write
 // principal receives direct DML only when no delegated roles are configured;
 // otherwise its exclusive write authority is the reconciled NOLOGIN role set.
+// Reader delegation is an explicit opt-in: it removes direct/default SELECT and
+// reconciles the configured NOLOGIN reader set, including an empty set.
 // The caller owns the transaction and must roll it back on any returned error.
 //
 // Membership reconciliation revokes then re-grants, so the caller must also
@@ -115,12 +122,16 @@ func ReconcileRuntimeAccess(ctx context.Context, tx *sql.Tx, access RuntimeAcces
 			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA ` + schema + ` FROM ` + readWrite,
 			`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ` + schema + ` FROM ` + readOnly,
 			`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ` + schema + ` FROM ` + readWrite,
-			`GRANT SELECT ON ALL TABLES IN SCHEMA ` + schema + ` TO ` + readOnly,
 			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + owner + ` IN SCHEMA ` + schema + ` REVOKE ALL ON TABLES FROM ` + readOnly,
 			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + owner + ` IN SCHEMA ` + schema + ` REVOKE ALL ON TABLES FROM ` + readWrite,
 			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + owner + ` IN SCHEMA ` + schema + ` REVOKE ALL ON SEQUENCES FROM ` + readOnly,
 			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + owner + ` IN SCHEMA ` + schema + ` REVOKE ALL ON SEQUENCES FROM ` + readWrite,
-			`ALTER DEFAULT PRIVILEGES FOR ROLE ` + owner + ` IN SCHEMA ` + schema + ` GRANT SELECT ON TABLES TO ` + readOnly,
+		}
+		if !access.ReconcileReadOnlyRoleMemberships {
+			statements = append(statements,
+				`GRANT SELECT ON ALL TABLES IN SCHEMA `+schema+` TO `+readOnly,
+				`ALTER DEFAULT PRIVILEGES FOR ROLE `+owner+` IN SCHEMA `+schema+` GRANT SELECT ON TABLES TO `+readOnly,
+			)
 		}
 		if len(access.ReadWriteRoles) == 0 {
 			statements = append(statements,
@@ -134,6 +145,14 @@ func ReconcileRuntimeAccess(ctx context.Context, tx *sql.Tx, access RuntimeAcces
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return err
 			}
+		}
+	}
+	if access.ReconcileReadOnlyRoleMemberships {
+		if err := validateReaderRoles(ctx, tx, access); err != nil {
+			return err
+		}
+		if err := reconcileRuntimeRoleMemberships(ctx, tx, access.ReadOnlyRole, access.ReadOnlyRoles); err != nil {
+			return err
 		}
 	}
 	if access.ReconcileReadWriteRoleMemberships {
@@ -170,6 +189,21 @@ func validateRuntimeAccess(access RuntimeAccess) error {
 	if len(access.ReadWriteRoles) > 0 && !access.ReconcileReadWriteRoleMemberships {
 		return errors.New("runtime-access read-write roles require membership reconciliation")
 	}
+	if len(access.ReadOnlyRoles) > 0 && !access.ReconcileReadOnlyRoleMemberships {
+		return errors.New("runtime-access read-only roles require membership reconciliation")
+	}
+	seen := map[string]bool{access.OwnerRole: true, access.ReadOnlyRole: true, access.ReadWriteRole: true}
+	for _, roles := range [][]string{access.ReadWriteRoles, access.ReadOnlyPrincipals, access.ReadWritePrincipals} {
+		for _, role := range roles {
+			seen[role] = true
+		}
+	}
+	for _, role := range access.ReadOnlyRoles {
+		if role == "" || strings.TrimSpace(role) != role || len(role) > 63 || strings.ContainsRune(role, 0) || seen[role] {
+			return errors.New("runtime-access read-only roles must be distinct application roles")
+		}
+		seen[role] = true
+	}
 	for _, schema := range access.Schemas {
 		if strings.TrimSpace(schema) == "" {
 			return errors.New("runtime-access schema cannot be empty")
@@ -190,6 +224,55 @@ func validateRuntimeAccess(access RuntimeAccess) error {
 		}
 	default:
 		return fmt.Errorf("runtime-access auth mode %q is not supported", access.AuthMode)
+	}
+	return nil
+}
+
+// Application migrations own reader roles and their table/RLS policies. This
+// boundary refuses obvious elevation instead of turning the read-only group into
+// a second writer. Checks cover transitive role authority and existing objects in
+// the declared schemas; owners must retain those properties when changing grants.
+// It cannot prove that an executable routine is free of side effects.
+func validateReaderRoles(ctx context.Context, tx *sql.Tx, access RuntimeAccess) error {
+	for _, role := range access.ReadOnlyRoles {
+		var allowed bool
+		err := tx.QueryRowContext(ctx, `
+ SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=$1 AND NOT rolcanlogin)
+ AND NOT EXISTS (
+   SELECT 1 FROM pg_roles r
+   WHERE (r.rolname=$1 OR pg_has_role($1,r.oid,'MEMBER'))
+     AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls)
+ )
+ AND NOT EXISTS (
+   SELECT 1 FROM pg_database d WHERE d.datname=current_database()
+     AND pg_has_role($1,d.datdba,'MEMBER')
+ )
+ AND NOT EXISTS (
+   SELECT 1 FROM pg_roles r WHERE r.rolname=ANY($3)
+     AND pg_has_role($1,r.oid,'MEMBER')
+ )
+ AND NOT EXISTS (
+   SELECT 1 FROM pg_namespace n CROSS JOIN pg_roles r
+   WHERE n.nspname=ANY($2) AND (r.rolname=$1 OR pg_has_role($1,r.oid,'MEMBER'))
+     AND has_schema_privilege(r.oid,n.oid,'CREATE')
+ )
+ AND NOT EXISTS (
+   SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+   CROSS JOIN pg_roles r
+   WHERE n.nspname=ANY($2) AND (r.rolname=$1 OR pg_has_role($1,r.oid,'MEMBER')) AND (
+     (c.relkind IN ('r','p','v','m','f') AND (
+       has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+       OR has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')
+     ))
+     OR (c.relkind='S' AND has_sequence_privilege(r.oid,c.oid,'USAGE,UPDATE'))
+   )
+ )`, role, pq.Array(access.Schemas), pq.Array(append([]string{access.OwnerRole, access.ReadOnlyRole, access.ReadWriteRole}, access.ReadWriteRoles...))).Scan(&allowed)
+		if err != nil {
+			return fmt.Errorf("check read-only role authority: %w", err)
+		}
+		if !allowed {
+			return fmt.Errorf("runtime-access read-only role %q is missing or has non-reader authority", role)
+		}
 	}
 	return nil
 }

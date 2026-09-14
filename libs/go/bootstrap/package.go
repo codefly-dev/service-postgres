@@ -77,7 +77,9 @@ func snapshot(directory string, binding Binding) (schemaplan.Plan, string, error
 	if err := decodeJSON(bytes.NewReader(data), &p); err != nil {
 		return p, "", err
 	}
-	if p.ContractVersion != schemaplan.ContractVersion || p.Digest != p.ContentDigest() || p.Digest != binding.PlanDigest {
+	if (p.ContractVersion != schemaplan.ContractVersion && p.ContractVersion != schemaplan.ReaderRolesContractVersion) ||
+		(p.ContractVersion == schemaplan.ContractVersion && p.Access.ReadOnlyRoles != nil) ||
+		p.Digest != p.ContentDigest() || p.Digest != binding.PlanDigest {
 		return fail("schema plan identity mismatch")
 	}
 	if err := validateBinding(p, binding); err != nil {
@@ -185,7 +187,7 @@ func validateBinding(p schemaplan.Plan, b Binding) error {
 		}
 		seen[group] = true
 	}
-	for _, roles := range [][]string{p.Access.ReadWriteRoles, b.ReadOnlyPrincipals, b.ReadWritePrincipals} {
+	for _, roles := range [][]string{p.Access.ReadOnlyRoles, p.Access.ReadWriteRoles, b.ReadOnlyPrincipals, b.ReadWritePrincipals} {
 		for _, r := range roles {
 			if !identifier(r) || seen[r] {
 				return errors.New("role bindings must be distinct valid identifiers")
