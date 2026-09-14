@@ -149,13 +149,17 @@ type WriteTx interface {
 }
 
 type config struct {
-	tenantSetting       string
-	userSetting         string
-	operationTimeout    time.Duration
-	readIsolation       pgx.TxIsoLevel
-	accessTokenProvider AccessTokenProvider
-	restrictedSession   bool
-	deniedRoles         []string
+	tenantSetting        string
+	userSetting          string
+	operationTimeout     time.Duration
+	readIsolation        pgx.TxIsoLevel
+	accessTokenProvider  AccessTokenProvider
+	restrictedSession    bool
+	deniedRoles          []string
+	readerProfile        ConnectionProfile
+	writerProfile        ConnectionProfile
+	maintenanceProfile   ConnectionProfile
+	distinctProxySockets bool
 }
 
 // Option configures the RLS settings used by application policies.

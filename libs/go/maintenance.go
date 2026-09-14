@@ -64,8 +64,11 @@ func OpenMaintenance(ctx context.Context, connection, applicationRole string, op
 		ctx, cancel = context.WithTimeout(ctx, c.operationTimeout)
 		defer cancel()
 	}
-	pc, err := pgxpool.ParseConfig(connection)
+	pc, err := ParseConnection(connection, c.maintenanceProfile, c.accessTokenProvider != nil)
 	if err != nil {
+		if c.maintenanceProfile.Transport != "" {
+			return nil, nil, err
+		}
 		return nil, nil, errors.New("invalid maintenance Postgres connection")
 	}
 	if role := pc.ConnConfig.RuntimeParams["role"]; role != "" && role != applicationRole {
@@ -95,16 +98,16 @@ func OpenMaintenance(ctx context.Context, connection, applicationRole string, op
 	installRestrictedSession(pc, c)
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
-		return nil, nil, errors.New("cannot open maintenance Postgres capability")
+		return nil, nil, profileConnectionError(c.maintenanceProfile, errors.New("cannot open maintenance Postgres capability"))
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, nil, err
+		return nil, nil, profileConnectionError(c.maintenanceProfile, err)
 	}
 	maintenance, err := NewMaintenance(pool, options...)
 	if err != nil {
 		pool.Close()
-		return nil, nil, err
+		return nil, nil, profileConnectionError(c.maintenanceProfile, err)
 	}
 	var once sync.Once
 	return maintenance, func() { once.Do(pool.Close) }, nil
