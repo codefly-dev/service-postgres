@@ -142,6 +142,8 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 		return result, e
 	}
 	a := controlplane.RuntimeAccess{Database: p.Database, OwnerRole: o.Binding.OwnerRole, ReadOnlyRole: p.Access.ReadOnlyRole, ReadWriteRole: p.Access.ReadWriteRole, Schemas: p.Access.Schemas, ReadWriteRoles: p.Access.ReadWriteRoles, ReconcileReadWriteRoleMemberships: true, AuthMode: controlplane.AuthModeExternalIdentity, ReadOnlyPrincipals: o.Binding.ReadOnlyPrincipals, ReadWritePrincipals: o.Binding.ReadWritePrincipals}
+	a.ReadOnlyRoles = p.Access.ReadOnlyRoles
+	a.ReconcileReadOnlyRoleMemberships = p.ContractVersion == schemaplan.ReaderRolesContractVersion
 	if e = controlplane.ReconcileRuntimeAccess(ctx, tx, a); e != nil {
 		return result, errors.New("runtime access reconciliation failed")
 	}

@@ -151,3 +151,64 @@ The managed command still needs an immutable deployment artifact and managed
 provider qualification before use against a shared endpoint. Provider IAM,
 workload identity, secret/token refresh, application database clients and cloud
 backup/restore are outside this runner's responsibility.
+
+## Delegated reader roles (schema-plan v2)
+
+The managed bootstrap accepts both `codefly.dev/postgres-schema-plan/v1` and
+`codefly.dev/postgres-schema-plan/v2`. Existing v1 JSON, content digests and direct
+reader SELECT/default privileges remain unchanged. The service builder continues
+to emit v1 unless its owning package composition explicitly selects v2; no new
+service setting is implied by this library extension.
+
+For a module with its own read-only role and RLS policy, its package composition
+sets the plan's contract version to v2 and declares, for example:
+
+```json
+"access": {
+  "read-only-role": "managed_reader_group",
+  "read-write-role": "managed_writer_group",
+  "schemas": ["public"],
+  "read-write-roles": ["app_writer"],
+  "read-only-roles": ["app_reader"]
+}
+```
+
+The existing module migration creates `app_reader` and grants its table/RLS
+permissions. The canonical reconciler creates the managed group in external
+identity mode and reconciles its application-role memberships. Platform bindings
+still supply the pre-existing login principals. Packages must not reconstruct the
+primitive's role-name algorithm or create its managed groups in application SQL.
+
+V2 reader delegation is exclusive: the group has CONNECT/USAGE, no direct table or
+sequence privileges, and no default SELECT. Sessions explicitly select the
+application reader role, just as they select an application writer role. An empty
+or omitted v2 `read-only-roles` list removes all memberships held by the reader
+group and provides no table authority; it never falls back to broad SELECT. Changes
+to this list change the plan digest, while leaving SQL lineage digests alone.
+
+Reader roles must already exist, be non-login, differ from the owner, managed
+groups, writer roles and physical principals, and have no transitive privileged
+role/owner/writer membership. Reconciliation also refuses CREATE, column/table and
+sequence write privileges in the declared schemas, including through NOINHERIT
+memberships a session could explicitly select. Module owners remain responsible for
+future grants and the behavior of callable routines; this is not proof that every
+SQL expression or SECURITY DEFINER function is free of effects. The owner must
+hold the existing per-database reconciliation lock and roll back on any error.
+
+Replacing or removing reader roles reconciles the whole reader group's inherited
+role set; only module-owned reader groups should opt in. Drain request sessions
+before changing grants and replace their connections afterward: revoking a role
+does not terminate a session that already selected it. Reapplying v1 is not a safe
+rollback of v2 access, because it deliberately restores legacy broad SELECT and
+does not own reader-membership cleanup. Use an explicitly reviewed v2 policy to
+reduce or remove access.
+
+Adoption requires a newly built/published managed-bootstrap engine and an image
+containing it, plus new package metadata and approval of the v2 plan digest. Older
+engines reject v2. A Go dependency bump alone does not update a pinned migration
+image. The previous engine/image and previously executed SQL remain immutable.
+This contract does not rewrite migration ledgers, validate historical file hashes,
+or authorize changing previously applied migration bytes. Preserve the original
+inventory for an existing lineage and use its owner's reviewed forward migration
+path. Migration completion and access reconciliation remain separately recorded;
+schema changes are not undone when a later access check refuses a binding.
