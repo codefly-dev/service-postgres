@@ -88,3 +88,25 @@ func TestAnotherTargetIsOnlyData(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMountPathsMustNotOverlap(t *testing.T) {
+	for _, consumer := range []bool{true, false} {
+		for _, path := range []string{"/cloudsql", "/cloudsql/nested", "/"} {
+			a, _ := Parse(fixture(t))
+			volume := a.Volumes[0]
+			volume.Name = "second-socket"
+			a.Volumes = append(a.Volumes, volume)
+			mount := a.VolumeMounts[0]
+			mount.Name, mount.MountPath = volume.Name, path
+			if consumer {
+				a.VolumeMounts = append(a.VolumeMounts, mount)
+			} else {
+				a.InitContainers[0].VolumeMounts = append(a.InitContainers[0].VolumeMounts, mount)
+			}
+			_ = a.Seal()
+			if a.Validate() == nil {
+				t.Fatalf("consumer=%t overlapping path %s accepted", consumer, path)
+			}
+		}
+	}
+}

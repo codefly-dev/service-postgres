@@ -176,11 +176,18 @@ func (a *Attachment) Validate() error {
 	}
 	checkMounts := func(mounts []Mount, consumer bool) bool {
 		seen := map[string]bool{}
+		paths := []string{}
 		for _, m := range mounts {
 			if !volumes[m.Name] || seen[m.Name] || !validPath(m.MountPath) || (consumer && (m.ReadOnly == nil || !*m.ReadOnly)) {
 				return false
 			}
 			seen[m.Name] = true
+			for _, existing := range paths {
+				if m.MountPath == existing || strings.HasPrefix(m.MountPath, existing+"/") || strings.HasPrefix(existing, m.MountPath+"/") {
+					return false
+				}
+			}
+			paths = append(paths, m.MountPath)
 		}
 		return len(mounts) > 0 && len(mounts) <= 16
 	}
