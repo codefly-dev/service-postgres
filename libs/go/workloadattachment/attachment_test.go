@@ -130,3 +130,29 @@ func TestKubernetesNamesMustEndInAlphanumeric(t *testing.T) {
 		}
 	}
 }
+
+func TestUTF8SealMatchesPythonAndKeepsLiteralEscapes(t *testing.T) {
+	a, _ := Parse(fixture(t))
+	a.Binding.ID = "unicode-\u2028-\u2029-literal-\\u2028-\\u2029"
+	if err := a.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	// hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+	if a.Digest != "sha256:8d9c1c8a27bccfce0d09e06a2eceb90078c6ea546aa2886034780022ccd6e190" {
+		t.Fatal("UTF-8 canonical digest diverges from Python")
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSocketAndMountPathsRejectNullAndUnicodeWhitespace(t *testing.T) {
+	for _, path := range []string{"/cloudsql/\x00socket", "/cloudsql/\u2028socket"} {
+		a, _ := Parse(fixture(t))
+		a.Binding.Connection.SocketDirectory = path
+		_ = a.Seal()
+		if a.Validate() == nil {
+			t.Fatal("unsafe socket path accepted")
+		}
+	}
+}

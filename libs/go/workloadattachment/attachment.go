@@ -13,6 +13,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 const Version = "codefly.dev/postgres-workload-attachment/v1"
@@ -94,7 +95,7 @@ var namePattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
 var imagePattern = regexp.MustCompile(`^[^\s@]+@sha256:[a-f0-9]{64}$`)
 
 func validPath(value string) bool {
-	return path.IsAbs(value) && value != "/" && path.Clean(value) == value && !strings.ContainsAny(value, "\t\r\n ") && !strings.Contains(value, ".s.PGSQL.")
+	return path.IsAbs(value) && value != "/" && path.Clean(value) == value && strings.IndexFunc(value, func(r rune) bool { return r == 0 || unicode.IsSpace(r) }) == -1 && !strings.Contains(value, ".s.PGSQL.")
 }
 func bounded(s string) bool {
 	return len(s) > 0 && len(s) <= 1024 && !strings.ContainsAny(s, "\x00\r\n")
@@ -145,7 +146,28 @@ func (a *Attachment) computedDigest() (string, error) {
 	if err = encoder.Encode(value); err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(bytes.TrimSuffix(canonical.Bytes(), []byte("\n")))
+	// encoding/json always escapes JavaScript's line separators, even with HTML
+	// escaping disabled. The public UTF-8 seal leaves these characters literal.
+	// Walk escape pairs so a literal backslash-u2028 string stays unchanged.
+	raw := bytes.TrimSuffix(canonical.Bytes(), []byte("\n"))
+	var utf8 bytes.Buffer
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 < len(raw) {
+			if bytes.HasPrefix(raw[i:], []byte(`\u2028`)) || bytes.HasPrefix(raw[i:], []byte(`\u2029`)) {
+				if raw[i+5] == '8' {
+					utf8.WriteRune('\u2028')
+				} else {
+					utf8.WriteRune('\u2029')
+				}
+				i += 5
+				continue
+			}
+			utf8.WriteByte(raw[i])
+			i++
+		}
+		utf8.WriteByte(raw[i])
+	}
+	sum := sha256.Sum256(utf8.Bytes())
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
