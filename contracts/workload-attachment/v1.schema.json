@@ -1,0 +1,349 @@
+{
+  "$id": "https://codefly.dev/contracts/postgres-workload-attachment/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "binding": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "enum": [
+            "reader",
+            "writer",
+            "maintenance"
+          ]
+        },
+        "binding_id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "connection": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "local-identity-proxy"
+            },
+            "port": {
+              "maximum": 65535,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "socket_directory": {
+              "pattern": "^/[^\\s]+$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "socket_directory",
+            "port"
+          ],
+          "type": "object"
+        },
+        "database": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "primitive": {
+          "const": "database"
+        },
+        "user": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "primitive",
+        "binding_id",
+        "access",
+        "database",
+        "user",
+        "connection"
+      ],
+      "type": "object"
+    },
+    "digest": {
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "type": "string"
+    },
+    "init_containers": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "image": {
+            "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "name": {
+            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "type": "string"
+          },
+          "resources": {
+            "additionalProperties": false,
+            "properties": {
+              "limits": {
+                "additionalProperties": false,
+                "properties": {
+                  "cpu": {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "memory": {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "cpu",
+                  "memory"
+                ],
+                "type": "object"
+              },
+              "requests": {
+                "additionalProperties": false,
+                "properties": {
+                  "cpu": {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "memory": {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "cpu",
+                  "memory"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "requests",
+              "limits"
+            ],
+            "type": "object"
+          },
+          "restartPolicy": {
+            "const": "Always"
+          },
+          "securityContext": {
+            "additionalProperties": false,
+            "properties": {
+              "allowPrivilegeEscalation": {
+                "const": false
+              },
+              "capabilities": {
+                "additionalProperties": false,
+                "properties": {
+                  "drop": {
+                    "const": [
+                      "ALL"
+                    ]
+                  }
+                },
+                "required": [
+                  "drop"
+                ],
+                "type": "object"
+              },
+              "readOnlyRootFilesystem": {
+                "const": true
+              }
+            },
+            "required": [
+              "allowPrivilegeEscalation",
+              "readOnlyRootFilesystem",
+              "capabilities"
+            ],
+            "type": "object"
+          },
+          "volumeMounts": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "mountPath": {
+                  "pattern": "^/[^\\s]+$",
+                  "type": "string"
+                },
+                "name": {
+                  "pattern": "^[a-z][a-z0-9-]{0,62}$",
+                  "type": "string"
+                },
+                "readOnly": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "name",
+                "mountPath"
+              ],
+              "type": "object"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "image",
+          "restartPolicy",
+          "args",
+          "volumeMounts",
+          "securityContext",
+          "resources"
+        ],
+        "type": "object"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "type": "array"
+    },
+    "namespace": {
+      "pattern": "^[a-z][a-z0-9-]{0,62}$",
+      "type": "string"
+    },
+    "pod_security_context": {
+      "additionalProperties": false,
+      "properties": {
+        "fsGroup": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "runAsGroup": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "runAsNonRoot": {
+          "const": true
+        },
+        "runAsUser": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "seccompProfile": {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "RuntimeDefault"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "runAsNonRoot",
+        "runAsUser",
+        "runAsGroup",
+        "fsGroup",
+        "seccompProfile"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "codefly.dev/postgres-workload-attachment/v1"
+    },
+    "service_account": {
+      "pattern": "^[a-z][a-z0-9-]{0,62}$",
+      "type": "string"
+    },
+    "volume_mounts": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "mountPath": {
+            "pattern": "^/[^\\s]+$",
+            "type": "string"
+          },
+          "name": {
+            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "type": "string"
+          },
+          "readOnly": {
+            "const": true
+          }
+        },
+        "required": [
+          "name",
+          "mountPath",
+          "readOnly"
+        ],
+        "type": "object"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "type": "array"
+    },
+    "volumes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "emptyDir": {
+            "additionalProperties": false,
+            "properties": {
+              "medium": {
+                "const": "Memory"
+              },
+              "sizeLimit": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "medium",
+              "sizeLimit"
+            ],
+            "type": "object"
+          },
+          "name": {
+            "pattern": "^[a-z][a-z0-9-]{0,62}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "emptyDir"
+        ],
+        "type": "object"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "binding",
+    "namespace",
+    "service_account",
+    "pod_security_context",
+    "init_containers",
+    "volumes",
+    "volume_mounts",
+    "digest"
+  ],
+  "title": "PostgreSQL local identity proxy workload attachment",
+  "type": "object"
+}
