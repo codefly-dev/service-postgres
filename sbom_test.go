@@ -21,6 +21,8 @@ var (
 	runtimeARM64Digest   = testImageDigest("a22")
 	bootstrapAMD64Digest = testImageDigest("b11")
 	bootstrapARM64Digest = testImageDigest("b22")
+	overrideAMD64Digest  = testImageDigest("c11")
+	overrideARM64Digest  = testImageDigest("c22")
 )
 
 func testImageDigest(seed string) string {
@@ -136,9 +138,11 @@ func TestImageSBOMReportsAFailedScanRatherThanPartialCoverage(t *testing.T) {
 	require.Contains(t, response.GetState().GetMessage(), "no space left on device")
 }
 
-// One scan answers for every service that runs that exact image: the digest is
-// inventoried once and keeps both associations.
-func TestImageSBOMDeduplicatesASharedDigestWithoutLosingSubjects(t *testing.T) {
+// One digest is reported once and keeps every association. The scanner still
+// visits it once per distinct subject — the shared helper resolves each subject
+// before consulting its index — so the scan count is asserted rather than
+// glossed: a subject that differs only in service is a second scan.
+func TestImageSBOMReportsASharedDigestOnceAndKeepsEverySubject(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 	log := stubScanner(t, scanner{})
 	neighbour := &builderv0.ImageSubject{
@@ -158,9 +162,101 @@ func TestImageSBOMDeduplicatesASharedDigestWithoutLosingSubjects(t *testing.T) {
 
 	require.Len(t, response.GetImages(), 2, "the shared digest is reported once, not once per subject")
 	shared := evidenceFor(t, response, runtimeAMD64Digest)
-	require.Equal(t, []string{builder.Unique(), "module/other-postgres"}, subjectServices(shared))
-	require.Equal(t, image.FullName(), shared.GetSubjects()[1].GetReference())
-	require.NotEmpty(t, scans(t, log))
+	require.Equal(t, []string{"module/other-postgres", builder.Unique()}, subjectServices(shared),
+		"the caller's own subjects lead, and neither association is dropped")
+	require.Len(t, scans(t, log), 3,
+		"two platforms of the runtime image, plus the neighbour subject the helper resolves separately")
+}
+
+// A subject identical to one this agent contributes carries no association the
+// contributed one lacks, so it must not cost a second full image scan.
+func TestImageSBOMScansAnIdenticalSubjectOnlyOnce(t *testing.T) {
+	builder := newBuildTestBuilder(t)
+	log := stubScanner(t, scanner{})
+	duplicate := &builderv0.ImageSubject{
+		Reference: image.FullName(),
+		Platform:  "linux/amd64",
+		Role:      runtimeImageRole,
+		Service:   builder.Unique(),
+	}
+
+	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
+		Scope:    builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv0.ImageSubject{duplicate},
+	})
+	require.NoError(t, err)
+	require.Equal(t, builderv0.SBOMStatus_COMPLETE, response.GetState().GetState(),
+		response.GetState().GetMessage())
+	require.Len(t, scans(t, log), 2, "the repeated subject is dropped before it is scanned")
+	require.Len(t, evidenceFor(t, response, runtimeAMD64Digest).GetSubjects(), 1)
+}
+
+// A multi-platform override is an ordinary configuration — postgres:17-alpine
+// ships eight platforms — and declaring them is what makes its evidence
+// complete instead of failing the whole request.
+func TestImageSBOMCoversEveryDeclaredPlatformOfAnOverride(t *testing.T) {
+	builder := newBuildTestBuilder(t)
+	builder.Settings.Image = "postgres:17-alpine"
+	builder.Settings.ImagePlatforms = []string{"linux/amd64", "linux/arm64"}
+	log := stubScanner(t, scanner{overrideImage: "postgres"})
+
+	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
+		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv0.ImageSubject{{
+			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+		}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, builderv0.SBOMStatus_COMPLETE, response.GetState().GetState(),
+		response.GetState().GetMessage())
+
+	require.Equal(t, []string{"linux/amd64", "linux/arm64"},
+		[]string{
+			evidenceFor(t, response, overrideAMD64Digest).GetPlatform(),
+			evidenceFor(t, response, overrideARM64Digest).GetPlatform(),
+		})
+	require.Contains(t, scans(t, log), "registry:postgres@"+overrideARM64Digest,
+		"the override's tag is resolved to each declared platform's child digest")
+}
+
+// Without a declaration there is nothing to resolve a multi-platform override
+// with, and the scanner refuses to pick a platform rather than mislabel the
+// evidence. The failure has to name that ambiguity.
+func TestImageSBOMFailsOnAnUndeclaredMultiPlatformOverride(t *testing.T) {
+	builder := newBuildTestBuilder(t)
+	builder.Settings.Image = "postgres:17-alpine"
+	stubScanner(t, scanner{overrideImage: "postgres"})
+
+	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
+		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv0.ImageSubject{{
+			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+		}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Contains(t, response.GetState().GetMessage(), "name the platform to scan")
+}
+
+// A reference the override parser cannot read — a registry with a port has two
+// colons — must be reported, never dereferenced.
+func TestImageSBOMRejectsAnUnreadableOverrideReference(t *testing.T) {
+	builder := newBuildTestBuilder(t)
+	builder.Settings.Image = "registry.internal:5000/pg:17"
+	log := stubScanner(t, scanner{})
+
+	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
+		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv0.ImageSubject{{
+			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+		}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Contains(t, response.GetState().GetMessage(), "is not a name:tag reference")
+	require.NoFileExists(t, log, "nothing may be scanned once the configuration is rejected")
 }
 
 // The source inventory this agent has always served is preserved, and is still
@@ -185,7 +281,8 @@ func TestSourceScopeStillInventoriesTheConfiguredImage(t *testing.T) {
 func TestRuntimeImageSubjectsFollowTheLockedPlatformsAndTheOverride(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 
-	locked := builder.runtimeImageSubjects()
+	locked, err := builder.runtimeImageSubjects()
+	require.NoError(t, err)
 	require.Len(t, locked, len(image.Platforms))
 	for index, subject := range locked {
 		require.Equal(t, image.FullName(), subject.GetReference())
@@ -196,12 +293,25 @@ func TestRuntimeImageSubjectsFollowTheLockedPlatformsAndTheOverride(t *testing.T
 			"evidence binds to the platform's child manifest, not to the manifest list")
 	}
 
+	// A single-platform override needs no declaration: one unstated platform is
+	// exact, and the scanner resolves it.
 	builder.Settings.Image = "postgis/postgis:17-3.5"
-	overridden := builder.runtimeImageSubjects()
+	overridden, err := builder.runtimeImageSubjects()
+	require.NoError(t, err)
 	require.Len(t, overridden, 1)
 	require.Equal(t, "postgis/postgis:17-3.5", overridden[0].GetReference())
-	require.Empty(t, overridden[0].GetPlatform(),
-		"an override's platforms are not locked here, so the scanner resolves them")
+	require.Empty(t, overridden[0].GetPlatform())
+
+	builder.Settings.ImagePlatforms = []string{"linux/amd64", "linux/arm64"}
+	declared, err := builder.runtimeImageSubjects()
+	require.NoError(t, err)
+	require.Len(t, declared, 2)
+	require.Equal(t, "linux/arm64", declared[1].GetPlatform())
+	require.Equal(t, "postgis/postgis:17-3.5", declared[1].GetReference())
+
+	builder.Settings.ImagePlatforms = []string{"amd64"}
+	_, err = builder.runtimeImageSubjects()
+	require.EqualError(t, err, `docker-image-platforms "amd64" must be os/arch`)
 }
 
 // bootstrapImageName is the image the recipe emitted by newBuildTestBuilder's
@@ -212,6 +322,9 @@ type scanner struct {
 	// failure is the stderr a failing scan reports; empty means every scan
 	// succeeds.
 	failure string
+	// overrideImage is the reference prefix a docker-image override resolves
+	// under, so its evidence stays distinguishable from the caller's images.
+	overrideImage string
 }
 
 // stubScanner puts a docker and a syft on PATH that answer like the real ones:
@@ -229,6 +342,7 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$SCANNER_LOG"
 case "$4" in
   "$RUNTIME_IMAGE_NAME"*) amd64=$RUNTIME_AMD64_DIGEST; arm64=$RUNTIME_ARM64_DIGEST ;;
+  "$OVERRIDE_IMAGE_NAME"*) amd64=$OVERRIDE_AMD64_DIGEST; arm64=$OVERRIDE_ARM64_DIGEST ;;
   *) amd64=$BOOTSTRAP_AMD64_DIGEST; arm64=$BOOTSTRAP_ARM64_DIGEST ;;
 esac
 cat <<JSON
@@ -246,8 +360,8 @@ if [[ -n "${SYFT_FAILURE:-}" ]]; then
 fi
 architecture=unknown
 case "$1" in
-  *"$RUNTIME_AMD64_DIGEST"|*"$BOOTSTRAP_AMD64_DIGEST") architecture=amd64 ;;
-  *"$RUNTIME_ARM64_DIGEST"|*"$BOOTSTRAP_ARM64_DIGEST") architecture=arm64 ;;
+  *"$RUNTIME_AMD64_DIGEST"|*"$BOOTSTRAP_AMD64_DIGEST"|*"$OVERRIDE_AMD64_DIGEST") architecture=amd64 ;;
+  *"$RUNTIME_ARM64_DIGEST"|*"$BOOTSTRAP_ARM64_DIGEST"|*"$OVERRIDE_ARM64_DIGEST") architecture=arm64 ;;
 esac
 cat <<JSON
 {
@@ -274,6 +388,15 @@ JSON
 	t.Setenv("RUNTIME_ARM64_DIGEST", runtimeARM64Digest)
 	t.Setenv("BOOTSTRAP_AMD64_DIGEST", bootstrapAMD64Digest)
 	t.Setenv("BOOTSTRAP_ARM64_DIGEST", bootstrapARM64Digest)
+	// A test with no override still needs a pattern that matches nothing: an
+	// empty one would match every reference and shadow the default branch.
+	overrideImage := options.overrideImage
+	if overrideImage == "" {
+		overrideImage = "no-override-configured"
+	}
+	t.Setenv("OVERRIDE_IMAGE_NAME", overrideImage)
+	t.Setenv("OVERRIDE_AMD64_DIGEST", overrideAMD64Digest)
+	t.Setenv("OVERRIDE_ARM64_DIGEST", overrideARM64Digest)
 	return log
 }
 

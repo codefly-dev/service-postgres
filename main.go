@@ -74,6 +74,17 @@ type Settings struct {
 	// the default pgvector image (see the `image` var).
 	Image string `yaml:"docker-image"`
 
+	// ImagePlatforms are the os/arch platforms the overridden image ships.
+	// Image inventories describe one platform each, and nothing else can tell
+	// this service what an image it does not own carries, so a multi-platform
+	// override has to name them or its evidence cannot be produced at all.
+	// Empty is right for a single-platform override: the scanner resolves that
+	// one on its own.
+	//
+	//   docker-image: postgres:17-alpine
+	//   docker-image-platforms: [linux/amd64, linux/arm64]
+	ImagePlatforms []string `yaml:"docker-image-platforms"`
+
 	// Extensions are CREATE EXTENSION IF NOT EXISTS'd at startup, on top of the
 	// always-on defaults (defaultExtensions). The extension's shared library
 	// must exist in the image; the default pgvector image ships the standard
@@ -216,9 +227,8 @@ func parseRuntimeImageLock(content []byte) (*runtimeImage, error) {
 		return nil, fmt.Errorf("runtime image platforms are required")
 	}
 	for _, platform := range lock.Platforms {
-		operatingSystem, architecture, found := strings.Cut(platform, "/")
-		if !found || operatingSystem == "" || architecture == "" {
-			return nil, fmt.Errorf("runtime image platform %q must be os/arch", platform)
+		if err := validatePlatform("runtime image platform", platform); err != nil {
+			return nil, err
 		}
 	}
 	return &runtimeImage{
@@ -229,6 +239,16 @@ func parseRuntimeImageLock(content []byte) (*runtimeImage, error) {
 		},
 		Platforms: lock.Platforms,
 	}, nil
+}
+
+// validatePlatform accepts the "os/arch" form image evidence is keyed by, the
+// same form the scanner selects a manifest with.
+func validatePlatform(field, value string) error {
+	operatingSystem, architecture, found := strings.Cut(value, "/")
+	if !found || operatingSystem == "" || architecture == "" {
+		return fmt.Errorf("%s %q must be os/arch", field, value)
+	}
+	return nil
 }
 
 type DeploymentTemplateParameters struct {

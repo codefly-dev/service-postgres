@@ -53,6 +53,9 @@ const (
 	// local configuration and secrets, and a context is transferred to the
 	// daemon and cached whether or not the Dockerfile copies from it.
 	bootstrapIgnoreFile = "dockerignore"
+	// runtimeImageRole names the postgres image in SBOM evidence. The bootstrap
+	// image carries its own role from the recipe that builds it.
+	runtimeImageRole = "runtime"
 )
 
 type Builder struct {
@@ -128,28 +131,67 @@ func (s *Builder) SBOM(ctx context.Context, req *builderv0.SBOMRequest) (*builde
 	if len(req.GetSubjects()) == 0 {
 		return s.Builder.SBOMImageSubjectsRequired()
 	}
-	subjects := append(s.runtimeImageSubjects(), req.GetSubjects()...)
-	return s.Builder.SBOMImages(ctx, subjects, sbom.SourceRegistry)
+	runtimeSubjects, err := s.runtimeImageSubjects()
+	if err != nil {
+		return s.Builder.SBOMImageError(err)
+	}
+	// The caller's own subjects lead, so a failure among the images it asked
+	// about is reported as itself rather than behind the one this agent adds.
+	return s.Builder.SBOMImages(ctx, distinctSubjects(req.GetSubjects(), runtimeSubjects), sbom.SourceRegistry)
 }
 
-// runtimeImageRole names the postgres image in evidence. The bootstrap image
-// carries its own role from the recipe that builds it.
-const runtimeImageRole = "runtime"
+// distinctSubjects drops subjects that are identical in every field. Each
+// subject costs a full image scan, and a repeated one carries no association
+// the first does not already have. Subjects that differ in service or role are
+// kept: that is how one digest still names every service it covers.
+func distinctSubjects(groups ...[]*builderv0.ImageSubject) []*builderv0.ImageSubject {
+	seen := map[string]bool{}
+	var subjects []*builderv0.ImageSubject
+	for _, group := range groups {
+		for _, subject := range group {
+			key := strings.Join([]string{
+				subject.GetReference(),
+				subject.GetDigest(),
+				subject.GetPlatform(),
+				subject.GetRole(),
+				subject.GetService(),
+			}, "|")
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			subjects = append(subjects, subject)
+		}
+	}
+	return subjects
+}
 
 // runtimeImageSubjects describes the postgres image the workload runs. It is
 // deployed rather than built, so it appears in no build plan and no caller
 // derives a subject for it — without this the image the database actually runs
 // would never be inventoried. The subjects carry no digest: evidence binds to
 // the platform's child manifest, not to the manifest list the deployment names.
-func (s *Service) runtimeImageSubjects() []*builderv0.ImageSubject {
-	// An override is a bring-your-own reference whose platforms are not locked
-	// here, so it names none and the scanner resolves what that reference
-	// carries, or fails asking for a platform it cannot pick on its own.
-	platforms := []string{""}
-	if s.Settings == nil || s.Settings.Image == "" {
-		platforms = image.Platforms
+func (s *Service) runtimeImageSubjects() ([]*builderv0.ImageSubject, error) {
+	configured := s.dockerImage()
+	if configured == nil {
+		return nil, fmt.Errorf("docker-image %q is not a name:tag reference", s.Settings.Image)
 	}
-	reference := s.dockerImage().FullName()
+	platforms := image.Platforms
+	if s.Settings != nil && s.Settings.Image != "" {
+		for _, platform := range s.Settings.ImagePlatforms {
+			if err := validatePlatform("docker-image-platforms", platform); err != nil {
+				return nil, err
+			}
+		}
+		// An override that declares no platforms leaves the platform unstated:
+		// exact for a single-platform image, and for a multi-platform one the
+		// scanner refuses to pick one rather than mislabel the evidence.
+		platforms = s.Settings.ImagePlatforms
+		if len(platforms) == 0 {
+			platforms = []string{""}
+		}
+	}
+	reference := configured.FullName()
 	subjects := make([]*builderv0.ImageSubject, 0, len(platforms))
 	for _, platform := range platforms {
 		subjects = append(subjects, &builderv0.ImageSubject{
@@ -159,7 +201,7 @@ func (s *Service) runtimeImageSubjects() []*builderv0.ImageSubject {
 			Service:   s.Unique(),
 		})
 	}
-	return subjects
+	return subjects, nil
 }
 
 // Upgrade reports an available tag bump for the managed postgres image.

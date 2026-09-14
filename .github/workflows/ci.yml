@@ -208,37 +208,6 @@ jobs:
             image --quiet --format table --severity HIGH,CRITICAL \
             --exit-code 1 --input /image.tar
 
-      # Image evidence for the digest this run verified, one CycloneDX document
-      # per platform the lock declares, so the inventory a consumer retrieves
-      # describes exactly the image it deploys. A platform whose SBOM cannot be
-      # produced fails here, before the tag below starts pointing at the digest.
-      - name: Inventory published runtime image
-        env:
-          RUNTIME_IMAGE: ${{ steps.runtime.outputs.reference }}
-          RUNTIME_NAME: ${{ steps.runtime.outputs.name }}
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/image-sbom
-          manifest=$(docker buildx imagetools inspect "$RUNTIME_IMAGE" --format '{{json .Manifest}}')
-          for platform in $(jq -er '.platforms[]' runtime-image.json); do
-            child=$(jq -er --arg platform "$platform" '
-              .manifests[]
-              | select(.platform.os + "/" + .platform.architecture == $platform)
-              | .digest' <<< "$manifest")
-            document="/tmp/image-sbom/${platform//\//-}-${child#sha256:}.cdx.json"
-            docker run --rm --network bridge --read-only --cap-drop ALL \
-              --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid --env HOME=/tmp \
-              anchore/syft@sha256:b4f1df79f97b817682d8b5ff941eb6bfe74f6172553a5e312c75bbc2eabc405c \
-              "registry:$RUNTIME_NAME@$child" -o cyclonedx-json@1.5 > "$document"
-            jq -e '.metadata.component.name != null and (.components | length) > 0' "$document" >/dev/null
-          done
-
-      - name: Upload image SBOM evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: image-sbom-${{ github.run_id }}-${{ github.run_attempt }}
-          path: /tmp/image-sbom
-
       # The tag string is read from runtime-image.json, so every branch resolves
       # the same one. A PR build that moved it would race every other PR on that
       # single tag, and would repoint what releases consume while still unmerged,
@@ -256,3 +225,47 @@ jobs:
           RUNTIME_IMAGE: ${{ steps.runtime.outputs.reference }}
           RUNTIME_TAG: ${{ steps.runtime.outputs.tag_reference }}
         run: .github/scripts/tag-runtime-image.sh "$RUNTIME_TAG"
+
+      # Image evidence for the digest this run verified, one CycloneDX document
+      # per platform the lock declares, so the inventory a consumer retrieves
+      # describes exactly the image it deploys.
+      #
+      # It runs after the tag move, unlike the scan above. The scan reads a
+      # local `docker save` tar and needs no network, so gating the tag on it
+      # costs nothing; producing evidence pulls every platform from the registry
+      # again, and a transient registry failure there must not be what strands
+      # the shared tag on the previous digest with nothing to retry it. A
+      # failure here still fails the run — it just no longer decides what a
+      # plain `docker pull` of the tag returns.
+      - name: Inventory published runtime image
+        env:
+          RUNTIME_IMAGE: ${{ steps.runtime.outputs.reference }}
+          RUNTIME_NAME: ${{ steps.runtime.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/image-sbom
+          manifest=$(docker buildx imagetools inspect "$RUNTIME_IMAGE" --format '{{json .Manifest}}')
+          for platform in $(jq -er '.platforms[]' runtime-image.json); do
+            # Variant is part of the platform identity: linux/arm/v6 and
+            # linux/arm/v7 are one string apart, and selecting on os/arch alone
+            # would match both and build a reference naming two digests.
+            child=$(jq -er --arg platform "$platform" '
+              [ .manifests[]
+                | select(.platform.os + "/" + .platform.architecture
+                    + (if .platform.variant then "/" + .platform.variant else "" end) == $platform)
+                | .digest ]
+              | if length == 1 then .[0]
+                else error("expected exactly one manifest for \($platform), got \(length)") end' <<< "$manifest")
+            document="/tmp/image-sbom/${platform//\//-}-${child#sha256:}.cdx.json"
+            docker run --rm --network bridge --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid --env HOME=/tmp \
+              anchore/syft@sha256:b4f1df79f97b817682d8b5ff941eb6bfe74f6172553a5e312c75bbc2eabc405c \
+              "registry:$RUNTIME_NAME@$child" -o cyclonedx-json@1.5 > "$document"
+            jq -e '.metadata.component.name != null and (.components | length) > 0' "$document" >/dev/null
+          done
+
+      - name: Upload image SBOM evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: image-sbom-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/image-sbom
