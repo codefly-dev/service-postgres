@@ -16,6 +16,11 @@ The seal is `sha256:` of UTF-8 JSON with sorted object keys, compact separators,
 no ASCII or HTML escaping, and only the top-level `digest` omitted. Arrays retain
 order. It detects changed content; it is not a signature, grant or proof of a live
 connection. Both schema and the specific attachment digest need owner review.
+Inputs must contain one UTF-8 JSON document with unique object keys and the exact
+published field names and types. Case aliases, null in place of an optional
+boolean, and lossy Unicode replacements are rejected before admission; they
+cannot borrow the seal of a normalized document. Whitespace and valid JSON string
+escapes do not change the decoded content or its seal.
 
 Version 1 permits only passwordless local identity proxy connections, pinned
 native sidecars, memory-backed private socket volumes, read-only application

@@ -156,3 +156,44 @@ func TestSocketAndMountPathsRejectNullAndUnicodeWhitespace(t *testing.T) {
 		}
 	}
 }
+
+func TestParseRejectsNormalizationBeforeSeal(t *testing.T) {
+	data := fixture(t)
+	for name, bad := range map[string][]byte{
+		"field case":             bytes.Replace(data, []byte(`"namespace":`), []byte(`"Namespace":`), 1),
+		"nested field case":      bytes.Replace(data, []byte(`"socket_directory":`), []byte(`"Socket_Directory":`), 1),
+		"duplicate identity":     bytes.Replace(data, []byte(`"namespace":`), []byte(`"namespace":"unreviewed","namespace":`), 1),
+		"duplicate nested field": bytes.Replace(data, []byte(`"port":`), []byte(`"port":1,"port":`), 1),
+		"escaped duplicate key":  bytes.Replace(data, []byte(`"namespace":`), []byte(`"namespac\u0065":"unreviewed","namespace":`), 1),
+		"null optional mount":    bytes.Replace(data, []byte(`"mountPath":`), []byte(`"readOnly":null,"mountPath":`), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(bad); err == nil {
+				t.Fatal("document outside the public contract accepted under the original seal")
+			}
+		})
+	}
+}
+
+func TestParseUnicodeIsLossless(t *testing.T) {
+	a, _ := Parse(fixture(t))
+	a.Binding.ID = "replacement-\ufffd"
+	_ = a.Seal()
+	data, _ := json.Marshal(a)
+	for _, replacement := range [][]byte{[]byte(`\ud800`), []byte(`\udfff`), {0xff}} {
+		bad := bytes.Replace(data, []byte("\ufffd"), replacement, 1)
+		if _, err := Parse(bad); err == nil {
+			t.Fatal("lossy Unicode normalization accepted under replacement-character seal")
+		}
+	}
+	if _, err := Parse(data); err != nil {
+		t.Fatal("literal replacement character is valid UTF-8:", err)
+	}
+	a.Binding.ID = "pair-\U0001f512-literal-\\ud800"
+	_ = a.Seal()
+	data, _ = json.Marshal(a)
+	data = bytes.Replace(data, []byte("\U0001f512"), []byte(`\ud83d\udd12`), 1)
+	if _, err := Parse(data); err != nil {
+		t.Fatal("valid surrogate pair or literal escape rejected:", err)
+	}
+}
