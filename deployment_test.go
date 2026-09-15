@@ -169,6 +169,81 @@ func TestEphemeralDeploymentRetainsValueBasedConfigurationAndSecret(t *testing.T
 	require.Contains(t, job, fmt.Sprintf("activeDeadlineSeconds: %d", defaultBootstrapJobSeconds))
 }
 
+func TestExternalInstanceDeploymentUsesBindingAndOmitsOwnedServer(t *testing.T) {
+	builder, _ := newDeploymentTestBuilder(t)
+	builder.DatabaseName = "accounts"
+	builder.RuntimeReadWriteRoles = []string{"app_tenant", "app_worker"}
+	builder.ExternalInstance = &ExternalInstance{
+		Host:                  "managed.postgres.example.com",
+		Port:                  6432,
+		DatabaseName:          "accounts",
+		RuntimeReadWriteRoles: []string{"app_tenant", "app_worker"},
+	}
+	destination := t.TempDir()
+	request := promotableDeploymentRequest(destination, nil, nil)
+	request.GetDeployment().GetKubernetes().Profile = builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_EPHEMERAL_LOCAL_APPLY_V1
+	request.GetDeployment().GetKubernetes().BuildContext.ImageDigest = ""
+	request.Configuration = testPostgresConfiguration("migration-owner", "owner-secret", "reader-secret", "writer-secret")
+
+	response, err := builder.Deploy(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	readWriteConnection := configurationValue(t, response.GetConfiguration(), readWriteConnectionKey)
+	require.Contains(t, readWriteConnection, "@managed.postgres.example.com:6432/accounts")
+
+	baseKustomization := readDeploymentFile(t, destination, "base", "kustomization.yaml")
+	require.NotContains(t, baseKustomization, "stateful-set.yaml")
+	require.NotContains(t, baseKustomization, "service.yaml")
+	require.Contains(t, baseKustomization, "job.yaml")
+	requireNoDeploymentFile(t, destination, "base", "stateful-set.yaml")
+	requireNoDeploymentFile(t, destination, "base", "service.yaml")
+	require.Contains(t, readDeploymentFile(t, destination, "base", "job.yaml"), "kind: Job")
+}
+
+func TestExternalInstanceDeploymentRejectsContractDrift(t *testing.T) {
+	tests := []struct {
+		name     string
+		binding  ExternalInstance
+		expected string
+	}{
+		{
+			name: "database name",
+			binding: ExternalInstance{
+				Host:                  "managed.postgres.example.com",
+				DatabaseName:          "billing",
+				RuntimeReadWriteRoles: []string{"app_tenant", "app_worker"},
+			},
+			expected: `external-instance database-name "billing" does not match declared database-name "accounts"`,
+		},
+		{
+			name: "runtime roles",
+			binding: ExternalInstance{
+				Host:                  "managed.postgres.example.com",
+				DatabaseName:          "accounts",
+				RuntimeReadWriteRoles: []string{"app_worker", "app_tenant"},
+			},
+			expected: "external-instance runtime-read-write-roles [app_worker app_tenant] do not match declared runtime-read-write-roles [app_tenant app_worker]",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			builder, _ := newDeploymentTestBuilder(t)
+			builder.DatabaseName = "accounts"
+			builder.RuntimeReadWriteRoles = []string{"app_tenant", "app_worker"}
+			builder.ExternalInstance = &test.binding
+
+			response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(
+				t.TempDir(),
+				nil,
+				promotablePostgresSecretReferences(),
+			))
+			require.NoError(t, err)
+			require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
+			require.Contains(t, response.GetState().GetMessage(), test.expected)
+		})
+	}
+}
+
 // assertBootstrapJobDeadline pins the elapsed-time bound on the Job itself.
 // backoffLimit counts failed pods and cannot stop a container that is still
 // running, so it is not a substitute.

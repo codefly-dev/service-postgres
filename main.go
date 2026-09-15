@@ -35,6 +35,12 @@ type Settings struct {
 	DatabaseName string `yaml:"database-name"`
 	HotReload    bool   `yaml:"hot-reload"`
 
+	// ExternalInstance binds deployed workloads to a Postgres server provisioned
+	// outside this service. DatabaseName and RuntimeReadWriteRoles attest that the
+	// environment binding targets the same logical database contract declared by
+	// this service.
+	ExternalInstance *ExternalInstance `yaml:"external-instance"`
+
 	// AuthMode selects how runtime login principals authenticate. Empty is the
 	// default password mode: the service owns password-authenticated login
 	// roles and exports credentialed connection strings. "external-identity" is
@@ -139,6 +145,13 @@ type Settings struct {
 	// probing, connection establishment, migration locking and statements, and
 	// the deployed bootstrap Job. See Timeouts for the keys and defaults.
 	Timeouts Timeouts `yaml:"timeouts"`
+}
+
+type ExternalInstance struct {
+	Host                  string   `yaml:"host"`
+	Port                  uint16   `yaml:"port"`
+	DatabaseName          string   `yaml:"database-name"`
+	RuntimeReadWriteRoles []string `yaml:"runtime-read-write-roles"`
 }
 
 // MigrationSource declares one additional service contributing migrations to
@@ -253,6 +266,7 @@ func validatePlatform(field, value string) error {
 
 type DeploymentTemplateParameters struct {
 	WithBootstrap                bool
+	ExternalInstance             bool
 	ManagedImage                 string
 	BootstrapJobName             string
 	DatabaseName                 string

@@ -9,8 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -549,6 +552,7 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 	}
 	parameters := &DeploymentTemplateParameters{
 		WithBootstrap:               true,
+		ExternalInstance:            s.Settings.ExternalInstance != nil,
 		ManagedImage:                s.dockerImage().FullName(),
 		DatabaseName:                s.DatabaseName,
 		BootstrapJobDeadlineSeconds: s.Settings.Timeouts.BootstrapJobSeconds(),
@@ -649,12 +653,7 @@ func (s *Builder) prepareDeployment(
 	parameters *DeploymentTemplateParameters,
 ) (*v0.Configuration, error) {
 	req := deployment.Request
-	instance, err := resources.FindNetworkInstanceInNetworkMappings(
-		ctx,
-		req.GetNetworkMappings(),
-		s.TcpEndpoint,
-		resources.NewPublicNetworkAccess(),
-	)
+	instance, err := s.deploymentNetworkInstance(ctx, req.GetNetworkMappings())
 	if err != nil {
 		return nil, err
 	}
@@ -689,6 +688,57 @@ func (s *Builder) prepareDeployment(
 		resources.Env(migrationConnectionEnvironmentKey, ownerConnection),
 	)
 	return configuration, nil
+}
+
+func (s *Builder) deploymentNetworkInstance(
+	ctx context.Context,
+	mappings []*v0.NetworkMapping,
+) (*v0.NetworkInstance, error) {
+	binding := s.Settings.ExternalInstance
+	if binding == nil {
+		return resources.FindNetworkInstanceInNetworkMappings(
+			ctx,
+			mappings,
+			s.TcpEndpoint,
+			resources.NewPublicNetworkAccess(),
+		)
+	}
+	if binding.Host == "" {
+		return nil, fmt.Errorf("external-instance host is required")
+	}
+	if binding.Host != strings.TrimSpace(binding.Host) ||
+		strings.ContainsAny(binding.Host, " \t\r\n/?#") ||
+		strings.Contains(binding.Host, "://") ||
+		(strings.Contains(binding.Host, ":") && net.ParseIP(binding.Host) == nil) {
+		return nil, fmt.Errorf("external-instance host %q must be a hostname or IP address without a scheme, port, or path", binding.Host)
+	}
+	if binding.DatabaseName != s.DatabaseName {
+		return nil, fmt.Errorf("external-instance database-name %q does not match declared database-name %q", binding.DatabaseName, s.DatabaseName)
+	}
+	readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
+	declaredRoles, err := normalizedRuntimeReadWriteRoles(s.RuntimeReadWriteRoles, readOnlyRole, readWriteRole)
+	if err != nil {
+		return nil, err
+	}
+	boundRoles, err := normalizedRuntimeReadWriteRoles(binding.RuntimeReadWriteRoles, readOnlyRole, readWriteRole)
+	if err != nil {
+		return nil, fmt.Errorf("external-instance: %w", err)
+	}
+	if !slices.Equal(boundRoles, declaredRoles) {
+		return nil, fmt.Errorf("external-instance runtime-read-write-roles %v do not match declared runtime-read-write-roles %v", boundRoles, declaredRoles)
+	}
+	port := binding.Port
+	if port == 0 {
+		port = 5432
+	}
+	address := net.JoinHostPort(binding.Host, strconv.Itoa(int(port)))
+	return &v0.NetworkInstance{
+		Access:   resources.NewPublicNetworkAccess(),
+		Hostname: binding.Host,
+		Host:     address,
+		Port:     uint32(port),
+		Address:  address,
+	}, nil
 }
 
 type promotableWorkloadSecretReferences struct {
