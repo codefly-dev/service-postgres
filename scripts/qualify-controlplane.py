@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+CHILD = ROOT / "libs" / "go"
 
 
 def main():
@@ -98,12 +99,14 @@ def main():
             env["SERVICE_POSTGRES_FIXTURE_CONTAINER"] = container
             env["SERVICE_POSTGRES_MIGRATE_EXECUTABLE"] = migrate
             env["SERVICE_POSTGRES_BOOTSTRAP_EXECUTABLE"] = bootstrap
+            # Only child tests follow: never inherit a parent -modfile or workspace.
+            env.update(GOWORK="off", GOENV="off", GOFLAGS="-mod=readonly -p=2")
             subprocess.run(["go", "test", "-race", "-count=1", "-v", "-tags", "controlplaneintegration",
-                            "./libs/go/bootstrap"], cwd=ROOT, env=env, check=True, timeout=120)
+                            "./bootstrap"], cwd=CHILD, env=env, check=True, timeout=120)
         print(f"Fixture image: {image}", flush=True)
         subprocess.run(
-            ["go", "test", "-race", "-count=1", "-v", "./libs/go", "-run", "^TestRestrictedSession"],
-            cwd=ROOT,
+            ["go", "test", "-race", "-count=1", "-v", ".", "-run", "^TestRestrictedSession"],
+            cwd=CHILD,
             env=env,
             check=True,
             timeout=120,
@@ -117,9 +120,9 @@ def main():
                 "-v",
                 "-tags",
                 "controlplaneintegration",
-                "./libs/go/controlplane",
+                "./controlplane",
             ],
-            cwd=ROOT,
+            cwd=CHILD,
             env=env,
             check=True,
             timeout=300,

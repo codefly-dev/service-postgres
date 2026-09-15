@@ -40,7 +40,7 @@ service-account/transport data; it does not add environment conditionals.
 
 This public interface is independent of schema-plan v1/v2 and delegated read-only
 roles. It neither upgrades a schema-plan engine nor changes historical migrations.
-Run `go test ./libs/go/workloadattachment` for malformed contracts, strict fields,
+From `libs/go`, run `go test ./workloadattachment` for malformed contracts, strict fields,
 security/reference denials, canonical seal consistency and second-target coverage.
 Cloud connectivity, IAM grants and database privileges still require their normal
 owner qualification; passing attachment validation makes none of those claims.

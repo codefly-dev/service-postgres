@@ -22,8 +22,22 @@ permissions:
   contents: read
 
 jobs:
+  runtime-library:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: libs/go/go.mod
+          cache: false
+      - name: Qualify standalone runtime library
+        run: python3 scripts/qualify-runtime-library.py
+
   image:
     if: github.event_name == 'push'
+    needs: runtime-library
     permissions:
       contents: read
       packages: write
@@ -103,6 +117,9 @@ jobs:
         working-directory: release-source
         env:
           GOFLAGS: -modfile=${{ runner.temp }}/release.mod
+      - name: Qualify standalone runtime library when present in release source
+        if: hashFiles('release-source/libs/go/go.mod') != ''
+        run: python3 scripts/qualify-runtime-library.py --source-root release-source
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a
         with:

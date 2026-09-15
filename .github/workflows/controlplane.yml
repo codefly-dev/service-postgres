@@ -35,6 +35,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go vet ./libs/go ./libs/go/controlplane ./libs/go/bootstrap ./libs/go/schemaplan ./cmd/managed-bootstrap
+      - run: go vet ./...
+        working-directory: libs/go
+        env:
+          GOWORK: "off"
+          GOENV: "off"
+          GOFLAGS: -mod=readonly
+      - run: go vet ./cmd/managed-bootstrap
       - run: docker pull "$POSTGRES_TEST_IMAGE"
       - run: python3 scripts/qualify-controlplane.py
