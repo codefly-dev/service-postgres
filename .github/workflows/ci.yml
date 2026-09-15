@@ -55,6 +55,9 @@ jobs:
           cache: false
           go-version-file: go.mod
 
+      - name: Qualify standalone runtime library
+        run: python3 scripts/qualify-runtime-library.py
+
       # Registered before the tests, not just before the multi-arch publish: the
       # bootstrap image build test verifies linux/arm64, which needs emulation on an
       # amd64 runner. Without this the arm64 case would skip and a wrong arm64

@@ -191,7 +191,8 @@ multiple hosts must be replaced with a reviewed explicit binding before enabling
 a profile. No database migration, role grant, schema-plan or engine/image update
 is performed by this API.
 
-Local qualification (requires a native PostgreSQL installation, Go and OpenSSL):
+Local qualification from the repository root (requires a native PostgreSQL
+installation, Go and OpenSSL):
 
 ```sh
 POSTGRES_BIN=/path/to/postgres/bin python3 qualification/connection-profiles/run.py \
@@ -201,5 +202,5 @@ POSTGRES_BIN=/path/to/postgres/bin python3 qualification/connection-profiles/run
 This creates disposable TLS and Unix-socket PostgreSQL fixtures and checks actual
 identity/role, RLS, maintenance separation, token reconnect, closure, wrong CA and
 hostname denial, and redacted failures. It does not qualify a real identity proxy
-or hosted provider. Ordinary `go test ./libs/go/...` also runs the parser matrix;
+or hosted provider. From `libs/go`, ordinary `go test ./...` also runs the parser matrix;
 the native fixture requires the runner and records whether its test actually ran.

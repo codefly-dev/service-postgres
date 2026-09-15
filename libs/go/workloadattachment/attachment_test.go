@@ -9,7 +9,7 @@ import (
 
 func fixture(t *testing.T) []byte {
 	t.Helper()
-	data, err := os.ReadFile("../../../contracts/workload-attachment/example.json")
+	data, err := os.ReadFile("testdata/example.json")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,0 +1,83 @@
+{
+  "binding": {
+    "access": "writer",
+    "binding_id": "customer-east/inference/writer-v1",
+    "connection": {
+      "kind": "local-identity-proxy",
+      "port": 5432,
+      "socket_directory": "/cloudsql/example-project:us-east1:customer-db"
+    },
+    "database": "inference",
+    "primitive": "database",
+    "user": "example-writer@example-project.iam"
+  },
+  "digest": "sha256:aa089095e412dcb31c0ff1b2e32b007258569b25ed1497f5393b2827f374485e",
+  "init_containers": [
+    {
+      "args": [
+        "--impersonate-service-account=example-writer@example-project.iam.gserviceaccount.com",
+        "--auto-iam-authn",
+        "--private-ip",
+        "--unix-socket=/cloudsql",
+        "--exit-zero-on-sigterm",
+        "example-project:us-east1:customer-db"
+      ],
+      "image": "gcr.io/cloud-sql-connectors/cloud-sql-proxy@sha256:10baeffb98e5a0318b03891049c63aec08ecd99b7aae944227d69bc9d0bbf1e6",
+      "name": "proxy",
+      "resources": {
+        "limits": {
+          "cpu": "250m",
+          "memory": "256Mi"
+        },
+        "requests": {
+          "cpu": "25m",
+          "memory": "64Mi"
+        }
+      },
+      "restartPolicy": "Always",
+      "securityContext": {
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+        {
+          "mountPath": "/cloudsql",
+          "name": "socket"
+        }
+      ]
+    }
+  ],
+  "namespace": "inference-test",
+  "pod_security_context": {
+    "fsGroup": 65532,
+    "runAsGroup": 65532,
+    "runAsNonRoot": true,
+    "runAsUser": 65532,
+    "seccompProfile": {
+      "type": "RuntimeDefault"
+    }
+  },
+  "schema_version": "codefly.dev/postgres-workload-attachment/v1",
+  "service_account": "inference-runtime",
+  "volume_mounts": [
+    {
+      "mountPath": "/cloudsql",
+      "name": "socket",
+      "readOnly": true
+    }
+  ],
+  "volumes": [
+    {
+      "emptyDir": {
+        "medium": "Memory",
+        "sizeLimit": "1Mi"
+      },
+      "name": "socket"
+    }
+  ]
+}
