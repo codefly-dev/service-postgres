@@ -1,0 +1,118 @@
+{
+  "binding": {
+    "access": "writer",
+    "binding_id": "customer-east/inference/writer-v1",
+    "connection": {
+      "connection_limit_scope": "pod",
+      "kind": "local-transaction-pool",
+      "max_db_connections": 20,
+      "pool_mode": "transaction",
+      "port": 5432,
+      "session_state": "transaction-local-only",
+      "socket_directory": "/pooler",
+      "startup_parameters": [
+        "application_name",
+        "client_encoding",
+        "datestyle",
+        "standard_conforming_strings",
+        "timezone"
+      ]
+    },
+    "database": "inference",
+    "primitive": "database",
+    "user": "example-writer@example-project.iam"
+  },
+  "digest": "sha256:73aa0bc75d7dc246a471f42a73eef652fff66e3fbf745e0d8d767572d7b4d80c",
+  "init_containers": [
+    {
+      "args": [
+        "--impersonate-service-account=example-writer@example-project.iam.gserviceaccount.com",
+        "--auto-iam-authn",
+        "--private-ip",
+        "--unix-socket=/cloudsql",
+        "--exit-zero-on-sigterm",
+        "example-project:us-east1:customer-db"
+      ],
+      "image": "gcr.io/cloud-sql-connectors/cloud-sql-proxy@sha256:10baeffb98e5a0318b03891049c63aec08ecd99b7aae944227d69bc9d0bbf1e6",
+      "name": "proxy",
+      "resources": {
+        "limits": {"cpu": "250m", "memory": "256Mi"},
+        "requests": {"cpu": "25m", "memory": "64Mi"}
+      },
+      "restartPolicy": "Always",
+      "securityContext": {
+        "allowPrivilegeEscalation": false,
+        "capabilities": {"drop": ["ALL"]},
+        "readOnlyRootFilesystem": true
+      },
+      "volumeMounts": [
+        {"mountPath": "/cloudsql", "name": "proxy-socket"}
+      ]
+    },
+    {
+      "args": [
+        "/bin/sh",
+        "-ec",
+        "printf '%s\\n' \"$1\" > /pooler/pgbouncer.ini; exec /opt/bitnami/pgbouncer/bin/pgbouncer /pooler/pgbouncer.ini",
+        "pooler",
+        "[databases]\ninference = host=/cloudsql/example-project:us-east1:customer-db port=5432 dbname=inference user=example-writer@example-project.iam max_db_connections=20 connect_query='SET statement_timeout=30000; SET idle_in_transaction_session_timeout=60000'\n[pgbouncer]\nlisten_addr =\nlisten_port = 5432\nunix_socket_dir = /pooler\nunix_socket_mode = 0770\nauth_type = trust\npool_mode = transaction\nserver_reset_query = DISCARD ALL; SET statement_timeout=30000; SET idle_in_transaction_session_timeout=60000\nserver_reset_query_always = 1\nmax_client_conn = 100\ndefault_pool_size = 10\nmax_prepared_statements = 200\npidfile = /pooler/pgbouncer.pid"
+      ],
+      "image": "docker.io/bitnamilegacy/pgbouncer@sha256:6d366c5bcce08039ae9e1f595ab06e0396eca687027e75c6dd450c4f1dbad850",
+      "name": "pooler",
+      "resources": {
+        "limits": {"cpu": "250m", "memory": "128Mi"},
+        "requests": {"cpu": "25m", "memory": "32Mi"}
+      },
+      "restartPolicy": "Always",
+      "securityContext": {
+        "allowPrivilegeEscalation": false,
+        "capabilities": {"drop": ["ALL"]},
+        "readOnlyRootFilesystem": true
+      },
+      "startupProbe": {
+        "exec": {
+          "command": [
+            "/opt/bitnami/postgresql/bin/psql",
+            "-X",
+            "-w",
+            "-qAt",
+            "-h",
+            "/pooler",
+            "-p",
+            "5432",
+            "-d",
+            "inference",
+            "-U",
+            "example-writer@example-project.iam",
+            "-c",
+            "SELECT 1"
+          ]
+        },
+        "failureThreshold": 30,
+        "periodSeconds": 1
+      },
+      "volumeMounts": [
+        {"mountPath": "/cloudsql", "name": "proxy-socket", "readOnly": true},
+        {"mountPath": "/pooler", "name": "pooler-socket"},
+        {"mountPath": "/tmp", "name": "pooler-socket"}
+      ]
+    }
+  ],
+  "namespace": "inference-test",
+  "pod_security_context": {
+    "fsGroup": 65532,
+    "runAsGroup": 65532,
+    "runAsNonRoot": true,
+    "runAsUser": 65532,
+    "seccompProfile": {"type": "RuntimeDefault"}
+  },
+  "schema_version": "codefly.dev/postgres-workload-attachment/v2",
+  "service_account": "inference-runtime",
+  "volume_mounts": [
+    {"mountPath": "/pooler", "name": "pooler-socket", "readOnly": true}
+  ],
+  "volumes": [
+    {"emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}, "name": "proxy-socket"},
+    {"emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}, "name": "pooler-socket"}
+  ]
+}

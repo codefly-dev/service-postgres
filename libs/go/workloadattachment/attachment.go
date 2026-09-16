@@ -19,12 +19,20 @@ import (
 	"unicode/utf8"
 )
 
-const Version = "codefly.dev/postgres-workload-attachment/v1"
+const (
+	Version   = "codefly.dev/postgres-workload-attachment/v1"
+	VersionV2 = "codefly.dev/postgres-workload-attachment/v2"
+)
 
 type Connection struct {
-	Kind            string `json:"kind"`
-	SocketDirectory string `json:"socket_directory"`
-	Port            int    `json:"port"`
+	Kind                 string   `json:"kind"`
+	SocketDirectory      string   `json:"socket_directory"`
+	Port                 int      `json:"port"`
+	PoolMode             string   `json:"pool_mode,omitempty"`
+	SessionState         string   `json:"session_state,omitempty"`
+	ConnectionLimitScope string   `json:"connection_limit_scope,omitempty"`
+	MaxDBConnections     int      `json:"max_db_connections,omitempty"`
+	StartupParameters    []string `json:"startup_parameters,omitempty"`
 }
 type Binding struct {
 	Primitive  string     `json:"primitive"`
@@ -73,14 +81,23 @@ type Resources struct {
 	Requests ResourceValues `json:"requests"`
 	Limits   ResourceValues `json:"limits"`
 }
+type ExecAction struct {
+	Command []string `json:"command"`
+}
+type StartupProbe struct {
+	Exec             ExecAction `json:"exec"`
+	FailureThreshold int        `json:"failureThreshold"`
+	PeriodSeconds    int        `json:"periodSeconds"`
+}
 type Sidecar struct {
-	Name            string    `json:"name"`
-	Image           string    `json:"image"`
-	RestartPolicy   string    `json:"restartPolicy"`
-	Args            []string  `json:"args"`
-	VolumeMounts    []Mount   `json:"volumeMounts"`
-	SecurityContext Security  `json:"securityContext"`
-	Resources       Resources `json:"resources"`
+	Name            string        `json:"name"`
+	Image           string        `json:"image"`
+	RestartPolicy   string        `json:"restartPolicy"`
+	Args            []string      `json:"args"`
+	VolumeMounts    []Mount       `json:"volumeMounts"`
+	SecurityContext Security      `json:"securityContext"`
+	Resources       Resources     `json:"resources"`
+	StartupProbe    *StartupProbe `json:"startupProbe,omitempty"`
 }
 type Attachment struct {
 	SchemaVersion      string      `json:"schema_version"`
@@ -283,11 +300,17 @@ func (a *Attachment) computedDigest() (string, error) {
 // argument semantics and approved identity matching belong to its platform producer.
 func (a *Attachment) Validate() error {
 	fail := func() error { return fmt.Errorf("invalid PostgreSQL workload attachment") }
-	if a.SchemaVersion != Version || !namePattern.MatchString(a.Namespace) || !namePattern.MatchString(a.ServiceAccount) {
+	if (a.SchemaVersion != Version && a.SchemaVersion != VersionV2) || !namePattern.MatchString(a.Namespace) || !namePattern.MatchString(a.ServiceAccount) {
 		return fail()
 	}
 	b := a.Binding
-	if b.Primitive != "database" || (b.Access != "reader" && b.Access != "writer" && b.Access != "maintenance") || !bounded(b.ID) || !bounded(b.Database) || !bounded(b.User) || b.Connection.Kind != "local-identity-proxy" || !validPath(b.Connection.SocketDirectory) || b.Connection.Port < 1 || b.Connection.Port > 65535 {
+	if b.Primitive != "database" || (b.Access != "reader" && b.Access != "writer" && b.Access != "maintenance") || !bounded(b.ID) || !bounded(b.Database) || !bounded(b.User) || !validPath(b.Connection.SocketDirectory) || b.Connection.Port < 1 || b.Connection.Port > 65535 {
+		return fail()
+	}
+	connection := b.Connection
+	legacyConnection := connection.Kind == "local-identity-proxy" && connection.PoolMode == "" && connection.SessionState == "" && connection.ConnectionLimitScope == "" && connection.MaxDBConnections == 0 && connection.StartupParameters == nil
+	pooledConnection := connection.Kind == "local-transaction-pool" && connection.PoolMode == "transaction" && connection.SessionState == "transaction-local-only" && connection.ConnectionLimitScope == "pod" && connection.MaxDBConnections > 0 && connection.MaxDBConnections <= 100 && reflect.DeepEqual(connection.StartupParameters, []string{"application_name", "client_encoding", "datestyle", "standard_conforming_strings", "timezone"})
+	if (a.SchemaVersion == Version && !legacyConnection) || (a.SchemaVersion == VersionV2 && !pooledConnection) {
 		return fail()
 	}
 	p := a.PodSecurityContext
@@ -304,11 +327,11 @@ func (a *Attachment) Validate() error {
 		}
 		volumes[v.Name] = true
 	}
-	checkMounts := func(mounts []Mount, consumer bool) bool {
+	checkMounts := func(mounts []Mount, consumer bool, repeatedVolumes bool) bool {
 		seen := map[string]bool{}
 		paths := []string{}
 		for _, m := range mounts {
-			if !volumes[m.Name] || seen[m.Name] || !validPath(m.MountPath) || (consumer && (m.ReadOnly == nil || !*m.ReadOnly)) {
+			if !volumes[m.Name] || (seen[m.Name] && !repeatedVolumes) || !validPath(m.MountPath) || (consumer && (m.ReadOnly == nil || !*m.ReadOnly)) {
 				return false
 			}
 			seen[m.Name] = true
@@ -321,7 +344,7 @@ func (a *Attachment) Validate() error {
 		}
 		return len(mounts) > 0 && len(mounts) <= 16
 	}
-	if !checkMounts(a.VolumeMounts, true) {
+	if !checkMounts(a.VolumeMounts, true, false) {
 		return fail()
 	}
 	socketMounted := false
@@ -334,8 +357,9 @@ func (a *Attachment) Validate() error {
 		return fail()
 	}
 	containers := map[string]bool{}
+	startupProbes := 0
 	for _, c := range a.InitContainers {
-		if !namePattern.MatchString(c.Name) || containers[c.Name] || !imagePattern.MatchString(c.Image) || c.RestartPolicy != "Always" || len(c.Args) == 0 || len(c.Args) > 16 || !checkMounts(c.VolumeMounts, false) {
+		if !namePattern.MatchString(c.Name) || containers[c.Name] || !imagePattern.MatchString(c.Image) || c.RestartPolicy != "Always" || len(c.Args) == 0 || len(c.Args) > 16 || !checkMounts(c.VolumeMounts, false, a.SchemaVersion == VersionV2) {
 			return fail()
 		}
 		containers[c.Name] = true
@@ -344,7 +368,7 @@ func (a *Attachment) Validate() error {
 			return fail()
 		}
 		for _, argument := range c.Args {
-			if !bounded(argument) {
+			if len(argument) == 0 || len(argument) > 1024 || strings.ContainsAny(argument, "\x00\r") || a.SchemaVersion == Version && strings.Contains(argument, "\n") {
 				return fail()
 			}
 		}
@@ -353,6 +377,21 @@ func (a *Attachment) Validate() error {
 				return fail()
 			}
 		}
+		if c.StartupProbe != nil {
+			startupProbes++
+			probe := c.StartupProbe
+			if len(probe.Exec.Command) == 0 || len(probe.Exec.Command) > 16 || probe.FailureThreshold < 1 || probe.FailureThreshold > 60 || probe.PeriodSeconds < 1 || probe.PeriodSeconds > 60 {
+				return fail()
+			}
+			for _, argument := range probe.Exec.Command {
+				if !bounded(argument) {
+					return fail()
+				}
+			}
+		}
+	}
+	if (a.SchemaVersion == Version && startupProbes != 0) || (a.SchemaVersion == VersionV2 && startupProbes != 1) {
+		return fail()
 	}
 	digest, err := a.computedDigest()
 	if err != nil || digest != a.Digest {
