@@ -1,3 +1,4 @@
+{{- if not .Deployment.Parameters.ExternalInstance }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -11,7 +12,6 @@ spec:
       port: 5432
       targetPort: 5432
   # Headless — clients reach postgres via the StatefulSet pod's stable
-  # DNS (<svc>-0.<svc>.<ns>.svc). For prod-style RDS deployments,
-  # replace this entire kustomize layer with an ExternalName Service
-  # in the module-level environment overlay.
+  # DNS (<svc>-0.<svc>.<ns>.svc).
   clusterIP: None
+{{- end }}

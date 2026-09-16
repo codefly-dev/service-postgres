@@ -15,6 +15,14 @@ func fixture(t *testing.T) []byte {
 	}
 	return data
 }
+func pooledFixture(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile("testdata/pooled.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
 func TestPublicFixtureAndCanonicalSeal(t *testing.T) {
 	a, err := Parse(fixture(t))
 	if err != nil {
@@ -34,6 +42,49 @@ func TestPublicFixtureAndCanonicalSeal(t *testing.T) {
 	after, _ := json.Marshal(a)
 	if !bytes.Equal(before, after) {
 		t.Fatal("validation mutated attachment")
+	}
+}
+func TestPooledFixtureAndCanonicalSeal(t *testing.T) {
+	a, err := Parse(pooledFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := a.Digest
+	if err = a.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if a.Digest != original {
+		t.Fatal("Python/Go canonical digests diverge")
+	}
+}
+
+func TestPooledConnectionFailsClosed(t *testing.T) {
+	cases := []func(*Attachment){
+		func(a *Attachment) { a.SchemaVersion = Version },
+		func(a *Attachment) { a.Binding.Connection.Kind = "local-identity-proxy" },
+		func(a *Attachment) { a.Binding.Connection.PoolMode = "session" },
+		func(a *Attachment) { a.Binding.Connection.SessionState = "session-persistent" },
+		func(a *Attachment) { a.Binding.Connection.ConnectionLimitScope = "server" },
+		func(a *Attachment) { a.Binding.Connection.MaxDBConnections = 0 },
+		func(a *Attachment) { a.Binding.Connection.MaxDBConnections = 101 },
+		func(a *Attachment) {
+			a.Binding.Connection.StartupParameters = append(a.Binding.Connection.StartupParameters, "options")
+		},
+		func(a *Attachment) { a.InitContainers[1].StartupProbe = nil },
+		func(a *Attachment) { a.InitContainers[0].StartupProbe = a.InitContainers[1].StartupProbe },
+		func(a *Attachment) { a.InitContainers[1].StartupProbe.Exec.Command = nil },
+		func(a *Attachment) { a.InitContainers[1].Args[4] += "\runsafe" },
+	}
+	for i, change := range cases {
+		a, err := Parse(pooledFixture(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		change(a)
+		_ = a.Seal()
+		if a.Validate() == nil {
+			t.Fatalf("case%d accepted", i)
+		}
 	}
 }
 func TestUnknownFieldsAndExtraDocument(t *testing.T) {
@@ -108,6 +159,15 @@ func TestMountPathsMustNotOverlap(t *testing.T) {
 				t.Fatalf("consumer=%t overlapping path %s accepted", consumer, path)
 			}
 		}
+	}
+	a, err := Parse(pooledFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.InitContainers[1].VolumeMounts[2].MountPath = "/pooler/nested"
+	_ = a.Seal()
+	if a.Validate() == nil {
+		t.Fatal("pooled repeated volume with overlapping paths accepted")
 	}
 }
 

@@ -5,11 +5,17 @@
 # them are serialized by a single advisory lock.
 set -eu
 
-connection={{ printf "\"${%s:-}\"" .MigrationConnectionEnvironment }}
-if [ -z "${connection}" ]; then
-    echo "bootstrap: {{ .MigrationConnectionEnvironment }} is not set" >&2
-    exit 1
+if [ "${CODEFLY_POSTGRES_EXTERNAL_BINDING:-}" = "true" ]; then
+    connection="postgresql:///"
+else
+    connection={{ printf "\"${%s:-}\"" .MigrationConnectionEnvironment }}
+    if [ -z "${connection}" ]; then
+        echo "bootstrap: {{ .MigrationConnectionEnvironment }} is not set" >&2
+        exit 1
+    fi
 fi
+{{ printf "%s" .MigrationConnectionEnvironment }}="${connection}"
+export {{ printf "%s" .MigrationConnectionEnvironment }}
 
 # Each lineage is applied to its own ledger, which golang-migrate takes as a
 # query parameter -- and the connection string may already carry one.
@@ -50,3 +56,45 @@ sha256sum -c sources.sha256
 {{- end }}
 
 psql "${connection}" --no-psqlrc --set=ON_ERROR_STOP=1 --file=/app/bootstrap.sql
+
+if [ "${CODEFLY_POSTGRES_EXTERNAL_BINDING:-}" = "true" ]; then
+    validate_runtime_connection() {
+        label=$1
+        runtime_connection=$2
+        expected_role=$3
+        if [ -z "${runtime_connection}" ]; then
+            echo "bootstrap: ${label} connection is not set" >&2
+            exit 78
+        fi
+        actual=$(psql "${runtime_connection}" --no-psqlrc --tuples-only --no-align --set=ON_ERROR_STOP=1 \
+            --command="SELECT current_database() || '|' || session_user") || {
+            echo "bootstrap: ${label} connection cannot reach the bound database" >&2
+            exit 78
+        }
+        if [ "${actual}" != "${POSTGRES_DB}|${expected_role}" ]; then
+            echo "bootstrap: ${label} connection resolves to ${actual}, expected ${POSTGRES_DB}|${expected_role}" >&2
+            exit 78
+        fi
+        connection_info=$(psql "${runtime_connection}" --no-psqlrc --command='\conninfo' 2>&1) || {
+            echo "bootstrap: cannot inspect ${label} connection target" >&2
+            exit 78
+        }
+        case "${connection_info}" in
+            *"host \"${CODEFLY_POSTGRES_EXPECTED_HOST}\""*) ;;
+            *) echo "bootstrap: ${label} connection does not target host ${CODEFLY_POSTGRES_EXPECTED_HOST}" >&2; exit 78 ;;
+        esac
+        case "${connection_info}" in
+            *"port \"${CODEFLY_POSTGRES_EXPECTED_PORT}\""*) ;;
+            *) echo "bootstrap: ${label} connection does not target port ${CODEFLY_POSTGRES_EXPECTED_PORT}" >&2; exit 78 ;;
+        esac
+    }
+
+    validate_runtime_connection \
+        read-only \
+        "${CODEFLY_POSTGRES_READ_ONLY_CONNECTION:-}" \
+        "${CODEFLY_POSTGRES_EXPECTED_READ_ONLY_ROLE}"
+    validate_runtime_connection \
+        read-write \
+        "${CODEFLY_POSTGRES_READ_WRITE_CONNECTION:-}" \
+        "${CODEFLY_POSTGRES_EXPECTED_READ_WRITE_ROLE}"
+fi

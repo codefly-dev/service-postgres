@@ -22,6 +22,8 @@ const (
 	// migrationConnectionEnvironmentKey is an internal bootstrap-job secret.
 	// It is never part of the service's exported Configuration contract.
 	migrationConnectionEnvironmentKey = "CODEFLY_POSTGRES_MIGRATION_CONNECTION"
+	externalReadOnlyConnectionKey     = "CODEFLY_POSTGRES_READ_ONLY_CONNECTION"
+	externalReadWriteConnectionKey    = "CODEFLY_POSTGRES_READ_WRITE_CONNECTION"
 
 	// authModePassword and authModeExternalIdentity are the supported values of
 	// Settings.AuthMode. Empty is treated as authModePassword.

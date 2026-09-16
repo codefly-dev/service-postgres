@@ -1,7 +1,7 @@
-# PostgreSQL workload attachment v1
+# PostgreSQL workload attachment
 
-`v1.schema.json` is the public, transport-neutral JSON envelope for a PostgreSQL
-local identity proxy's pod attachment. `libs/go/workloadattachment` provides a
+`v1.schema.json` and `v2.schema.json` are the public, transport-neutral JSON
+envelopes for a PostgreSQL pod attachment. `libs/go/workloadattachment` provides a
 strict parser, validation and integrity sealing. The checked-in `example.json`
 is synthetic and has a cross-language tested canonical digest.
 
@@ -31,6 +31,11 @@ owning primitive/platform binding. Group names and grant algorithms are never
 reconstructed here. Cloud-specific proxy arguments and live delegation validation
 remain with the existing platform producer; SQL access policy remains with the
 PostgreSQL control-plane and schema-plan engines.
+
+Version 2 adds a transaction-pooling sidecar in front of the local identity proxy.
+It declares the pod-scoped database connection ceiling and the startup parameters
+that can safely cross transaction pooling, and requires exactly one bounded startup
+probe. Version 1 remains strict and does not accept the added fields.
 
 A consumer checks all referenced volumes and confirms its configured socket lives
 under a read-only application mount. Changed identity, socket or security fields
