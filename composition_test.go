@@ -38,13 +38,14 @@ runtime-schemas:
 runtime-read-write-roles:
   - app_tenant
   - app_worker
-external-instance:
-  host: postgres.production.example.com
-  port: 6432
-  database-name: myapp
-  runtime-read-write-roles:
-    - app_tenant
-    - app_worker
+external-instances:
+  production:
+    host: postgres.production.example.com
+    port: 6432
+    database-name: myapp
+    runtime-read-write-roles:
+      - app_tenant
+      - app_worker
 `)
 	var s Settings
 	if err := yaml.Unmarshal(src, &s); err != nil {
@@ -68,13 +69,14 @@ external-instance:
 	if len(s.RuntimeReadWriteRoles) != 2 || s.RuntimeReadWriteRoles[0] != "app_tenant" || s.RuntimeReadWriteRoles[1] != "app_worker" {
 		t.Errorf("RuntimeReadWriteRoles: got %v", s.RuntimeReadWriteRoles)
 	}
-	if s.ExternalInstance == nil || s.ExternalInstance.Host != "postgres.production.example.com" || s.ExternalInstance.Port != 6432 {
-		t.Errorf("ExternalInstance: got %+v", s.ExternalInstance)
+	external, ok := s.ExternalInstances["production"]
+	if !ok || external.Host != "postgres.production.example.com" || external.Port != 6432 {
+		t.Errorf("ExternalInstances: got %+v", s.ExternalInstances)
 	}
-	if s.ExternalInstance.DatabaseName != "myapp" {
-		t.Errorf("ExternalInstance.DatabaseName: got %q", s.ExternalInstance.DatabaseName)
+	if external.DatabaseName != "myapp" {
+		t.Errorf("ExternalInstance.DatabaseName: got %q", external.DatabaseName)
 	}
-	if len(s.ExternalInstance.RuntimeReadWriteRoles) != 2 || s.ExternalInstance.RuntimeReadWriteRoles[0] != "app_tenant" || s.ExternalInstance.RuntimeReadWriteRoles[1] != "app_worker" {
-		t.Errorf("ExternalInstance.RuntimeReadWriteRoles: got %v", s.ExternalInstance.RuntimeReadWriteRoles)
+	if len(external.RuntimeReadWriteRoles) != 2 || external.RuntimeReadWriteRoles[0] != "app_tenant" || external.RuntimeReadWriteRoles[1] != "app_worker" {
+		t.Errorf("ExternalInstance.RuntimeReadWriteRoles: got %v", external.RuntimeReadWriteRoles)
 	}
 }

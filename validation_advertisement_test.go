@@ -148,4 +148,13 @@ func TestSyncProvesNoDriftInDryRun(t *testing.T) {
 	require.Equal(t, builderv0.SyncStatus_SUCCESS, response.GetState().GetState(),
 		response.GetState().GetMessage())
 	require.Empty(t, response.GetChangedFiles())
+
+	builder.ExternalInstances = map[string]ExternalInstance{"production": {
+		Host:         "managed.postgres.example.com",
+		DatabaseName: builder.DatabaseName + "-drifted",
+	}}
+	response, err = builder.Sync(t.Context(), &builderv0.SyncRequest{DryRun: true})
+	require.NoError(t, err)
+	require.Equal(t, builderv0.SyncStatus_ERROR, response.GetState().GetState())
+	require.Contains(t, response.GetState().GetMessage(), "does not match declared database-name")
 }

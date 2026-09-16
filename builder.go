@@ -107,6 +107,11 @@ func (s *Builder) Sync(ctx context.Context, req *builderv0.SyncRequest) (*builde
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
+	for environment := range s.Settings.ExternalInstances {
+		if _, err := s.externalInstance(environment); err != nil {
+			return s.Builder.SyncError(err)
+		}
+	}
 	return s.Builder.SyncResponse()
 }
 
@@ -552,7 +557,6 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 	}
 	parameters := &DeploymentTemplateParameters{
 		WithBootstrap:               true,
-		ExternalInstance:            s.Settings.ExternalInstance != nil,
 		ManagedImage:                s.dockerImage().FullName(),
 		DatabaseName:                s.DatabaseName,
 		BootstrapJobDeadlineSeconds: s.Settings.Timeouts.BootstrapJobSeconds(),
@@ -653,13 +657,34 @@ func (s *Builder) prepareDeployment(
 	parameters *DeploymentTemplateParameters,
 ) (*v0.Configuration, error) {
 	req := deployment.Request
-	instance, err := s.deploymentNetworkInstance(ctx, req.GetNetworkMappings())
+	instance, binding, err := s.deploymentNetworkInstance(
+		ctx,
+		req.GetNetworkMappings(),
+		req.GetEnvironment().GetName(),
+	)
 	if err != nil {
 		return nil, err
+	}
+	if binding != nil {
+		if s.externalIdentity() {
+			return nil, fmt.Errorf("external-instance deployment does not support auth-mode %q: managed bootstrap generation requires password authentication", authModeExternalIdentity)
+		}
+		readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
+		parameters.ExternalInstance = true
+		parameters.ExternalHost = binding.Host
+		parameters.ExternalPort = binding.port()
+		parameters.ExternalSSLMode = "prefer"
+		if s.WithoutSSL {
+			parameters.ExternalSSLMode = "disable"
+		}
+		parameters.ReadOnlyRole = readOnlyRole
+		parameters.ReadWriteRole = readWriteRole
+		parameters.ExternalBindingID = externalBindingID(req.GetEnvironment().GetName(), binding)
 	}
 	if services.IsRestrictedOutputProfile(deployment.Profile) {
 		workloadReferences, referencesErr := s.selectPromotableSecretReferences(
 			deployment.Kubernetes.GetSecretReferences(),
+			binding != nil,
 		)
 		if referencesErr != nil {
 			return nil, referencesErr
@@ -687,21 +712,56 @@ func (s *Builder) prepareDeployment(
 		resources.Env("POSTGRES_READ_WRITE_PASSWORD", s.readWritePassword),
 		resources.Env(migrationConnectionEnvironmentKey, ownerConnection),
 	)
+	if binding != nil {
+		deployment.AddSecrets(
+			resources.Env("PGUSER", s.postgresUser),
+			resources.Env("PGPASSWORD", s.postgresPassword),
+			resources.Env(externalReadOnlyConnectionKey, configurationValueByKey(configuration, readOnlyConnectionKey)),
+			resources.Env(externalReadWriteConnectionKey, configurationValueByKey(configuration, readWriteConnectionKey)),
+		)
+	}
 	return configuration, nil
 }
 
 func (s *Builder) deploymentNetworkInstance(
 	ctx context.Context,
 	mappings []*v0.NetworkMapping,
-) (*v0.NetworkInstance, error) {
-	binding := s.Settings.ExternalInstance
+	environment string,
+) (*v0.NetworkInstance, *ExternalInstance, error) {
+	binding, err := s.externalInstance(environment)
+	if err != nil {
+		return nil, nil, err
+	}
 	if binding == nil {
-		return resources.FindNetworkInstanceInNetworkMappings(
+		instance, findErr := resources.FindNetworkInstanceInNetworkMappings(
 			ctx,
 			mappings,
 			s.TcpEndpoint,
 			resources.NewPublicNetworkAccess(),
 		)
+		return instance, nil, findErr
+	}
+	port := binding.port()
+	address := net.JoinHostPort(binding.Host, strconv.Itoa(int(port)))
+	return &v0.NetworkInstance{
+		Access:   resources.NewPublicNetworkAccess(),
+		Hostname: binding.Host,
+		Host:     address,
+		Port:     uint32(port),
+		Address:  address,
+	}, binding, nil
+}
+
+func (s *Service) externalInstance(environment string) (*ExternalInstance, error) {
+	if len(s.Settings.ExternalInstances) == 0 {
+		return nil, nil
+	}
+	if strings.TrimSpace(environment) == "" {
+		return nil, fmt.Errorf("external-instances requires a named deployment environment")
+	}
+	binding, configured := s.Settings.ExternalInstances[environment]
+	if !configured {
+		return nil, fmt.Errorf("external-instances has no binding for deployment environment %q", environment)
 	}
 	if binding.Host == "" {
 		return nil, fmt.Errorf("external-instance host is required")
@@ -727,18 +787,37 @@ func (s *Builder) deploymentNetworkInstance(
 	if !slices.Equal(boundRoles, declaredRoles) {
 		return nil, fmt.Errorf("external-instance runtime-read-write-roles %v do not match declared runtime-read-write-roles %v", boundRoles, declaredRoles)
 	}
-	port := binding.Port
-	if port == 0 {
-		port = 5432
+	return &binding, nil
+}
+
+func (binding *ExternalInstance) port() uint16 {
+	if binding.Port == 0 {
+		return 5432
 	}
-	address := net.JoinHostPort(binding.Host, strconv.Itoa(int(port)))
-	return &v0.NetworkInstance{
-		Access:   resources.NewPublicNetworkAccess(),
-		Hostname: binding.Host,
-		Host:     address,
-		Port:     uint32(port),
-		Address:  address,
-	}, nil
+	return binding.Port
+}
+
+func externalBindingID(environment string, binding *ExternalInstance) string {
+	identity := strings.Join([]string{
+		environment,
+		binding.Host,
+		strconv.Itoa(int(binding.port())),
+		binding.DatabaseName,
+		strings.Join(binding.RuntimeReadWriteRoles, "\x00"),
+	}, "\x00")
+	digest := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(digest[:])
+}
+
+func configurationValueByKey(configuration *v0.Configuration, key string) string {
+	for _, information := range configuration.GetInfos() {
+		for _, value := range information.GetConfigurationValues() {
+			if value.GetKey() == key {
+				return value.GetValue()
+			}
+		}
+	}
+	return ""
 }
 
 type promotableWorkloadSecretReferences struct {
@@ -748,6 +827,7 @@ type promotableWorkloadSecretReferences struct {
 
 func (s *Builder) selectPromotableSecretReferences(
 	configured map[string]*builderv0.KubernetesSecretKeyReference,
+	external bool,
 ) (*promotableWorkloadSecretReferences, error) {
 	// The restricted deploy build never loads runtime credentials, so this is
 	// the only place the auth mode is checked on this path: reject a mistyped
@@ -763,6 +843,9 @@ func (s *Builder) selectPromotableSecretReferences(
 			StatefulSet:  map[string]*builderv0.KubernetesSecretKeyReference{},
 			BootstrapJob: map[string]*builderv0.KubernetesSecretKeyReference{},
 		}, nil
+	}
+	if external {
+		return s.selectExternalSecretReferences(configured)
 	}
 	statefulSetEnvironmentVariables := []string{
 		"POSTGRES_USER",
@@ -815,6 +898,45 @@ func (s *Builder) selectPromotableSecretReferences(
 	return &promotableWorkloadSecretReferences{
 		StatefulSet:  selectForWorkload(statefulSetEnvironmentVariables),
 		BootstrapJob: selectForWorkload(bootstrapJobEnvironmentVariables),
+	}, nil
+}
+
+func (s *Builder) selectExternalSecretReferences(
+	configured map[string]*builderv0.KubernetesSecretKeyReference,
+) (*promotableWorkloadSecretReferences, error) {
+	required := []struct {
+		environmentVariable string
+		configurationKey    string
+	}{
+		{environmentVariable: "POSTGRES_USER", configurationKey: "POSTGRES_USER"},
+		{environmentVariable: "PGUSER", configurationKey: "POSTGRES_USER"},
+		{environmentVariable: "PGPASSWORD", configurationKey: "POSTGRES_PASSWORD"},
+		{environmentVariable: "POSTGRES_READ_ONLY_PASSWORD", configurationKey: "POSTGRES_READ_ONLY_PASSWORD"},
+		{environmentVariable: "POSTGRES_READ_WRITE_PASSWORD", configurationKey: "POSTGRES_READ_WRITE_PASSWORD"},
+		{environmentVariable: externalReadOnlyConnectionKey, configurationKey: readOnlyConnectionKey},
+		{environmentVariable: externalReadWriteConnectionKey, configurationKey: readWriteConnectionKey},
+	}
+	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(required))
+	secretName := ""
+	for _, item := range required {
+		key := resources.ServiceSecretConfigurationKeyFromUnique(s.Unique(), "postgres", item.configurationKey)
+		reference := configured[key]
+		if reference == nil || reference.GetName() == "" || reference.GetKey() == "" {
+			return nil, fmt.Errorf("external postgres deployment requires a typed Kubernetes Secret reference for %s", key)
+		}
+		if reference.GetOptional() {
+			return nil, fmt.Errorf("%s Kubernetes Secret reference must not be optional", key)
+		}
+		if secretName == "" {
+			secretName = reference.GetName()
+		} else if secretName != reference.GetName() {
+			return nil, fmt.Errorf("external postgres credential references must use one Kubernetes Secret")
+		}
+		selected[item.environmentVariable] = reference
+	}
+	return &promotableWorkloadSecretReferences{
+		StatefulSet:  map[string]*builderv0.KubernetesSecretKeyReference{},
+		BootstrapJob: selected,
 	}, nil
 }
 

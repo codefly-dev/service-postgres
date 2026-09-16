@@ -13,19 +13,22 @@ The bootstrap job applies migrations and reconciles runtime roles and grants on 
 
 ## Externally provisioned deployments
 
-Set `external-instance` when a deployed environment uses a managed Postgres server instead of a server owned by this service. The deployment emits the bootstrap Job but no Service, StatefulSet, or persistent volume. Local Docker and Nix runs still provision their own Postgres server.
+Add an entry to `external-instances` when a deployment environment uses a managed Postgres server instead of a server owned by this service. Bindings are keyed by environment so staging and production cannot silently share an address. The deployment emits the bootstrap Job but no Service, StatefulSet, or persistent volume. Local Docker and Nix runs still provision their own Postgres server.
 
 ```yaml
 database-name: accounts
 runtime-read-write-roles: [app_tenant, app_worker]
-external-instance:
-  host: postgres.production.example.com
-  port: 5432
-  database-name: accounts
-  runtime-read-write-roles: [app_tenant, app_worker]
+external-instances:
+  production:
+    host: postgres.production.example.com
+    port: 5432
+    database-name: accounts
+    runtime-read-write-roles: [app_tenant, app_worker]
 ```
 
-The nested database name and ordered role list attest the environment binding. Deployment fails before rendering if either differs from the top-level contract. `port` defaults to `5432` when omitted. The external address is used directly in generated connection strings, so no per-service network mapping or `ExternalName` Service is required.
+When `external-instances` is present, every deployment environment must have an entry; a misspelled or missing environment fails instead of silently provisioning an owned server. The nested database name and ordered role list attest the environment binding. Deployment fails before rendering if either differs from the top-level contract. `port` defaults to `5432` when omitted. The bootstrap Job connects to the declared host directly, then verifies that the externally supplied read-only and read-write DSNs resolve to that host, port, database, and the expected managed login roles before reporting success. A target change produces a new immutable Job identity.
+
+External instances currently require password authentication. `auth-mode: external-identity` is rejected before rendering because its managed bootstrap path is not yet compatible with the generated role reconciler described below.
 
 Local database state survives ordinary stop/start and container recreation. In Docker mode, the agent mounts the official image's data directory from a Codefly-owned persistent runtime directory scoped by workspace, service, and naming scope. Stable and development scopes therefore keep independent databases even when they run from the same checkout.
 

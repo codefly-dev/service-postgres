@@ -108,6 +108,27 @@ func startDisposablePostgres(t *testing.T) *disposableServer {
 	return server
 }
 
+func TestExternalBootstrapConnectionUsesDeclaredLibpqTarget(t *testing.T) {
+	server := startDisposablePostgres(t)
+	host, port, err := net.SplitHostPort(server.address)
+	require.NoError(t, err)
+	t.Setenv("PGHOST", host)
+	t.Setenv("PGPORT", port)
+	t.Setenv("PGDATABASE", "postgres")
+	t.Setenv("PGUSER", "postgres")
+	t.Setenv("PGPASSWORD", disposableOwnerPassword)
+
+	database, err := sql.Open("postgres", "postgresql:///?sslmode=disable")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	var identity string
+	require.NoError(t, database.QueryRowContext(
+		context.Background(),
+		"SELECT current_database() || '|' || session_user",
+	).Scan(&identity))
+	require.Equal(t, "postgres|postgres", identity)
+}
+
 func waitForControlPlane(t *testing.T, ctx context.Context, dsn string) *migrationtest.ControlPlane {
 	t.Helper()
 	var lastErr error

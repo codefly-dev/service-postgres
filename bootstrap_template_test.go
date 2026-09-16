@@ -134,6 +134,73 @@ func TestBootstrapImageAlwaysReconcilesRuntimeAccess(t *testing.T) {
 	}
 }
 
+func TestExternalBootstrapRejectsRuntimeConnectionDrift(t *testing.T) {
+	program := renderStagedTemplate(t, "templates/bootstrap/bootstrap.sh.tmpl", testBootstrapTemplating())
+	tests := []struct {
+		name         string
+		readIdentity string
+		readHost     string
+		readPort     string
+		expected     string
+	}{
+		{name: "database", readIdentity: "billing|codefly_app_ro", readHost: "managed.postgres.example.com", readPort: "5432", expected: "resolves to billing|codefly_app_ro"},
+		{name: "login role", readIdentity: "accounts|unrelated_reader", readHost: "managed.postgres.example.com", readPort: "5432", expected: "resolves to accounts|unrelated_reader"},
+		{name: "host", readIdentity: "accounts|codefly_app_ro", readHost: "wrong.postgres.example.com", readPort: "5432", expected: "does not target host managed.postgres.example.com"},
+		{name: "port", readIdentity: "accounts|codefly_app_ro", readHost: "managed.postgres.example.com", readPort: "6432", expected: "does not target port 5432"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bin := t.TempDir()
+			writeExecutable := func(name, body string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeExecutable("pg_isready", "#!/bin/sh\nexit 0\n")
+			writeExecutable("psql", fmt.Sprintf(`#!/bin/sh
+case "$*" in
+  *--file=/app/bootstrap.sql*) exit 0 ;;
+  *"SELECT current_database()"*)
+    case "$1" in
+      *reader*) echo '%s' ;;
+      *writer*) echo 'accounts|codefly_app_rw' ;;
+    esac
+    exit 0
+    ;;
+  *conninfo*)
+    case "$1" in
+      *reader*) echo 'You are connected to database "accounts" as user "codefly_app_ro" on host "%s" at port "%s".' ;;
+      *writer*) echo 'You are connected to database "accounts" as user "codefly_app_rw" on host "managed.postgres.example.com" at port "5432".' ;;
+    esac
+    exit 0
+    ;;
+esac
+exit 1
+	`, test.readIdentity, test.readHost, test.readPort))
+			command := exec.Command("/bin/sh", "-c", program)
+			command.Env = append(os.Environ(),
+				"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"CODEFLY_POSTGRES_EXTERNAL_BINDING=true",
+				"CODEFLY_POSTGRES_EXPECTED_HOST=managed.postgres.example.com",
+				"CODEFLY_POSTGRES_EXPECTED_PORT=5432",
+				"CODEFLY_POSTGRES_EXPECTED_READ_ONLY_ROLE=codefly_app_ro",
+				"CODEFLY_POSTGRES_EXPECTED_READ_WRITE_ROLE=codefly_app_rw",
+				"CODEFLY_POSTGRES_READ_ONLY_CONNECTION=postgresql://reader@managed.postgres.example.com/accounts",
+				"CODEFLY_POSTGRES_READ_WRITE_CONNECTION=postgresql://writer@managed.postgres.example.com/accounts",
+				"POSTGRES_DB=accounts",
+			)
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatalf("bootstrap accepted a drifted read-only DSN:\n%s", output)
+			}
+			if !strings.Contains(string(output), test.expected) {
+				t.Fatalf("bootstrap failed for the wrong reason: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
 // TestBootstrapProgramAppliesEveryLineageToItsOwnLedger is the deployed half of
 // the local multi-source contract: each source is applied to its own ledger, in
 // TestBootstrapProgramAppliesEveryLineageToItsOwnLedger is the deployed half of

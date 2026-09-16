@@ -16,6 +16,9 @@ spec:
         codefly.dev/bootstrap-service: {{ .Service.Name.DNSCase }}
       annotations:
         sidecar.istio.io/inject: "false"
+{{- if .Deployment.Parameters.ExternalInstance }}
+        codefly.dev/postgres-binding: "{{ .Deployment.Parameters.ExternalBindingID }}"
+{{- end }}
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -42,8 +45,30 @@ spec:
           envFrom:
             - secretRef:
                 name: secret-{{ .Service.Name.DNSCase }}
-{{- else }}
+{{- end }}
+{{- if or .Restricted .Deployment.Parameters.ExternalInstance }}
           env:
+{{- if .Deployment.Parameters.ExternalInstance }}
+            - name: CODEFLY_POSTGRES_EXTERNAL_BINDING
+              value: "true"
+            - name: CODEFLY_POSTGRES_EXPECTED_HOST
+              value: "{{ .Deployment.Parameters.ExternalHost }}"
+            - name: CODEFLY_POSTGRES_EXPECTED_PORT
+              value: "{{ .Deployment.Parameters.ExternalPort }}"
+            - name: CODEFLY_POSTGRES_EXPECTED_READ_ONLY_ROLE
+              value: "{{ .Deployment.Parameters.ReadOnlyRole }}"
+            - name: CODEFLY_POSTGRES_EXPECTED_READ_WRITE_ROLE
+              value: "{{ .Deployment.Parameters.ReadWriteRole }}"
+            - name: PGHOST
+              value: "{{ .Deployment.Parameters.ExternalHost }}"
+            - name: PGPORT
+              value: "{{ .Deployment.Parameters.ExternalPort }}"
+            - name: PGDATABASE
+              value: "{{ .Deployment.Parameters.DatabaseName }}"
+            - name: PGSSLMODE
+              value: "{{ .Deployment.Parameters.ExternalSSLMode }}"
+{{- end }}
+{{- if .Restricted }}
             - name: POSTGRES_DB
               value: "{{ .Deployment.Parameters.DatabaseName }}"
 {{- range $environmentVariable, $reference := .Deployment.Parameters.BootstrapJobSecretReferences }}
@@ -53,6 +78,7 @@ spec:
                   name: {{ $reference.Name }}
                   key: {{ $reference.Key }}
                   optional: {{ $reference.Optional }}
+{{- end }}
 {{- end }}
 {{- end }}
           resources:
