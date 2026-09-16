@@ -40,7 +40,8 @@ func TestImageSBOMCoversEveryShippedImageAndPlatform(t *testing.T) {
 	response, err := builder.Build(t.Context(), buildRequest(t.TempDir()))
 	require.NoError(t, err)
 	plan := response.GetResult().GetDockerBuildPlan()
-	expected := sbom.ExpectedFromBuildPlan(builder.Unique(), plan)
+	expected, err := sbom.ExpectedFromBuildPlan(builder.Unique(), plan, builtBootstrapImages())
+	require.NoError(t, err)
 	require.Len(t, expected, 2, "the bootstrap recipe ships two platforms")
 
 	sbomResponse, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
@@ -52,7 +53,7 @@ func TestImageSBOMCoversEveryShippedImageAndPlatform(t *testing.T) {
 		sbomResponse.GetState().GetMessage())
 	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, sbomResponse.GetScope())
 	require.Equal(t, builderv0.NoImageReason_NO_IMAGE_REASON_UNSPECIFIED, sbomResponse.GetNoImageReason())
-	require.NoError(t, sbom.ValidateCoverage(expected, sbomResponse))
+	require.NoError(t, sbom.ValidateCoverage(builder.Unique(), expected, sbomResponse))
 
 	covered := map[string]*builderv0.ImageSBOM{}
 	for _, evidence := range sbomResponse.GetImages() {
@@ -112,8 +113,8 @@ func TestImageSBOMWithoutSubjectsRefusesToClaimCoverage(t *testing.T) {
 	require.Equal(t, builderv0.NoImageReason_NO_IMAGE_REASON_UNSPECIFIED, response.GetNoImageReason(),
 		"a service that does ship images must never claim a no-image reason")
 	require.ErrorContains(t,
-		sbom.ValidateCoverage([]*builderv0.ImageSubject{{
-			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+		sbom.ValidateCoverage(builder.Unique(), []*builderv0.ImageSubject{{
+			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}}, response),
 		"does not build its own images")
 	require.NoFileExists(t, log, "nothing may be scanned once the request is refused")
@@ -128,7 +129,7 @@ func TestImageSBOMReportsAFailedScanRatherThanPartialCoverage(t *testing.T) {
 	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
 		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
 		Subjects: []*builderv0.ImageSubject{{
-			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
@@ -191,19 +192,19 @@ func TestImageSBOMScansAnIdenticalSubjectOnlyOnce(t *testing.T) {
 	require.Len(t, evidenceFor(t, response, runtimeAMD64Digest).GetSubjects(), 1)
 }
 
-// A multi-platform override is an ordinary configuration — postgres:17-alpine
+// A multi-platform override is an ordinary configuration — the postgres image
 // ships eight platforms — and declaring them is what makes its evidence
 // complete instead of failing the whole request.
 func TestImageSBOMCoversEveryDeclaredPlatformOfAnOverride(t *testing.T) {
 	builder := newBuildTestBuilder(t)
-	builder.Settings.Image = "postgres:17-alpine"
+	builder.Settings.Image = pinnedOverrideImage
 	builder.Settings.ImagePlatforms = []string{"linux/amd64", "linux/arm64"}
 	log := stubScanner(t, scanner{overrideImage: "postgres"})
 
 	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
 		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
 		Subjects: []*builderv0.ImageSubject{{
-			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
@@ -216,7 +217,7 @@ func TestImageSBOMCoversEveryDeclaredPlatformOfAnOverride(t *testing.T) {
 			evidenceFor(t, response, overrideARM64Digest).GetPlatform(),
 		})
 	require.Contains(t, scans(t, log), "registry:postgres@"+overrideARM64Digest,
-		"the override's tag is resolved to each declared platform's child digest")
+		"the override's manifest list is resolved to each declared platform's child digest")
 }
 
 // Without a declaration there is nothing to resolve a multi-platform override
@@ -224,19 +225,40 @@ func TestImageSBOMCoversEveryDeclaredPlatformOfAnOverride(t *testing.T) {
 // evidence. The failure has to name that ambiguity.
 func TestImageSBOMFailsOnAnUndeclaredMultiPlatformOverride(t *testing.T) {
 	builder := newBuildTestBuilder(t)
-	builder.Settings.Image = "postgres:17-alpine"
+	builder.Settings.Image = pinnedOverrideImage
 	stubScanner(t, scanner{overrideImage: "postgres"})
 
 	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
 		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
 		Subjects: []*builderv0.ImageSubject{{
-			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
 	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
 	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
 	require.Contains(t, response.GetState().GetMessage(), "name the platform to scan")
+}
+
+// An override that names a floating tag cannot be answered for: the tag serves
+// whatever was pushed to it last, so scanning it would report an inventory of
+// something nobody checked is what the database runs.
+func TestImageSBOMRefusesAnUnpinnedOverride(t *testing.T) {
+	builder := newBuildTestBuilder(t)
+	builder.Settings.Image = "postgres:17-alpine"
+	log := stubScanner(t, scanner{overrideImage: "postgres"})
+
+	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
+		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv0.ImageSubject{{
+			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+		}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Contains(t, response.GetState().GetMessage(), "is not pinned to a sha256 digest")
+	require.NoFileExists(t, log, "nothing may be scanned once the configuration is rejected")
 }
 
 // A reference the override parser cannot read — a registry with a port has two
@@ -249,7 +271,7 @@ func TestImageSBOMRejectsAnUnreadableOverrideReference(t *testing.T) {
 	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
 		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
 		Subjects: []*builderv0.ImageSubject{{
-			Reference: bootstrapImageName, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
+			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
@@ -272,7 +294,7 @@ func TestSourceScopeStillInventoriesTheConfiguredImage(t *testing.T) {
 	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_SOURCE, response.GetScope())
 	require.Equal(t, []string{"registry:" + image.FullName()}, scans(t, log))
 	require.ErrorContains(t,
-		sbom.ValidateCoverage([]*builderv0.ImageSubject{{
+		sbom.ValidateCoverage(builder.Unique(), []*builderv0.ImageSubject{{
 			Reference: image.FullName(), Role: runtimeImageRole, Service: builder.Unique(),
 		}}, response),
 		"not image coverage")
@@ -295,11 +317,11 @@ func TestRuntimeImageSubjectsFollowTheLockedPlatformsAndTheOverride(t *testing.T
 
 	// A single-platform override needs no declaration: one unstated platform is
 	// exact, and the scanner resolves it.
-	builder.Settings.Image = "postgis/postgis:17-3.5"
+	builder.Settings.Image = "postgis/postgis@" + overrideAMD64Digest
 	overridden, err := builder.runtimeImageSubjects()
 	require.NoError(t, err)
 	require.Len(t, overridden, 1)
-	require.Equal(t, "postgis/postgis:17-3.5", overridden[0].GetReference())
+	require.Equal(t, "postgis/postgis@"+overrideAMD64Digest, overridden[0].GetReference())
 	require.Empty(t, overridden[0].GetPlatform())
 
 	builder.Settings.ImagePlatforms = []string{"linux/amd64", "linux/arm64"}
@@ -307,7 +329,7 @@ func TestRuntimeImageSubjectsFollowTheLockedPlatformsAndTheOverride(t *testing.T
 	require.NoError(t, err)
 	require.Len(t, declared, 2)
 	require.Equal(t, "linux/arm64", declared[1].GetPlatform())
-	require.Equal(t, "postgis/postgis:17-3.5", declared[1].GetReference())
+	require.Equal(t, "postgis/postgis@"+overrideAMD64Digest, declared[1].GetReference())
 
 	builder.Settings.ImagePlatforms = []string{"amd64"}
 	_, err = builder.runtimeImageSubjects()
@@ -317,6 +339,23 @@ func TestRuntimeImageSubjectsFollowTheLockedPlatformsAndTheOverride(t *testing.T
 // bootstrapImageName is the image the recipe emitted by newBuildTestBuilder's
 // build context names.
 const bootstrapImageName = "registry.example.com/module/postgres"
+
+// pinnedBootstrapImage is that image as a caller names it once its own build
+// has resolved a digest. A recipe carries a tag, and a subject may not.
+var pinnedBootstrapImage = bootstrapImageName + "@" + bootstrapAMD64Digest
+
+// pinnedOverrideImage is a docker-image override in the form image scope
+// requires: the digest of the manifest list the deployment names.
+var pinnedOverrideImage = "postgres@" + overrideAMD64Digest
+
+// builtBootstrapImages is what the caller's build of the emitted recipe
+// resolved: the pushed child digest of each platform the recipe ships.
+func builtBootstrapImages() []sbom.ResolvedImage {
+	return []sbom.ResolvedImage{
+		{Recipe: "bootstrap", Platform: "linux/amd64", Digest: bootstrapAMD64Digest, Source: sbom.SourceRegistry},
+		{Recipe: "bootstrap", Platform: "linux/arm64", Digest: bootstrapARM64Digest, Source: sbom.SourceRegistry},
+	}
+}
 
 type scanner struct {
 	// failure is the stderr a failing scan reports; empty means every scan

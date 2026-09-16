@@ -145,7 +145,7 @@ func (s *Builder) SBOM(ctx context.Context, req *builderv0.SBOMRequest) (*builde
 	}
 	// The caller's own subjects lead, so a failure among the images it asked
 	// about is reported as itself rather than behind the one this agent adds.
-	return s.Builder.SBOMImages(ctx, distinctSubjects(req.GetSubjects(), runtimeSubjects), sbom.SourceRegistry)
+	return s.Builder.SBOMImages(ctx, distinctSubjects(req.GetSubjects(), runtimeSubjects))
 }
 
 // distinctSubjects drops subjects that are identical in every field. Each
@@ -177,8 +177,9 @@ func distinctSubjects(groups ...[]*builderv0.ImageSubject) []*builderv0.ImageSub
 // runtimeImageSubjects describes the postgres image the workload runs. It is
 // deployed rather than built, so it appears in no build plan and no caller
 // derives a subject for it — without this the image the database actually runs
-// would never be inventoried. The subjects carry no digest: evidence binds to
-// the platform's child manifest, not to the manifest list the deployment names.
+// would never be inventoried. The pin rides in the reference rather than in the
+// digest field: evidence binds to the platform's child manifest, which is what
+// each subject's scan resolves out of the manifest list the deployment names.
 func (s *Service) runtimeImageSubjects() ([]*builderv0.ImageSubject, error) {
 	configured := s.dockerImage()
 	if configured == nil {
@@ -199,17 +200,12 @@ func (s *Service) runtimeImageSubjects() ([]*builderv0.ImageSubject, error) {
 			platforms = []string{""}
 		}
 	}
-	reference := configured.FullName()
-	subjects := make([]*builderv0.ImageSubject, 0, len(platforms))
-	for _, platform := range platforms {
-		subjects = append(subjects, &builderv0.ImageSubject{
-			Reference: reference,
-			Platform:  platform,
-			Role:      runtimeImageRole,
-			Service:   s.Unique(),
-		})
-	}
-	return subjects, nil
+	return sbom.ExpectedFromImageReference(sbom.PublishedImage{
+		Service:   s.Unique(),
+		Role:      runtimeImageRole,
+		Reference: configured.FullName(),
+		Platforms: platforms,
+	})
 }
 
 // Upgrade reports an available tag bump for the managed postgres image.

@@ -76,8 +76,10 @@ type Settings struct {
 
 	// Image overrides the default postgres image — bring your own extensions.
 	// e.g. "postgis/postgis:17-3.5" for PostGIS, or any image that ships the
-	// .so files the extensions you list below need. Format "name:tag". Empty =
-	// the default pgvector image (see the `image` var).
+	// .so files the extensions you list below need. Format "name:tag" or
+	// "name@sha256:...". Empty = the default pgvector image (see the `image`
+	// var). Image-scope SBOM needs the digest form: a tag serves whatever was
+	// pushed to it last, so its inventory is not coverage of what runs.
 	Image string `yaml:"docker-image"`
 
 	// ImagePlatforms are the os/arch platforms the overridden image ships.
@@ -299,6 +301,12 @@ var defaultExtensions = []string{
 // override if set, else the default pgvector image.
 func (s *Service) dockerImage() *resources.DockerImage {
 	if s.Settings != nil && s.Settings.Image != "" {
+		// NewDockerImage splits on ":", which a digest reference also carries, so
+		// it would file the digest as a tag and leave "name@sha256" as the image
+		// name. A registry host with a port takes it out of range entirely.
+		if name, digest, pinned := strings.Cut(s.Settings.Image, "@"); pinned {
+			return &resources.DockerImage{Name: name, Digest: digest}
+		}
 		return resources.NewDockerImage(s.Settings.Image)
 	}
 	return image.DockerImage
