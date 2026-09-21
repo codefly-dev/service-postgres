@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -77,6 +78,69 @@ func TestHostResourceRemovalPlanRejectsMalformedCandidateRows(t *testing.T) {
 		func(int) bool { return false },
 	)
 	require.Error(t, err, "malformed PostgreSQL semaphore set was accepted")
+}
+
+// TestRecoveryVerdictCountsAPeersRemovalAsDone is the concurrency case that
+// ipcrm's exit status gets wrong. Two agents planning the same orphans is
+// ordinary — one wins, and the loser's ipcrm fails the whole invocation over
+// identifiers that are already gone. Reading that as a cleanup failure makes
+// `codefly clear` report a failure for work that is complete, so the verdict
+// is taken from what survived, not from what ipcrm said.
+func TestRecoveryVerdictCountsAPeersRemovalAsDone(t *testing.T) {
+	recovery, err := recoveryVerdict(
+		[]int{91}, []int{20, 21},
+		survivors{},
+		errors.New("ipcrm: shmid(91): invalid identifier"),
+	)
+	require.NoError(t, err, "resources that are gone are recovered, whoever removed them")
+	require.Equal(t, hostResourceRecovery{SharedSegments: 1, SemaphoreSets: 2}, recovery)
+}
+
+// TestRecoveryVerdictReportsPartialProgressWithTheFailure keeps a real failure
+// from erasing the work that succeeded. ipcrm cannot attribute a batch failure
+// to individual identifiers, so a caller told only "it failed" would retry
+// believing nothing was removed, and an operator reading the log would not
+// know which resources are still holding the host.
+func TestRecoveryVerdictReportsPartialProgressWithTheFailure(t *testing.T) {
+	recovery, err := recoveryVerdict(
+		[]int{90, 91}, []int{20, 21, 22},
+		survivors{shared: []int{90}, semaphores: []int{22}},
+		nil,
+	)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "shared memory [90]")
+	require.Contains(t, err.Error(), "semaphores [22]")
+	require.Equal(t, hostResourceRecovery{SharedSegments: 1, SemaphoreSets: 2}, recovery,
+		"what was removed is reported even when the pass failed overall")
+}
+
+// TestSurvivingIDsReadsPresenceRatherThanTrustingRemoval is what makes the
+// verdict possible: whether a resource is still there is a fact about the
+// host, readable at any time, unlike ipcrm's one-shot exit status.
+func TestSurvivingIDsReadsPresenceRatherThanTrustingRemoval(t *testing.T) {
+	shared := `
+m 90 0x00001000 --rw------- alice staff alice staff 4 56 200 200
+`
+	semaphores := `
+s 21 0x00002002 --ra------- alice staff alice staff 20 09:00:00 09:00:00
+`
+	remaining, err := survivingIDs(shared, semaphores, []int{90, 91}, []int{20, 21})
+	require.NoError(t, err)
+	require.Equal(t, []int{90}, remaining.shared, "91 is absent, so it was removed")
+	require.Equal(t, []int{21}, remaining.semaphores, "20 is absent, so it was removed")
+}
+
+// TestSurvivingIDsRefusesAnUnreadableTable fails closed. A table this parser
+// cannot read would otherwise look like an empty table, which reads as "every
+// planned resource is gone" — reporting a successful cleanup that never
+// happened and leaving the host broken with nothing to retry it.
+func TestSurvivingIDsRefusesAnUnreadableTable(t *testing.T) {
+	_, err := survivingIDs(
+		"m bad 0x1000 --rw------- alice staff alice staff 0 56 300 300",
+		"",
+		[]int{91}, nil,
+	)
+	require.Error(t, err)
 }
 
 // TestHostResourceRemovalPlanSparesEverythingWhenNoRunLeaked is the quiet case

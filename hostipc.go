@@ -15,6 +15,11 @@ const hostResourceRecoveryCapability = "host-resource-recovery/v1"
 
 const recoverHostResourcesCommandName = "recover-host-resources"
 
+// recoverHostResources is indirected so the lifecycle wiring can be observed
+// without sweeping the developer's real IPC tables. Production always runs
+// reapHostIPC; only tests replace it.
+var recoverHostResources = reapHostIPC
+
 // hostResourceRecovery counts what one pass removed.
 type hostResourceRecovery struct {
 	SharedSegments int

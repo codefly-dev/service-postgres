@@ -610,6 +610,13 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 // once, and losing that race must not be what fails a start or a teardown that
 // otherwise succeeded. The authenticated recovery command returns the failure
 // instead, because collecting them is that caller's whole purpose.
+//
+// On the teardown paths this is opportunistic rather than a guarantee. Proc.Stop
+// returns once the SIGTERM grace window elapses, so a postmaster that is still
+// exiting still owns its segment and is correctly left alone, and a Destroy
+// arriving on a spent context cannot sweep at all. Init is what makes the
+// guarantee: it runs unconditionally before every native start, so anything
+// missed here is collected before it can affect a cluster.
 func (s *Runtime) reapHostResources(ctx context.Context) {
 	recovered, err := recoverHostResources(ctx)
 	if err != nil {

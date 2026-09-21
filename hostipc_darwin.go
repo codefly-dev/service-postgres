@@ -21,6 +21,14 @@ const (
 	postgresIPCRemovalBatchSize       = 256
 )
 
+// Absolute paths, for the same reason resolveBinDir refuses to trust PATH for
+// postgres itself: this is a destructive operation, and a shadowing entry in a
+// workspace profile would get to choose what removes the host's IPC resources.
+const (
+	ipcsCommand  = "/usr/bin/ipcs"
+	ipcrmCommand = "/usr/bin/ipcrm"
+)
+
 type postgresSharedMemoryRow struct {
 	id          int
 	key         uint64
@@ -39,18 +47,18 @@ type postgresSemaphoreRow struct {
 	createdAt  string
 }
 
-// recoverHostResources removes only current-user PostgreSQL control segments
-// whose creator is dead and semaphore runs that no live PostgreSQL control
-// segment owns. PostgreSQL normally removes these resources itself; their
-// orphaned shape means an interrupted process group prevented the postmaster
-// from executing IPC_RMID.
+// reapHostIPC removes only current-user PostgreSQL control segments whose
+// creator is dead and semaphore runs that no live PostgreSQL control segment
+// owns. PostgreSQL normally removes these resources itself; their orphaned
+// shape means an interrupted process group prevented the postmaster from
+// executing IPC_RMID.
 //
 // Safety depends on PostgreSQL's 56-byte control segment and its cluster of
 // 20-semaphore sets. A set is removed only when its dead control segment is
 // present or at least two same-creation-time sets form a bounded key cluster.
 // A lone semaphore set with no matching control segment is never touched.
 // Live control segments protect every matching semaphore cluster.
-func recoverHostResources(ctx context.Context) (hostResourceRecovery, error) {
+func reapHostIPC(ctx context.Context) (hostResourceRecovery, error) {
 	if err := ctx.Err(); err != nil {
 		return hostResourceRecovery{}, err
 	}
@@ -58,27 +66,35 @@ func recoverHostResources(ctx context.Context) (hostResourceRecovery, error) {
 	if err != nil {
 		return hostResourceRecovery{}, fmt.Errorf("resolve user for PostgreSQL IPC cleanup: %w", err)
 	}
-	sharedOutput, err := exec.CommandContext(ctx, "ipcs", "-ma").Output()
+	sharedOutput, semaphoreOutput, err := readIPCTables(ctx)
 	if err != nil {
-		return hostResourceRecovery{}, fmt.Errorf("list System V shared memory: %w", err)
-	}
-	semaphoreOutput, err := exec.CommandContext(ctx, "ipcs", "-sa").Output()
-	if err != nil {
-		return hostResourceRecovery{}, fmt.Errorf("list System V semaphores: %w", err)
+		return hostResourceRecovery{}, err
 	}
 	sharedIDs, semaphoreIDs, err := postgresIPCRemovalPlan(
-		string(sharedOutput),
-		string(semaphoreOutput),
+		sharedOutput,
+		semaphoreOutput,
 		current.Username,
 		processAlive,
 	)
 	if err != nil {
 		return hostResourceRecovery{}, err
 	}
-	if err := removePostgresIPC(ctx, sharedIDs, semaphoreIDs); err != nil {
-		return hostResourceRecovery{}, err
+	if len(sharedIDs) == 0 && len(semaphoreIDs) == 0 {
+		return hostResourceRecovery{}, nil
 	}
-	return hostResourceRecovery{SharedSegments: len(sharedIDs), SemaphoreSets: len(semaphoreIDs)}, nil
+	return removePostgresIPC(ctx, sharedIDs, semaphoreIDs)
+}
+
+func readIPCTables(ctx context.Context) (string, string, error) {
+	sharedOutput, err := exec.CommandContext(ctx, ipcsCommand, "-ma").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("list System V shared memory: %w", err)
+	}
+	semaphoreOutput, err := exec.CommandContext(ctx, ipcsCommand, "-sa").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("list System V semaphores: %w", err)
+	}
+	return string(sharedOutput), string(semaphoreOutput), nil
 }
 
 func postgresIPCRemovalPlan(
@@ -261,7 +277,96 @@ func parsePostgresSemaphoreRows(output string) ([]postgresSemaphoreRow, error) {
 	return rows, nil
 }
 
-func removePostgresIPC(ctx context.Context, sharedIDs, semaphoreIDs []int) error {
+// removePostgresIPC removes the planned resources and then re-reads the IPC
+// tables to decide what actually happened, because ipcrm's exit status cannot
+// answer that question. ipcrm fails the whole invocation when any single
+// identifier is already gone, and a resource that is already gone is the
+// ordinary result of another agent sweeping the same orphans a moment earlier
+// — success, not failure. It also gives no way to attribute a batch failure to
+// individual identifiers, so trusting it both reports nothing removed when
+// most of a batch succeeded and reports failure for work that is complete.
+// What every caller actually needs to know is whether the resource is still
+// there, so that is what is measured.
+func removePostgresIPC(ctx context.Context, sharedIDs, semaphoreIDs []int) (hostResourceRecovery, error) {
+	removalOutput := runIPCRemove(ctx, sharedIDs, semaphoreIDs)
+
+	sharedOutput, semaphoreOutput, err := readIPCTables(ctx)
+	if err != nil {
+		return hostResourceRecovery{}, errors.Join(
+			fmt.Errorf("verify removal of orphaned PostgreSQL IPC resources: %w", err),
+			removalOutput,
+		)
+	}
+	remaining, err := survivingIDs(sharedOutput, semaphoreOutput, sharedIDs, semaphoreIDs)
+	if err != nil {
+		return hostResourceRecovery{}, errors.Join(err, removalOutput)
+	}
+
+	return recoveryVerdict(sharedIDs, semaphoreIDs, remaining, removalOutput)
+}
+
+// recoveryVerdict reports what a pass achieved from what survived it. A
+// resource that is gone counts as recovered even when ipcrm complained about
+// it, because a peer removing the same orphan first leaves nothing to do; and
+// resources that were removed are still counted when others survive, so a
+// caller is never told nothing happened after most of a batch succeeded.
+func recoveryVerdict(sharedIDs, semaphoreIDs []int, remaining survivors, reported error) (hostResourceRecovery, error) {
+	recovery := hostResourceRecovery{
+		SharedSegments: len(sharedIDs) - len(remaining.shared),
+		SemaphoreSets:  len(semaphoreIDs) - len(remaining.semaphores),
+	}
+	if len(remaining.shared) > 0 || len(remaining.semaphores) > 0 {
+		return recovery, errors.Join(fmt.Errorf(
+			"orphaned PostgreSQL IPC resources survived removal: shared memory %v, semaphores %v",
+			remaining.shared, remaining.semaphores,
+		), reported)
+	}
+	return recovery, nil
+}
+
+type survivors struct {
+	shared     []int
+	semaphores []int
+}
+
+// survivingIDs reports which planned identifiers are still present. A planned
+// identifier that has disappeared is removed whether this process or a peer
+// did it, so both count as recovered.
+func survivingIDs(sharedOutput, semaphoreOutput string, sharedIDs, semaphoreIDs []int) (survivors, error) {
+	sharedRows, err := parsePostgresSharedMemoryRows(sharedOutput)
+	if err != nil {
+		return survivors{}, err
+	}
+	semaphoreRows, err := parsePostgresSemaphoreRows(semaphoreOutput)
+	if err != nil {
+		return survivors{}, err
+	}
+	present := make(map[int]struct{}, len(sharedRows))
+	for _, row := range sharedRows {
+		present[row.id] = struct{}{}
+	}
+	var remaining survivors
+	for _, id := range sharedIDs {
+		if _, ok := present[id]; ok {
+			remaining.shared = append(remaining.shared, id)
+		}
+	}
+	present = make(map[int]struct{}, len(semaphoreRows))
+	for _, row := range semaphoreRows {
+		present[row.id] = struct{}{}
+	}
+	for _, id := range semaphoreIDs {
+		if _, ok := present[id]; ok {
+			remaining.semaphores = append(remaining.semaphores, id)
+		}
+	}
+	return remaining, nil
+}
+
+// runIPCRemove issues the removals and returns ipcrm's own complaints for
+// diagnostics only. Whether a resource is gone is decided by re-reading the
+// tables, never by this exit status.
+func runIPCRemove(ctx context.Context, sharedIDs, semaphoreIDs []int) error {
 	var operations []string
 	for _, id := range sharedIDs {
 		operations = append(operations, "-m", strconv.Itoa(id))
@@ -269,22 +374,18 @@ func removePostgresIPC(ctx context.Context, sharedIDs, semaphoreIDs []int) error
 	for _, id := range semaphoreIDs {
 		operations = append(operations, "-s", strconv.Itoa(id))
 	}
-	var cleanupErr error
+	var reported error
 	for len(operations) > 0 {
 		count := postgresIPCRemovalBatchSize * 2
 		if count > len(operations) {
 			count = len(operations)
 		}
 		batch := operations[:count]
-		output, err := exec.CommandContext(ctx, "ipcrm", batch...).CombinedOutput()
+		output, err := exec.CommandContext(ctx, ipcrmCommand, batch...).CombinedOutput()
 		if err != nil {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf(
-				"remove orphaned PostgreSQL IPC resources: %w: %s",
-				err,
-				strings.TrimSpace(string(output)),
-			))
+			reported = errors.Join(reported, fmt.Errorf("ipcrm: %w: %s", err, strings.TrimSpace(string(output))))
 		}
 		operations = operations[count:]
 	}
-	return cleanupErr
+	return reported
 }
