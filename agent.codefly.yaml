@@ -1,7 +1,7 @@
 publisher: codefly.dev
 kind: codefly:service
 name: postgres
-version: 0.0.135
+version: 0.0.136
 release:
   owner: workflow
   workflow: releaser.yml
