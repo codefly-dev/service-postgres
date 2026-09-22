@@ -75,7 +75,7 @@ jobs:
     needs: image
     permissions:
       contents: read
-    uses: codefly-dev/core/.github/workflows/go-service-release.yml@f16e045805dbd213cdbebf98d5f7cbe802496d7c
+    uses: codefly-dev/core/.github/workflows/go-service-release.yml@08e37db5962cd98ddf77f8fb7dffe810a7ca1fc9
     with:
       # The bootstrap-image tests build linux/arm64 and refuse to run without
       # emulation registered ("CI must register emulation"). ci.yml gets it from

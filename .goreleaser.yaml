@@ -1,5 +1,12 @@
 version: 2
 
+sboms:
+  - id: archives
+    artifacts: archive
+    documents:
+      - "${artifact}.sbom.json"
+    disable: false
+
 builds:
   - id: darwin
     env:
