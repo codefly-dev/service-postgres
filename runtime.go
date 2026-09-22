@@ -241,6 +241,11 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	// database as the Docker path, so the rest of the agent is unchanged.
 	if rc := req.GetRuntimeContext(); rc != nil && rc.Kind == resources.RuntimeContextNix {
 		w.Debug("using nix runtime for postgres", wool.Field("port", instance.Port))
+		// An interrupted native run leaves System V resources the postmaster
+		// never got to remove, and a leaked semaphore run poisons every later
+		// start on this host. Collect them before the cluster is initialized,
+		// while nothing this invocation owns is attached to them yet.
+		s.reapHostResources(ctx)
 		nixpg, errNix := newNixPostgres(ctx, nixPostgresStateKey(s.Location, s.Environment.NamingScope), uint16(instance.Port),
 			s.postgresUser, s.postgresPassword, s.DatabaseName, s.LogLevel, newPGLogWriter(s.Wool))
 		if errNix != nil {
@@ -599,6 +604,30 @@ func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runt
 	return resp, nil
 }
 
+// reapHostResources collects host resources a previous native run leaked.
+// A failure is reported rather than returned: these resources belong to runs
+// this invocation does not own, several agents can reach for the same ones at
+// once, and losing that race must not be what fails a start or a teardown that
+// otherwise succeeded. The authenticated recovery command returns the failure
+// instead, because collecting them is that caller's whole purpose.
+//
+// On the teardown paths this is opportunistic rather than a guarantee. Proc.Stop
+// returns once the SIGTERM grace window elapses, so a postmaster that is still
+// exiting still owns its segment and is correctly left alone, and a Destroy
+// arriving on a spent context cannot sweep at all. Init is what makes the
+// guarantee: it runs unconditionally before every native start, so anything
+// missed here is collected before it can affect a cluster.
+func (s *Runtime) reapHostResources(ctx context.Context) {
+	recovered, err := recoverHostResources(ctx)
+	if err != nil {
+		s.Wool.Warn("cannot recover orphaned host resources", wool.ErrField(err))
+		return
+	}
+	if !recovered.empty() {
+		s.Wool.Info("recovered orphaned host resources", wool.Field("summary", recovered.summary()))
+	}
+}
+
 func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationRequest) (*runtimev0.InformationResponse, error) {
 	return s.Runtime.InformationResponse(ctx, req)
 }
@@ -674,6 +703,7 @@ func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtim
 		// second run — drop it instead of leaving a dead handle behind.
 		s.nixRuntime = nil
 		s.released = true
+		s.reapHostResources(ctx)
 		return s.stopResponse("stopped native postgres")
 	}
 
@@ -710,6 +740,7 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 		}
 		s.nixRuntime = nil
 		s.released = true
+		s.reapHostResources(ctx)
 		return s.destroyResponse("stopped native postgres")
 	}
 	// A nix invocation has no container to remove, and reaching for one would

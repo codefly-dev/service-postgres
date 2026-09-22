@@ -46,6 +46,8 @@ No operation deletes data. Dropping a database or a data directory needs an expl
 
 Stop releases only what the running invocation itself started. A session that never configured this service stops nothing.
 
+On the Nix runtime, a run that is interrupted rather than stopped — the terminal force-closed, the process group killed — leaves the System V shared-memory segment and semaphore sets the postmaster would otherwise have removed itself. A leaked semaphore run makes every later start on that host fail, so this agent collects them before it initializes a cluster and again after it releases one. Only resources belonging to the current user whose creating process is gone are removed; a live server's are never touched, on the reasoning that a resource still in use belongs to somebody. The same sweep is available on demand as the `recover-host-resources` command, which reports what it removed and fails loudly when it cannot — that is the form `codefly clear` invokes, and it needs to know what was left behind.
+
 **Behavior change:** Docker stop used to leave the container running, so a following run reattached to a warm server. It now stops the container, matching Nix. Set `keep-running: true` in the service settings to ask for warm reuse explicitly:
 
 ```yaml

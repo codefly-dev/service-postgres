@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/codefly-dev/core/agents"
+	"github.com/codefly-dev/core/agents/contract"
 	"github.com/codefly-dev/core/agents/services"
 	"github.com/codefly-dev/core/builders"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
@@ -335,7 +336,7 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	return services.Advertisement{
+	advertisement := services.Advertisement{
 		Backends: runnersbase.BackendSupport{
 			Nix:    true,
 			Docker: true,
@@ -356,14 +357,25 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 					},
 				}},
 		},
-	}.Build(), nil
+	}.Build()
+
+	// The shared server fills the contract in only when a handler leaves it
+	// absent, and that shared value carries the capabilities its own
+	// implementation promises — not one this agent adds. Declaring explicitly
+	// means carrying those promises forward rather than replacing them.
+	advertisement.Contract = contract.Current()
+	advertisement.Contract.Capabilities = append(advertisement.Contract.Capabilities, hostResourceRecoveryCapability)
+
+	return advertisement, nil
 }
 
 func NewService() *Service {
-	return &Service{
+	service := &Service{
 		Base:     services.NewServiceBase(context.Background(), agent.Of(resources.ServiceAgent)),
 		Settings: &Settings{},
 	}
+	service.RegisterCommand(recoverHostResourcesCommand(), runRecoverHostResources)
+	return service
 }
 
 func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configuration) error {
