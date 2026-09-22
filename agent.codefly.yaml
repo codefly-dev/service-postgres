@@ -1,7 +1,7 @@
 publisher: codefly.dev
 kind: codefly:service
 name: postgres
-version: 0.0.137
+version: 0.0.138
 source:
   directory: .
   agent: codefly.dev/go:0.0.56
