@@ -50,8 +50,8 @@ github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJ
 github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
 github.com/cloudflare/circl v1.6.3 h1:9GPOhQGF9MCYUeXyMYlqTR6a5gTrgR/fBLXvUgtVcg8=
 github.com/cloudflare/circl v1.6.3/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
-github.com/codefly-dev/core v0.4.4-0.20260922090214-83b3904dd07e h1:SRYQcgBnQynugAxDawMWmVhvdF8ngLEi3lhwfaYlh0s=
-github.com/codefly-dev/core v0.4.4-0.20260922090214-83b3904dd07e/go.mod h1:uG0HQy5iWnkuWUPa1LbbiPfEgzuxi1SzEKwcFPC6eoA=
+github.com/codefly-dev/core v0.5.0 h1:l5xCe06W6buzkO7piFwEPfv/gYKpzQZhDpw8uLKo7OY=
+github.com/codefly-dev/core v0.5.0/go.mod h1:uG0HQy5iWnkuWUPa1LbbiPfEgzuxi1SzEKwcFPC6eoA=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
 github.com/codefly-dev/service-postgres/libs/go v0.0.0-20260915032422-272301033aed h1:P4H/FvViECu25UB7OEyCgyyDVsj6/Ql5rRPKCtcUklA=
