@@ -3,7 +3,7 @@ module github.com/codefly-dev/service-postgres
 go 1.27.0
 
 require (
-	github.com/codefly-dev/core v0.5.0
+	github.com/codefly-dev/core v0.5.1
 	github.com/codefly-dev/gortk v0.2.0
 	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20260915032422-272301033aed
 	github.com/golang-migrate/migrate/v4 v4.19.1
