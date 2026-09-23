@@ -27,6 +27,113 @@ func TestDeploymentTemplatesWithMigration(t *testing.T) {
 	assertMigrationResource(t, dir, true)
 	assertEphemeralSecret(t, dir)
 	assertBootstrapJobDeadline(t, dir, 240)
+	// No allocated port: the Service stays on the container port and headless,
+	// the rendering every deployment produced before the port was read from the
+	// network mapping.
+	service := parseRenderedService(t, dir)
+	require.Equal(t, []renderedServicePort{{Name: "postgres", Port: 5432, TargetPort: 5432}}, service.Spec.Ports)
+	require.Equal(t, "None", service.Spec.ClusterIP, "a Service that translates nothing stays headless")
+}
+
+// Core allocates the tcp endpoint its canonical in-cluster port (80, not 5432)
+// and hands that to every consumer, so the Service has to publish it and fold
+// it onto 5432. A headless Service cannot: clients resolve it straight to pod
+// IPs and dial the published port themselves.
+func TestDeploymentTemplatesPublishAllocatedServicePort(t *testing.T) {
+	dir := agenttesting.AssertKustomizeTemplates(t, deploymentFS, DeploymentTemplateParameters{
+		WithBootstrap:               true,
+		ManagedImage:                image.FullName(),
+		BootstrapJobName:            "postgres-aaaaaaaaaaaa",
+		BootstrapJobDeadlineSeconds: 240,
+		ServicePort:                 80,
+	})
+	service := parseRenderedService(t, dir)
+	require.Equal(t, []renderedServicePort{{Name: "postgres", Port: 80, TargetPort: 5432}}, service.Spec.Ports)
+	require.NotEqual(t, "None", service.Spec.ClusterIP, "publishing a translated port needs a ClusterIP")
+	statefulSet := readDeploymentFile(t, dir, "base", "stateful-set.yaml")
+	require.Contains(t, statefulSet, "containerPort: 5432")
+	require.NotContains(t, statefulSet, "containerPort: 80")
+}
+
+// The Deploy path reads the port from the mapping the CLI hands it for the
+// store's own endpoint — the same instance whose address it advertises to
+// consumers and dials from the bootstrap Job.
+func TestDeployedServicePublishesAllocatedPort(t *testing.T) {
+	builder, _ := newDeploymentTestBuilder(t)
+	allocated := resources.NewNetworkInstance("postgres.codefly-test.svc.cluster.local", 80)
+	allocated.Access = resources.NewPublicNetworkAccess()
+	networkMappings := []*basev0.NetworkMapping{{
+		Endpoint:  builder.TcpEndpoint,
+		Instances: []*basev0.NetworkInstance{allocated},
+	}}
+	destination := t.TempDir()
+
+	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(
+		destination,
+		networkMappings,
+		promotablePostgresSecretReferences(),
+	))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	service := parseRenderedService(t, destination)
+	require.Equal(t, []renderedServicePort{{Name: "postgres", Port: 80, TargetPort: 5432}}, service.Spec.Ports)
+	require.NotEqual(t, "None", service.Spec.ClusterIP)
+	require.Contains(t, readDeploymentFile(t, destination, "base", "stateful-set.yaml"), "containerPort: 5432")
+}
+
+// A mapping on the container port needs no translation and renders the Service
+// byte-for-byte as before.
+func TestNativePortDeploymentRendersUnchangedService(t *testing.T) {
+	builder, networkMappings := newDeploymentTestBuilder(t)
+	destination := t.TempDir()
+
+	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(
+		destination,
+		networkMappings,
+		promotablePostgresSecretReferences(),
+	))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	want := `
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: "codefly-test"
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+  # Headless — clients reach postgres via the StatefulSet pod's stable
+  # DNS (<svc>-0.<svc>.<ns>.svc).
+  clusterIP: None
+`
+	require.Equal(t, want, readDeploymentFile(t, destination, "base", "service.yaml"))
+}
+
+type renderedServicePort struct {
+	Name       string `yaml:"name"`
+	Port       uint32 `yaml:"port"`
+	TargetPort uint32 `yaml:"targetPort"`
+}
+
+type renderedService struct {
+	Spec struct {
+		ClusterIP string                `yaml:"clusterIP"`
+		Ports     []renderedServicePort `yaml:"ports"`
+	} `yaml:"spec"`
+}
+
+func parseRenderedService(t *testing.T, destination string) renderedService {
+	t.Helper()
+	var service renderedService
+	require.NoError(t, yaml.Unmarshal([]byte(readDeploymentFile(t, destination, "base", "service.yaml")), &service))
+	return service
 }
 
 func TestDeploymentTemplatesWithoutBootstrap(t *testing.T) {

@@ -661,6 +661,12 @@ func (s *Builder) prepareDeployment(
 	if err != nil {
 		return nil, err
 	}
+	if binding == nil {
+		// The Service publishes the port core allocated to the endpoint — the
+		// one every consumer dials — and targets 5432. Same mechanism as redis:
+		// the mapping the CLI hands this Deploy carries our own endpoint.
+		parameters.ServicePort = instance.GetPort()
+	}
 	if binding != nil {
 		if s.externalIdentity() {
 			return nil, fmt.Errorf("external-instance deployment does not support auth-mode %q: managed bootstrap generation requires password authentication", authModeExternalIdentity)
