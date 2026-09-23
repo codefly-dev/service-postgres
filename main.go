@@ -282,6 +282,11 @@ type DeploymentTemplateParameters struct {
 	BootstrapJobDeadlineSeconds  int
 	StatefulSetSecretReferences  map[string]*builderv0.KubernetesSecretKeyReference
 	BootstrapJobSecretReferences map[string]*builderv0.KubernetesSecretKeyReference
+	// ServicePort is the in-cluster port core allocated to the tcp endpoint and
+	// handed to every consumer in its network mapping. The Service publishes it
+	// and folds it onto 5432, the port the container listens on. Zero leaves the
+	// template on 5432.
+	ServicePort uint32
 }
 
 // defaultExtensions are CREATE EXTENSION'd on every start. They are convenience

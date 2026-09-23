@@ -1,4 +1,15 @@
 {{- if not .Deployment.Parameters.ExternalInstance }}
+{{- /*
+  port is the in-cluster port core allocated to the tcp endpoint and handed to
+  every consumer; it falls back to the container port when no mapping set it.
+  targetPort stays the container port. A headless Service (clusterIP: None)
+  resolves straight to pod IPs with no kube-proxy translation, so it is only
+  correct when nothing needs translating — port equal to targetPort. Publishing
+  a different port needs a ClusterIP. spec.clusterIP is immutable: a Service
+  already applied headless has to be deleted before the ClusterIP one applies.
+*/}}
+{{- $port := .Deployment.Parameters.ServicePort }}
+{{- if not $port }}{{ $port = 5432 }}{{ end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -9,9 +20,11 @@ spec:
     app: {{ .Service.Name.DNSCase }}
   ports:
     - name: postgres
-      port: 5432
+      port: {{ $port }}
       targetPort: 5432
+{{- if eq $port 5432 }}
   # Headless — clients reach postgres via the StatefulSet pod's stable
   # DNS (<svc>-0.<svc>.<ns>.svc).
   clusterIP: None
+{{- end }}
 {{- end }}
