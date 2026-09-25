@@ -287,6 +287,14 @@ type DeploymentTemplateParameters struct {
 	// and folds it onto 5432, the port the container listens on. Zero leaves the
 	// template on 5432.
 	ServicePort uint32
+	// OwnerFromLibpqEnvironment makes the restricted bootstrap Job reach the
+	// managed server as the migration owner through PGHOST, PGPORT, PGDATABASE,
+	// PGSSLMODE (when pinned), PGUSER and PGPASSWORD instead of an assembled
+	// owner connection string.
+	OwnerFromLibpqEnvironment bool
+	OwnerHost                 string
+	OwnerPort                 string
+	OwnerSSLMode              string
 }
 
 // defaultExtensions are CREATE EXTENSION'd on every start. They are convenience
@@ -466,26 +474,50 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 // promotableConnectionConfiguration describes the capability-scoped handoff
 // without embedding credentials. The migration owner remains private to the
 // bootstrap Job and is never advertised to dependent workloads.
+//
+// Each connection carries a template instead of a value: the role, address,
+// database and sslmode are known here and are not secret, and the password is
+// a reference to this service's own runtime password. Whoever delivers the
+// value (the CLI's ExternalSecret projection) assembles it where the passwords
+// are, so a secret store holds only the passwords the bootstrap Job sets on the
+// roles, and nobody assembles a connection string by hand.
+//
+// External-identity mode holds no password, so there is nothing to assemble a
+// value from: its connections stay keys without values, as before.
 func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInstance) *basev0.Configuration {
+	readOnly := &basev0.ConfigurationValue{Key: readOnlyConnectionKey, Secret: true}
+	readWrite := &basev0.ConfigurationValue{Key: readWriteConnectionKey, Secret: true}
+	if !s.externalIdentity() {
+		readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
+		readOnly.Template = postgresConnectionTemplate(
+			instance.Address, s.DatabaseName, readOnlyRole, "POSTGRES_READ_ONLY_PASSWORD", !s.WithoutSSL,
+		)
+		readWrite.Template = postgresConnectionTemplate(
+			instance.Address, s.DatabaseName, readWriteRole, "POSTGRES_READ_WRITE_PASSWORD", !s.WithoutSSL,
+		)
+	}
 	return &basev0.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
 		Infos: []*basev0.ConfigurationInformation{
-			{
-				Name: "postgres",
-				ConfigurationValues: []*basev0.ConfigurationValue{
-					{Key: readOnlyConnectionKey, Secret: true},
-					{Key: readWriteConnectionKey, Secret: true},
-				},
-			},
+			{Name: "postgres", ConfigurationValues: []*basev0.ConfigurationValue{readOnly, readWrite}},
 		},
 	}
 }
 
+// postgresSSLMode is the sslmode a connection to address pins, or "" when it
+// pins none and leaves the client's default.
+func postgresSSLMode(address string, withSSL bool) string {
+	if !withSSL || strings.Contains(address, "localhost") || strings.Contains(address, "host.docker.internal") {
+		return "disable"
+	}
+	return ""
+}
+
 func postgresConnectionString(address, database, user, password string, withSSL, passwordless bool) string {
 	query := url.Values{}
-	if !withSSL || strings.Contains(address, "localhost") || strings.Contains(address, "host.docker.internal") {
-		query.Set("sslmode", "disable")
+	if sslMode := postgresSSLMode(address, withSSL); sslMode != "" {
+		query.Set("sslmode", sslMode)
 	}
 	// External-identity mode carries no password: the consumer acquires a
 	// short-lived token at connect time, so the DSN keeps only the principal.
@@ -502,6 +534,27 @@ func postgresConnectionString(address, database, user, password string, withSSL,
 		RawQuery: query.Encode(),
 	}
 	return connection.String()
+}
+
+// postgresConnectionTemplate is postgresConnectionString with the password
+// left as a reference to passwordKey in this service's "postgres" secret
+// configuration. Every other part is built by the same url.URL encoding, so the
+// assembled value addresses the same role, host, database and sslmode as the
+// value this agent renders when it holds the password itself.
+func postgresConnectionTemplate(address, database, user, passwordKey string, withSSL bool) *basev0.ConfigurationValueTemplate {
+	withoutPassword := postgresConnectionString(address, database, user, "", withSSL, true)
+	// withoutPassword is "postgresql://<user>@<host>/<database>[?query]"; the
+	// escaped user never contains "@", so the first one separates the userinfo.
+	userinfo, target, _ := strings.Cut(withoutPassword, "@")
+	return &basev0.ConfigurationValueTemplate{Segments: []*basev0.ConfigurationValueTemplateSegment{
+		{Content: &basev0.ConfigurationValueTemplateSegment_Literal{Literal: userinfo + ":"}},
+		{Content: &basev0.ConfigurationValueTemplateSegment_Reference{Reference: &basev0.ConfigurationValueReference{
+			Configuration: "postgres",
+			Key:           passwordKey,
+			Escape:        basev0.ConfigurationValueEscape_CONFIGURATION_VALUE_ESCAPE_URL_USERINFO,
+		}}},
+		{Content: &basev0.ConfigurationValueTemplateSegment_Literal{Literal: "@" + target}},
+	}}
 }
 
 func main() {

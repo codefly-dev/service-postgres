@@ -5,7 +5,11 @@
 # them are serialized by a single advisory lock.
 set -eu
 
-if [ "${CODEFLY_POSTGRES_EXTERNAL_BINDING:-}" = "true" ]; then
+# An external binding, and a restricted render of the managed server, hand the
+# owner over as libpq's environment (PGHOST, PGUSER, PGPASSWORD, ...) rather than
+# as an assembled connection string; the empty URL defers every part to it.
+if [ "${CODEFLY_POSTGRES_EXTERNAL_BINDING:-}" = "true" ] ||
+    [ "${CODEFLY_POSTGRES_OWNER_FROM_LIBPQ_ENVIRONMENT:-}" = "true" ]; then
     connection="postgresql:///"
 else
     connection={{ printf "\"${%s:-}\"" .MigrationConnectionEnvironment }}

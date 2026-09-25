@@ -68,6 +68,20 @@ spec:
             - name: PGSSLMODE
               value: "{{ .Deployment.Parameters.ExternalSSLMode }}"
 {{- end }}
+{{- if .Deployment.Parameters.OwnerFromLibpqEnvironment }}
+            - name: CODEFLY_POSTGRES_OWNER_FROM_LIBPQ_ENVIRONMENT
+              value: "true"
+            - name: PGHOST
+              value: "{{ .Deployment.Parameters.OwnerHost }}"
+            - name: PGPORT
+              value: "{{ .Deployment.Parameters.OwnerPort }}"
+            - name: PGDATABASE
+              value: "{{ .Deployment.Parameters.DatabaseName }}"
+{{- if .Deployment.Parameters.OwnerSSLMode }}
+            - name: PGSSLMODE
+              value: "{{ .Deployment.Parameters.OwnerSSLMode }}"
+{{- end }}
+{{- end }}
 {{- if .Restricted }}
             - name: POSTGRES_DB
               value: "{{ .Deployment.Parameters.DatabaseName }}"
