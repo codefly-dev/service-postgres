@@ -69,7 +69,8 @@ func TestRestrictedConnectionsAreTemplatesOverTheServicesOwnPasswords(t *testing
 		// already holds it.
 		require.Contains(t, references, resources.ServiceSecretConfigurationKeyFromUnique(builder.Unique(), "postgres", want.password))
 
-		require.Equal(t, "postgresql://"+want.role+":@postgres.example.com:5432/test", literals.String())
+		// The managed server serves no TLS, so its connections pin sslmode.
+		require.Equal(t, "postgresql://"+want.role+":@postgres.example.com:5432/test?sslmode=disable", literals.String())
 	}
 }
 
@@ -138,16 +139,36 @@ func TestConnectionTemplateAssemblesTheRenderedConnection(t *testing.T) {
 	}
 }
 
-// The restricted bootstrap Job pins sslmode exactly when the rendered owner
-// connection would.
-func TestRestrictedBootstrapJobPinsSSLModeOnlyWithoutSSL(t *testing.T) {
-	builder, networkMappings := newDeploymentTestBuilder(t)
-	builder.WithoutSSL = true
-	destination := t.TempDir()
-	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, promotablePostgresSecretReferences()))
+// The managed server runs this agent's runtime image, which serves no TLS: the
+// bootstrap Job's migrate (lib/pq, which requires TLS unless told otherwise)
+// must be told, whatever without-ssl says.
+func TestRestrictedBootstrapJobDisablesSSLForTheManagedServer(t *testing.T) {
+	for _, withoutSSL := range []bool{false, true} {
+		builder, networkMappings := newDeploymentTestBuilder(t)
+		builder.WithoutSSL = withoutSSL
+		destination := t.TempDir()
+		response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, promotablePostgresSecretReferences()))
+		require.NoError(t, err)
+		require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		job := readDeploymentFile(t, destination, "base", "job.yaml")
+		require.Contains(t, job, "name: PGSSLMODE\n              value: \"disable\"")
+		require.NotContains(t, job, migrationConnectionEnvironmentKey)
+	}
+}
+
+// An external instance's TLS is not this agent's: without-ssl still decides.
+func TestExternalInstanceConnectionsKeepTheDeclaredSSL(t *testing.T) {
+	builder, _ := newDeploymentTestBuilder(t)
+	builder.DatabaseName = "accounts"
+	builder.RuntimeReadWriteRoles = []string{"app_tenant"}
+	builder.ExternalInstances = map[string]ExternalInstance{"test": {
+		Host: "managed.postgres.example.com", Port: 6432, DatabaseName: "accounts", RuntimeReadWriteRoles: []string{"app_tenant"},
+	}}
+	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(t.TempDir(), nil, promotablePostgresSecretReferences()))
 	require.NoError(t, err)
 	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
-	job := readDeploymentFile(t, destination, "base", "job.yaml")
-	require.Contains(t, job, "name: PGSSLMODE\n              value: \"disable\"")
-	require.NotContains(t, job, migrationConnectionEnvironmentKey)
+	for _, value := range response.GetConfiguration().GetInfos()[0].GetConfigurationValues() {
+		last := value.GetTemplate().GetSegments()[len(value.GetTemplate().GetSegments())-1].GetLiteral()
+		require.Equal(t, "@managed.postgres.example.com:6432/accounts", last)
+	}
 }

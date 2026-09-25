@@ -554,6 +554,8 @@ func TestPromotableGitOpsDeploymentReturnsReferenceOnlyConfigurationAndScopesSec
 		"name: PGDATABASE",
 		"name: PGUSER",
 		"name: PGPASSWORD",
+		"name: PGSSLMODE",
+		`value: "disable"`,
 		"optional: false",
 	} {
 		require.Contains(t, job, expected)
@@ -569,8 +571,6 @@ func TestPromotableGitOpsDeploymentReturnsReferenceOnlyConfigurationAndScopesSec
 		// the primitives the server is initialized with.
 		"name: " + migrationConnectionEnvironmentKey,
 		"key: " + migrationConnectionEnvironmentKey,
-		// The server pins no sslmode unless without-ssl says so.
-		"name: PGSSLMODE",
 	} {
 		require.NotContains(t, job, unexpected)
 	}
