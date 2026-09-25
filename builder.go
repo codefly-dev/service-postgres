@@ -683,6 +683,7 @@ func (s *Builder) prepareDeployment(
 		parameters.ReadWriteRole = readWriteRole
 		parameters.ExternalBindingID = externalBindingID(req.GetEnvironment().GetName(), binding)
 	}
+	withSSL := s.deploymentWithSSL(binding)
 	if services.IsRestrictedOutputProfile(deployment.Profile) {
 		workloadReferences, referencesErr := s.selectPromotableSecretReferences(
 			deployment.Kubernetes.GetSecretReferences(),
@@ -705,16 +706,16 @@ func (s *Builder) prepareDeployment(
 			parameters.OwnerFromLibpqEnvironment = true
 			parameters.OwnerHost = host
 			parameters.OwnerPort = port
-			parameters.OwnerSSLMode = postgresSSLMode(instance.GetAddress(), !s.WithoutSSL)
+			parameters.OwnerSSLMode = postgresSSLMode(instance.GetAddress(), withSSL)
 		}
-		return s.promotableConnectionConfiguration(instance), nil
+		return s.promotableConnectionConfiguration(instance, withSSL), nil
 	}
 
-	configuration, err := s.CreateConnectionConfiguration(ctx, req.GetConfiguration(), instance, !s.WithoutSSL)
+	configuration, err := s.CreateConnectionConfiguration(ctx, req.GetConfiguration(), instance, withSSL)
 	if err != nil {
 		return nil, err
 	}
-	ownerConnection, err := s.createOwnerConnectionString(ctx, req.GetConfiguration(), instance.Address, !s.WithoutSSL)
+	ownerConnection, err := s.createOwnerConnectionString(ctx, req.GetConfiguration(), instance.Address, withSSL)
 	if err != nil {
 		return nil, err
 	}
@@ -737,6 +738,20 @@ func (s *Builder) prepareDeployment(
 		)
 	}
 	return configuration, nil
+}
+
+// deploymentWithSSL reports whether deployed connections may leave sslmode to
+// the client. The managed StatefulSet runs this agent's runtime image, which
+// configures no TLS, so a client that requires it by default — lib/pq, which
+// the bootstrap Job's migrate uses — is refused by the server this agent itself
+// deployed. Connections to it therefore pin sslmode=disable whatever without-ssl
+// says; without-ssl decides only for an external instance, whose TLS this agent
+// does not control. (Inside the cluster, transport encryption is the mesh's.)
+func (s *Builder) deploymentWithSSL(binding *ExternalInstance) bool {
+	if binding == nil {
+		return false
+	}
+	return !s.WithoutSSL
 }
 
 func (s *Builder) deploymentNetworkInstance(

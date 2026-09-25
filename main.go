@@ -484,16 +484,16 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 //
 // External-identity mode holds no password, so there is nothing to assemble a
 // value from: its connections stay keys without values, as before.
-func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInstance) *basev0.Configuration {
+func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInstance, withSSL bool) *basev0.Configuration {
 	readOnly := &basev0.ConfigurationValue{Key: readOnlyConnectionKey, Secret: true}
 	readWrite := &basev0.ConfigurationValue{Key: readWriteConnectionKey, Secret: true}
 	if !s.externalIdentity() {
 		readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
 		readOnly.Template = postgresConnectionTemplate(
-			instance.Address, s.DatabaseName, readOnlyRole, "POSTGRES_READ_ONLY_PASSWORD", !s.WithoutSSL,
+			instance.Address, s.DatabaseName, readOnlyRole, "POSTGRES_READ_ONLY_PASSWORD", withSSL,
 		)
 		readWrite.Template = postgresConnectionTemplate(
-			instance.Address, s.DatabaseName, readWriteRole, "POSTGRES_READ_WRITE_PASSWORD", !s.WithoutSSL,
+			instance.Address, s.DatabaseName, readWriteRole, "POSTGRES_READ_WRITE_PASSWORD", withSSL,
 		)
 	}
 	return &basev0.Configuration{
