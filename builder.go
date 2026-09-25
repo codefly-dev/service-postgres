@@ -693,6 +693,20 @@ func (s *Builder) prepareDeployment(
 		}
 		parameters.StatefulSetSecretReferences = workloadReferences.StatefulSet
 		parameters.BootstrapJobSecretReferences = workloadReferences.BootstrapJob
+		if binding == nil && !s.externalIdentity() {
+			// The migration owner reaches the managed server the way it reaches
+			// an external binding: through libpq's environment, from the owner
+			// user and password the server itself is initialized with. No
+			// assembled owner connection string exists for anyone to store.
+			host, port, splitErr := net.SplitHostPort(instance.GetAddress())
+			if splitErr != nil {
+				return nil, fmt.Errorf("postgres in-cluster address %q: %w", instance.GetAddress(), splitErr)
+			}
+			parameters.OwnerFromLibpqEnvironment = true
+			parameters.OwnerHost = host
+			parameters.OwnerPort = port
+			parameters.OwnerSSLMode = postgresSSLMode(instance.GetAddress(), !s.WithoutSSL)
+		}
 		return s.promotableConnectionConfiguration(instance), nil
 	}
 
@@ -885,11 +899,12 @@ func (s *Builder) selectPromotableSecretReferences(
 		}
 		selected[environmentVariable] = reference
 	}
-	selected[migrationConnectionEnvironmentKey] = &builderv0.KubernetesSecretKeyReference{
-		Name: secretName,
-		Key:  migrationConnectionEnvironmentKey,
-	}
-	bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, migrationConnectionEnvironmentKey)
+	// The Job connects as the migration owner through libpq's environment,
+	// from the same primitives the StatefulSet initializes the server with —
+	// never from an assembled connection string an operator has to store.
+	selected["PGUSER"] = selected["POSTGRES_USER"]
+	selected["PGPASSWORD"] = selected["POSTGRES_PASSWORD"]
+	bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, "PGUSER", "PGPASSWORD")
 	selectForWorkload := func(environmentVariables []string) map[string]*builderv0.KubernetesSecretKeyReference {
 		workloadReferences := make(map[string]*builderv0.KubernetesSecretKeyReference, len(environmentVariables))
 		for _, environmentVariable := range environmentVariables {

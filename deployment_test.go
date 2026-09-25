@@ -232,7 +232,10 @@ func TestPromotableDeploymentUsesTypedSecretReferencesWithoutValues(t *testing.T
 		"name: POSTGRES_PASSWORD",
 		"name: POSTGRES_READ_ONLY_PASSWORD",
 		"name: POSTGRES_READ_WRITE_PASSWORD",
-		"name: CODEFLY_POSTGRES_MIGRATION_CONNECTION",
+		"name: PGUSER",
+		"name: PGPASSWORD",
+		"name: PGHOST",
+		`value: "store.platform.svc.cluster.local"`,
 		"name: store-secrets",
 		`value: "users"`,
 	} {
@@ -543,7 +546,14 @@ func TestPromotableGitOpsDeploymentReturnsReferenceOnlyConfigurationAndScopesSec
 		"name: POSTGRES_READ_WRITE_PASSWORD",
 		"name: POSTGRES_DB",
 		`value: "test"`,
-		"name: " + migrationConnectionEnvironmentKey,
+		"name: CODEFLY_POSTGRES_OWNER_FROM_LIBPQ_ENVIRONMENT",
+		"name: PGHOST",
+		`value: "postgres.example.com"`,
+		"name: PGPORT",
+		`value: "5432"`,
+		"name: PGDATABASE",
+		"name: PGUSER",
+		"name: PGPASSWORD",
 		"optional: false",
 	} {
 		require.Contains(t, job, expected)
@@ -555,6 +565,12 @@ func TestPromotableGitOpsDeploymentReturnsReferenceOnlyConfigurationAndScopesSec
 		"envFrom:",
 		"name: POSTGRES_PASSWORD",
 		"name: UNRELATED_SECRET",
+		// The owner connection string is assembled by nobody: the Job reads
+		// the primitives the server is initialized with.
+		"name: " + migrationConnectionEnvironmentKey,
+		"key: " + migrationConnectionEnvironmentKey,
+		// The server pins no sslmode unless without-ssl says so.
+		"name: PGSSLMODE",
 	} {
 		require.NotContains(t, job, unexpected)
 	}
