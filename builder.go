@@ -683,6 +683,7 @@ func (s *Builder) prepareDeployment(
 		parameters.ReadWriteRole = readWriteRole
 		parameters.ExternalBindingID = externalBindingID(req.GetEnvironment().GetName(), binding)
 	}
+	withSSL := s.deploymentWithSSL(binding)
 	if services.IsRestrictedOutputProfile(deployment.Profile) {
 		workloadReferences, referencesErr := s.selectPromotableSecretReferences(
 			deployment.Kubernetes.GetSecretReferences(),
@@ -693,14 +694,28 @@ func (s *Builder) prepareDeployment(
 		}
 		parameters.StatefulSetSecretReferences = workloadReferences.StatefulSet
 		parameters.BootstrapJobSecretReferences = workloadReferences.BootstrapJob
-		return s.promotableConnectionConfiguration(instance), nil
+		if binding == nil && !s.externalIdentity() {
+			// The migration owner reaches the managed server the way it reaches
+			// an external binding: through libpq's environment, from the owner
+			// user and password the server itself is initialized with. No
+			// assembled owner connection string exists for anyone to store.
+			host, port, splitErr := net.SplitHostPort(instance.GetAddress())
+			if splitErr != nil {
+				return nil, fmt.Errorf("postgres in-cluster address %q: %w", instance.GetAddress(), splitErr)
+			}
+			parameters.OwnerFromLibpqEnvironment = true
+			parameters.OwnerHost = host
+			parameters.OwnerPort = port
+			parameters.OwnerSSLMode = postgresSSLMode(instance.GetAddress(), withSSL)
+		}
+		return s.promotableConnectionConfiguration(instance, withSSL), nil
 	}
 
-	configuration, err := s.CreateConnectionConfiguration(ctx, req.GetConfiguration(), instance, !s.WithoutSSL)
+	configuration, err := s.CreateConnectionConfiguration(ctx, req.GetConfiguration(), instance, withSSL)
 	if err != nil {
 		return nil, err
 	}
-	ownerConnection, err := s.createOwnerConnectionString(ctx, req.GetConfiguration(), instance.Address, !s.WithoutSSL)
+	ownerConnection, err := s.createOwnerConnectionString(ctx, req.GetConfiguration(), instance.Address, withSSL)
 	if err != nil {
 		return nil, err
 	}
@@ -723,6 +738,20 @@ func (s *Builder) prepareDeployment(
 		)
 	}
 	return configuration, nil
+}
+
+// deploymentWithSSL reports whether deployed connections may leave sslmode to
+// the client. The managed StatefulSet runs this agent's runtime image, which
+// configures no TLS, so a client that requires it by default — lib/pq, which
+// the bootstrap Job's migrate uses — is refused by the server this agent itself
+// deployed. Connections to it therefore pin sslmode=disable whatever without-ssl
+// says; without-ssl decides only for an external instance, whose TLS this agent
+// does not control. (Inside the cluster, transport encryption is the mesh's.)
+func (s *Builder) deploymentWithSSL(binding *ExternalInstance) bool {
+	if binding == nil {
+		return false
+	}
+	return !s.WithoutSSL
 }
 
 func (s *Builder) deploymentNetworkInstance(
@@ -885,11 +914,12 @@ func (s *Builder) selectPromotableSecretReferences(
 		}
 		selected[environmentVariable] = reference
 	}
-	selected[migrationConnectionEnvironmentKey] = &builderv0.KubernetesSecretKeyReference{
-		Name: secretName,
-		Key:  migrationConnectionEnvironmentKey,
-	}
-	bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, migrationConnectionEnvironmentKey)
+	// The Job connects as the migration owner through libpq's environment,
+	// from the same primitives the StatefulSet initializes the server with —
+	// never from an assembled connection string an operator has to store.
+	selected["PGUSER"] = selected["POSTGRES_USER"]
+	selected["PGPASSWORD"] = selected["POSTGRES_PASSWORD"]
+	bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, "PGUSER", "PGPASSWORD")
 	selectForWorkload := func(environmentVariables []string) map[string]*builderv0.KubernetesSecretKeyReference {
 		workloadReferences := make(map[string]*builderv0.KubernetesSecretKeyReference, len(environmentVariables))
 		for _, environmentVariable := range environmentVariables {

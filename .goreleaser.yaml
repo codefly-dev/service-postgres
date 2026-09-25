@@ -28,3 +28,10 @@ archives:
   - id: default
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+# A `codefly publish dev` tag (v<version>-dev.<sha>) is a semver prerelease;
+# auto publishes it as a GitHub prerelease that is never marked Latest, so a
+# dev build can never be what `version: latest` resolves to. A release tag has
+# no prerelease part and publishes exactly as before.
+release:
+  prerelease: auto
