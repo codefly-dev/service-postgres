@@ -238,8 +238,11 @@ type DockerTemplating struct {
 	// DefaultReadWriteRole is the application role the managed read-write login
 	// selects on connect. See defaultRuntimeReadWriteRole.
 	DefaultReadWriteRole string
-	Extensions           []BootstrapExtension
-	Lineages             []BootstrapLineage
+	// Logins are the declared runtime login principals the bootstrap Job
+	// provisions beside the managed read-write login.
+	Logins     []BootstrapLogin
+	Extensions []BootstrapExtension
+	Lineages   []BootstrapLineage
 }
 
 // Bootstrap resolves the locked bootstrap inputs the Dockerfile renders from. A
@@ -247,6 +250,29 @@ type DockerTemplating struct {
 // constructed value must not be able to omit it.
 func (DockerTemplating) Bootstrap() *bootstrapImageLock {
 	return bootstrapLock
+}
+
+// BootstrapLogin is one declared runtime login as runtime-access.sql sees it:
+// its role, the environment variable its password arrives on, its exclusive
+// delegated role set and the one it defaults to.
+type BootstrapLogin struct {
+	Role             string
+	PasswordVariable string
+	ReadWriteRoles   []string
+	DefaultRole      string
+}
+
+func bootstrapLogins(logins []runtimeLogin) []BootstrapLogin {
+	out := make([]BootstrapLogin, 0, len(logins))
+	for _, login := range logins {
+		out = append(out, BootstrapLogin{
+			Role:             login.role,
+			PasswordVariable: login.passwordKey,
+			ReadWriteRoles:   login.readWriteRoles,
+			DefaultRole:      defaultRuntimeReadWriteRole(login.readWriteRoles),
+		})
+	}
+	return out
 }
 
 // BootstrapLineage is one migration lineage as the generated bootstrap program
@@ -340,6 +366,10 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	if err != nil {
 		return s.Builder.BuildError(err)
 	}
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return s.Builder.BuildError(err)
+	}
 	if err = plan.attest(); err != nil {
 		return s.Builder.BuildError(err)
 	}
@@ -353,6 +383,7 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 		Schemas:                        plan.access.schemas,
 		ReadWriteRoles:                 plan.access.readWriteRoles,
 		DefaultReadWriteRole:           defaultRuntimeReadWriteRole(plan.access.readWriteRoles),
+		Logins:                         bootstrapLogins(logins),
 		Extensions:                     bootstrapExtensions(plan),
 		Lineages:                       bootstrapLineages(plan),
 	}
@@ -653,6 +684,10 @@ func (s *Builder) prepareDeployment(
 	parameters *DeploymentTemplateParameters,
 ) (*v0.Configuration, error) {
 	req := deployment.Request
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return nil, err
+	}
 	instance, binding, err := s.deploymentNetworkInstance(
 		ctx,
 		req.GetNetworkMappings(),
@@ -688,6 +723,7 @@ func (s *Builder) prepareDeployment(
 		workloadReferences, referencesErr := s.selectPromotableSecretReferences(
 			deployment.Kubernetes.GetSecretReferences(),
 			binding != nil,
+			logins,
 		)
 		if referencesErr != nil {
 			return nil, referencesErr
@@ -729,6 +765,9 @@ func (s *Builder) prepareDeployment(
 		resources.Env("POSTGRES_READ_WRITE_PASSWORD", s.readWritePassword),
 		resources.Env(migrationConnectionEnvironmentKey, ownerConnection),
 	)
+	for _, login := range logins {
+		deployment.AddSecrets(resources.Env(login.passwordKey, s.loginPasswords[login.name]))
+	}
 	if binding != nil {
 		deployment.AddSecrets(
 			resources.Env("PGUSER", s.postgresUser),
@@ -859,6 +898,7 @@ type promotableWorkloadSecretReferences struct {
 func (s *Builder) selectPromotableSecretReferences(
 	configured map[string]*builderv0.KubernetesSecretKeyReference,
 	external bool,
+	logins []runtimeLogin,
 ) (*promotableWorkloadSecretReferences, error) {
 	// The restricted deploy build never loads runtime credentials, so this is
 	// the only place the auth mode is checked on this path: reject a mistyped
@@ -887,14 +927,22 @@ func (s *Builder) selectPromotableSecretReferences(
 		"POSTGRES_READ_ONLY_PASSWORD",
 		"POSTGRES_READ_WRITE_PASSWORD",
 	}
-	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, 5)
-	secretName := ""
-	for _, environmentVariable := range []string{
+	primitives := []string{
 		"POSTGRES_USER",
 		"POSTGRES_PASSWORD",
 		"POSTGRES_READ_ONLY_PASSWORD",
 		"POSTGRES_READ_WRITE_PASSWORD",
-	} {
+	}
+	// Each declared login's password is one more primitive: the bootstrap Job
+	// sets it on the login's role, and consumers' connections are templated
+	// over it. It lives in the same Secret as the others.
+	for _, login := range logins {
+		primitives = append(primitives, login.passwordKey)
+		bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, login.passwordKey)
+	}
+	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(primitives)+2)
+	secretName := ""
+	for _, environmentVariable := range primitives {
 		configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(
 			s.Unique(),
 			"postgres",

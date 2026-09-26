@@ -59,6 +59,95 @@ type runtimeAccess struct {
 	readWriteRoles []string
 }
 
+// runtimeLogin is a declared read-write login principal resolved against the
+// database: its role, the keys its password and connection travel under, and
+// its exclusive delegated role set (see Settings.RuntimeLogins).
+type runtimeLogin struct {
+	name           string
+	role           string
+	passwordKey    string
+	connectionKey  string
+	readWriteRoles []string
+}
+
+// maxRuntimeLoginNameLength keeps every derived role name inside PostgreSQL's
+// 63-byte identifier limit: the managed prefix is at most 41 bytes.
+const maxRuntimeLoginNameLength = 16
+
+// reservedRuntimeLoginNames would collide with a managed key: the exported
+// owner-, read-only- and read-write-connection, and their passwords.
+var reservedRuntimeLoginNames = map[string]bool{"owner": true, "read-only": true, "read-write": true}
+
+// resolveRuntimeLogins validates the declared logins and derives each one's
+// role and keys. Resolution fails on anything a render could not carry
+// faithfully, so a bad declaration is refused before any database or render
+// sees it.
+func resolveRuntimeLogins(settings *Settings) ([]runtimeLogin, error) {
+	if settings == nil || len(settings.RuntimeLogins) == 0 {
+		return nil, nil
+	}
+	if settings.AuthMode == authModeExternalIdentity {
+		return nil, fmt.Errorf("runtime-logins are password principals; external-identity mode provisions its logins outside this service")
+	}
+	if len(settings.ExternalInstances) > 0 {
+		return nil, fmt.Errorf("runtime-logins are not supported with external-instances: the external binding carries one read-write principal")
+	}
+	readOnlyRole, readWriteRole := runtimeRoleNames(settings.DatabaseName)
+	prefix := strings.TrimSuffix(readWriteRole, "_rw")
+	seen := make(map[string]bool, len(settings.RuntimeLogins))
+	logins := make([]runtimeLogin, 0, len(settings.RuntimeLogins))
+	for _, declared := range settings.RuntimeLogins {
+		name := declared.Name
+		if !validRuntimeLoginName(name) {
+			return nil, fmt.Errorf("runtime login name %q must be 1-%d lower-case letters, digits and dashes, starting with a letter", name, maxRuntimeLoginNameLength)
+		}
+		if reservedRuntimeLoginNames[name] {
+			return nil, fmt.Errorf("runtime login name %q is reserved for a managed credential", name)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("runtime login %q is declared twice", name)
+		}
+		seen[name] = true
+		slug := strings.ReplaceAll(name, "-", "_")
+		role := prefix + "_" + slug
+		if role == readOnlyRole || role == readWriteRole {
+			return nil, fmt.Errorf("runtime login %q collides with a managed login role", name)
+		}
+		roles, err := normalizedRuntimeReadWriteRoles(declared.ReadWriteRoles, readOnlyRole, readWriteRole, role)
+		if err != nil {
+			return nil, fmt.Errorf("runtime login %q: %w", name, err)
+		}
+		if len(roles) == 0 {
+			return nil, fmt.Errorf("runtime login %q must declare at least one read-write role: a login's only write authority is delegated", name)
+		}
+		logins = append(logins, runtimeLogin{
+			name:           name,
+			role:           role,
+			passwordKey:    "POSTGRES_" + strings.ToUpper(slug) + "_PASSWORD",
+			connectionKey:  name + "-connection",
+			readWriteRoles: roles,
+		})
+	}
+	return logins, nil
+}
+
+func validRuntimeLoginName(name string) bool {
+	if name == "" || len(name) > maxRuntimeLoginNameLength || name[0] < 'a' || name[0] > 'z' || strings.HasSuffix(name, "-") {
+		return false
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Service) runtimeLogins() ([]runtimeLogin, error) {
+	return resolveRuntimeLogins(s.Settings)
+}
+
 // deriveRuntimePassword deterministically upgrades legacy owner-only service
 // configurations to the scoped runtime-credential contract. HMAC makes this a
 // one-way derivation: possession of an exported reader or writer password does
@@ -107,8 +196,25 @@ func (s *Service) validateCredentials() error {
 			return fmt.Errorf("owner, read-only, and read-write passwords must be distinct")
 		}
 	}
-	_, _, err := s.runtimeAccess()
-	return err
+	if _, _, err := s.runtimeAccess(); err != nil {
+		return err
+	}
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return err
+	}
+	used := map[string]string{s.postgresPassword: "owner", s.readOnlyPassword: "read-only", s.readWritePassword: "read-write"}
+	for _, login := range logins {
+		password := s.loginPasswords[login.name]
+		if strings.TrimSpace(password) == "" {
+			return fmt.Errorf("%s must not be empty", login.passwordKey)
+		}
+		if other, taken := used[password]; taken {
+			return fmt.Errorf("the %s login password must be distinct from the %s password", login.name, other)
+		}
+		used[password] = login.name
+	}
+	return nil
 }
 
 func (s *Service) runtimeAccess() (readOnlyRole, readWriteRole string, err error) {
@@ -329,6 +435,33 @@ func (s *Runtime) ensureRuntimeAccessLocked(ctx context.Context) error {
 	// prior default — and so its prior authority — untouched.
 	if err := ensureDefaultRole(ctx, tx, access.readWriteRole, defaultRuntimeReadWriteRole(access.readWriteRoles)); err != nil {
 		return s.Wool.Wrapf(err, "cannot set the read-write default role")
+	}
+	// Each declared login is reconciled exactly like the managed read-write
+	// login, in the same transaction and under the same lock, with its own
+	// delegated role set. Its memberships are its own: reconciling one login
+	// never touches another's.
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return err
+	}
+	for _, login := range logins {
+		if err := ensureLoginRole(ctx, tx, login.role, s.loginPasswords[login.name], false); err != nil {
+			return s.Wool.Wrapf(err, "cannot provision the %s runtime login", login.name)
+		}
+		if err := pgcontrol.ReconcileRuntimeAccess(ctx, tx, pgcontrol.RuntimeAccess{
+			Database:                          s.DatabaseName,
+			OwnerRole:                         s.postgresUser,
+			ReadOnlyRole:                      access.readOnlyRole,
+			ReadWriteRole:                     login.role,
+			Schemas:                           access.schemas,
+			ReadWriteRoles:                    login.readWriteRoles,
+			ReconcileReadWriteRoleMemberships: true,
+		}); err != nil {
+			return s.Wool.Wrapf(err, "cannot reconcile the %s login's grants", login.name)
+		}
+		if err := ensureDefaultRole(ctx, tx, login.role, defaultRuntimeReadWriteRole(login.readWriteRoles)); err != nil {
+			return s.Wool.Wrapf(err, "cannot set the %s login's default role", login.name)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return s.Wool.Wrapf(err, "cannot commit runtime access transaction")
