@@ -128,6 +128,27 @@ type Settings struct {
 	// exported credential starts as.
 	RuntimeReadWriteRoles []string `yaml:"runtime-read-write-roles"`
 
+	// RuntimeLogins declares further read-write login principals beside the
+	// managed read-write one, each for one kind of consumer that must hold a
+	// DIFFERENT delegated role set. A process that must never be able to assume
+	// another's role (a request API refusing any session that can reach a
+	// maintenance role, say) cannot share the one read-write login; it takes a
+	// login of its own here.
+	//
+	// Each entry is its own LOGIN principal (NOINHERIT, NOBYPASSRLS, no direct
+	// DML) whose only write authority is membership of its read-write-roles,
+	// which migrations create; the first is its session default. It has its own
+	// primitive password, POSTGRES_<NAME>_PASSWORD in the "postgres" secret
+	// configuration (derived from the owner secret locally when absent), and is
+	// exported as <name>-connection, templated over that password in a
+	// restricted render. The managed read-write login's role set is unchanged
+	// by it.
+	//
+	//   runtime-logins:
+	//     - name: maintenance
+	//       read-write-roles: [app_runtime]
+	RuntimeLogins []RuntimeLogin `yaml:"runtime-logins"`
+
 	// MigrationSources lets SEVERAL services share this ONE database while each
 	// owns its own migrations/ folder. Each source is applied with its own
 	// golang-migrate tracking table (schema_migrations_<name>), so the per-source
@@ -148,6 +169,16 @@ type Settings struct {
 	// probing, connection establishment, migration locking and statements, and
 	// the deployed bootstrap Job. See Timeouts for the keys and defaults.
 	Timeouts Timeouts `yaml:"timeouts"`
+}
+
+// RuntimeLogin is one declared read-write login principal. See
+// Settings.RuntimeLogins.
+type RuntimeLogin struct {
+	// Name is lower-case letters, digits and dashes, starting with a letter; it
+	// names the exported <name>-connection key and the password key.
+	Name string `yaml:"name"`
+	// ReadWriteRoles is the login's exclusive delegated role set; required.
+	ReadWriteRoles []string `yaml:"read-write-roles"`
 }
 
 type ExternalInstance struct {
@@ -336,8 +367,10 @@ type Service struct {
 	postgresPassword  string
 	readOnlyPassword  string
 	readWritePassword string
-	connectionKey     string
-	connection        string
+	// loginPasswords holds each declared runtime login's password by login name.
+	loginPasswords map[string]string
+	connectionKey  string
+	connection     string
 
 	TcpEndpoint *basev0.Endpoint
 }
@@ -421,6 +454,21 @@ func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configurat
 	if strings.TrimSpace(s.readWritePassword) == "" {
 		s.readWritePassword = deriveRuntimePassword(s.postgresPassword, s.DatabaseName, readWriteConnectionKey)
 	}
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return err
+	}
+	s.loginPasswords = make(map[string]string, len(logins))
+	for _, login := range logins {
+		password, err := resources.GetConfigurationValue(ctx, conf, "postgres", login.passwordKey)
+		if err != nil {
+			return s.Wool.Wrapf(err, "cannot get the %s login password", login.name)
+		}
+		if strings.TrimSpace(password) == "" {
+			password = deriveRuntimePassword(s.postgresPassword, s.DatabaseName, login.connectionKey)
+		}
+		s.loginPasswords[login.name] = password
+	}
 	return s.validateCredentials()
 }
 
@@ -455,17 +503,24 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 	// make a role the principal cannot yet assume a FATAL that refuses the
 	// connection outright, and would never reach the restricted deploy profile,
 	// which exports these keys without values.
+	values := []*basev0.ConfigurationValue{
+		{Key: ownerConnectionKey, Value: ownerConnection, Secret: true},
+		{Key: readOnlyConnectionKey, Value: readOnlyConnection, Secret: true},
+		{Key: readWriteConnectionKey, Value: readWriteConnection, Secret: true},
+	}
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return nil, err
+	}
+	for _, login := range logins {
+		connection := postgresConnectionString(instance.Address, s.DatabaseName, login.role, s.loginPasswords[login.name], withSSL, passwordless)
+		values = append(values, &basev0.ConfigurationValue{Key: login.connectionKey, Value: connection, Secret: true})
+	}
 	outputConf := &basev0.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
 		Infos: []*basev0.ConfigurationInformation{
-			{Name: "postgres",
-				ConfigurationValues: []*basev0.ConfigurationValue{
-					{Key: ownerConnectionKey, Value: ownerConnection, Secret: true},
-					{Key: readOnlyConnectionKey, Value: readOnlyConnection, Secret: true},
-					{Key: readWriteConnectionKey, Value: readWriteConnection, Secret: true},
-				},
-			},
+			{Name: "postgres", ConfigurationValues: values},
 		},
 	}
 	return outputConf, nil
@@ -496,11 +551,22 @@ func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInst
 			instance.Address, s.DatabaseName, readWriteRole, "POSTGRES_READ_WRITE_PASSWORD", withSSL,
 		)
 	}
+	values := []*basev0.ConfigurationValue{readOnly, readWrite}
+	// Settings were validated before any render reached here, so a resolution
+	// error cannot occur; an empty set renders no login.
+	logins, _ := s.runtimeLogins()
+	for _, login := range logins {
+		value := &basev0.ConfigurationValue{Key: login.connectionKey, Secret: true}
+		if !s.externalIdentity() {
+			value.Template = postgresConnectionTemplate(instance.Address, s.DatabaseName, login.role, login.passwordKey, withSSL)
+		}
+		values = append(values, value)
+	}
 	return &basev0.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
 		Infos: []*basev0.ConfigurationInformation{
-			{Name: "postgres", ConfigurationValues: []*basev0.ConfigurationValue{readOnly, readWrite}},
+			{Name: "postgres", ConfigurationValues: values},
 		},
 	}
 }
