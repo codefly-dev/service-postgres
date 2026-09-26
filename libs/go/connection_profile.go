@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"errors"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,6 +19,20 @@ type ConnectionTransport string
 const (
 	VerifiedTLS        ConnectionTransport = "verified-tls"
 	LocalIdentityProxy ConnectionTransport = "local-identity-proxy"
+	// MeshProtected is a plaintext TCP connection to a named host whose hop the
+	// platform's service mesh encrypts and authenticates (mutual TLS between
+	// workload identities). Selecting it is the composing service's assertion
+	// that the mesh covers the hop; nothing in the process can observe that, so
+	// it is never inferred. The driver adds no TLS: sslmode must be the literal
+	// "disable", no client certificate or trust root may be named, and the
+	// password travels only inside the mesh tunnel. This is the transport the
+	// Postgres agent renders for an in-cluster store.
+	MeshProtected ConnectionTransport = "mesh-protected"
+	// LocalLoopback is a plaintext TCP connection to a database on the same
+	// machine: the host is literal loopback (127.0.0.0/8, ::1) or "localhost",
+	// and sslmode is the literal "disable". It is what a local development run
+	// of the Postgres agent serves, and it is refused for any other host.
+	LocalLoopback ConnectionTransport = "local-loopback"
 )
 
 var ErrConnectionProfile = errors.New("invalid Postgres connection profile")
@@ -82,11 +97,17 @@ func (p ConnectionProfile) validate() error {
 		if p != (ConnectionProfile{}) {
 			return ErrConnectionProfile
 		}
-	case VerifiedTLS, LocalIdentityProxy:
+	case VerifiedTLS, LocalIdentityProxy, MeshProtected, LocalLoopback:
 	default:
 		return ErrConnectionProfile
 	}
 	return nil
+}
+
+// plaintext reports the profiles whose driver connection carries no TLS over
+// TCP: the hop's protection is the mesh's, or the hop never leaves the machine.
+func (p ConnectionProfile) plaintext() bool {
+	return p.Transport == MeshProtected || p.Transport == LocalLoopback
 }
 
 // ParseConnection parses once and validates the returned configuration without
@@ -158,8 +179,17 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 			return nil, ErrConnectionProfile
 		}
 	} else {
-		if host == "" || strings.ContainsAny(host, ",/\x00\r\n") || q.Get("sslmode") != "verify-full" {
+		sslmode := "verify-full"
+		if profile.plaintext() {
+			sslmode = "disable"
+		}
+		if host == "" || strings.ContainsAny(host, ",/\x00\r\n") || q.Get("sslmode") != sslmode {
 			return nil, ErrConnectionProfile
+		}
+		if profile.Transport == LocalLoopback && host != "localhost" {
+			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+				return nil, ErrConnectionProfile
+			}
 		}
 		if u.Port() != "" {
 			port, err = strconv.ParseUint(u.Port(), 10, 16)
@@ -202,6 +232,10 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 	}
 	if profile.Transport == LocalIdentityProxy {
 		if c.TLSConfig != nil || c.Password != "" {
+			return nil, ErrConnectionProfile
+		}
+	} else if profile.plaintext() {
+		if c.TLSConfig != nil {
 			return nil, ErrConnectionProfile
 		}
 	} else if c.TLSConfig == nil || c.TLSConfig.InsecureSkipVerify || c.TLSConfig.ServerName != host || c.TLSConfig.VerifyPeerCertificate != nil || c.TLSConfig.VerifyConnection != nil {
