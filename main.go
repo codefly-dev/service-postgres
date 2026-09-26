@@ -128,6 +128,27 @@ type Settings struct {
 	// exported credential starts as.
 	RuntimeReadWriteRoles []string `yaml:"runtime-read-write-roles"`
 
+	// RuntimeLogins declares further read-write login principals beside the
+	// managed read-write one, each for one kind of consumer that must hold a
+	// DIFFERENT delegated role set. A process that must never be able to assume
+	// another's role (a request API refusing any session that can reach a
+	// maintenance role, say) cannot share the one read-write login; it takes a
+	// login of its own here.
+	//
+	// Each entry is its own LOGIN principal (NOINHERIT, NOBYPASSRLS, no direct
+	// DML) whose only write authority is membership of its read-write-roles,
+	// which migrations create; the first is its session default. It has its own
+	// primitive password, POSTGRES_<NAME>_PASSWORD in the "postgres" secret
+	// configuration (derived from the owner secret locally when absent), and is
+	// exported as <name>-connection, templated over that password in a
+	// restricted render. The managed read-write login's role set is unchanged
+	// by it.
+	//
+	//   runtime-logins:
+	//     - name: maintenance
+	//       read-write-roles: [app_runtime]
+	RuntimeLogins []RuntimeLogin `yaml:"runtime-logins"`
+
 	// MigrationSources lets SEVERAL services share this ONE database while each
 	// owns its own migrations/ folder. Each source is applied with its own
 	// golang-migrate tracking table (schema_migrations_<name>), so the per-source
@@ -148,6 +169,16 @@ type Settings struct {
 	// probing, connection establishment, migration locking and statements, and
 	// the deployed bootstrap Job. See Timeouts for the keys and defaults.
 	Timeouts Timeouts `yaml:"timeouts"`
+}
+
+// RuntimeLogin is one declared read-write login principal. See
+// Settings.RuntimeLogins.
+type RuntimeLogin struct {
+	// Name is lower-case letters, digits and dashes, starting with a letter; it
+	// names the exported <name>-connection key and the password key.
+	Name string `yaml:"name"`
+	// ReadWriteRoles is the login's exclusive delegated role set; required.
+	ReadWriteRoles []string `yaml:"read-write-roles"`
 }
 
 type ExternalInstance struct {
@@ -287,6 +318,14 @@ type DeploymentTemplateParameters struct {
 	// and folds it onto 5432, the port the container listens on. Zero leaves the
 	// template on 5432.
 	ServicePort uint32
+	// OwnerFromLibpqEnvironment makes the restricted bootstrap Job reach the
+	// managed server as the migration owner through PGHOST, PGPORT, PGDATABASE,
+	// PGSSLMODE (when pinned), PGUSER and PGPASSWORD instead of an assembled
+	// owner connection string.
+	OwnerFromLibpqEnvironment bool
+	OwnerHost                 string
+	OwnerPort                 string
+	OwnerSSLMode              string
 }
 
 // defaultExtensions are CREATE EXTENSION'd on every start. They are convenience
@@ -328,8 +367,10 @@ type Service struct {
 	postgresPassword  string
 	readOnlyPassword  string
 	readWritePassword string
-	connectionKey     string
-	connection        string
+	// loginPasswords holds each declared runtime login's password by login name.
+	loginPasswords map[string]string
+	connectionKey  string
+	connection     string
 
 	TcpEndpoint *basev0.Endpoint
 }
@@ -413,6 +454,21 @@ func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configurat
 	if strings.TrimSpace(s.readWritePassword) == "" {
 		s.readWritePassword = deriveRuntimePassword(s.postgresPassword, s.DatabaseName, readWriteConnectionKey)
 	}
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return err
+	}
+	s.loginPasswords = make(map[string]string, len(logins))
+	for _, login := range logins {
+		password, err := resources.GetConfigurationValue(ctx, conf, "postgres", login.passwordKey)
+		if err != nil {
+			return s.Wool.Wrapf(err, "cannot get the %s login password", login.name)
+		}
+		if strings.TrimSpace(password) == "" {
+			password = deriveRuntimePassword(s.postgresPassword, s.DatabaseName, login.connectionKey)
+		}
+		s.loginPasswords[login.name] = password
+	}
 	return s.validateCredentials()
 }
 
@@ -447,17 +503,24 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 	// make a role the principal cannot yet assume a FATAL that refuses the
 	// connection outright, and would never reach the restricted deploy profile,
 	// which exports these keys without values.
+	values := []*basev0.ConfigurationValue{
+		{Key: ownerConnectionKey, Value: ownerConnection, Secret: true},
+		{Key: readOnlyConnectionKey, Value: readOnlyConnection, Secret: true},
+		{Key: readWriteConnectionKey, Value: readWriteConnection, Secret: true},
+	}
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return nil, err
+	}
+	for _, login := range logins {
+		connection := postgresConnectionString(instance.Address, s.DatabaseName, login.role, s.loginPasswords[login.name], withSSL, passwordless)
+		values = append(values, &basev0.ConfigurationValue{Key: login.connectionKey, Value: connection, Secret: true})
+	}
 	outputConf := &basev0.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
 		Infos: []*basev0.ConfigurationInformation{
-			{Name: "postgres",
-				ConfigurationValues: []*basev0.ConfigurationValue{
-					{Key: ownerConnectionKey, Value: ownerConnection, Secret: true},
-					{Key: readOnlyConnectionKey, Value: readOnlyConnection, Secret: true},
-					{Key: readWriteConnectionKey, Value: readWriteConnection, Secret: true},
-				},
-			},
+			{Name: "postgres", ConfigurationValues: values},
 		},
 	}
 	return outputConf, nil
@@ -466,26 +529,61 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 // promotableConnectionConfiguration describes the capability-scoped handoff
 // without embedding credentials. The migration owner remains private to the
 // bootstrap Job and is never advertised to dependent workloads.
-func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInstance) *basev0.Configuration {
+//
+// Each connection carries a template instead of a value: the role, address,
+// database and sslmode are known here and are not secret, and the password is
+// a reference to this service's own runtime password. Whoever delivers the
+// value (the CLI's ExternalSecret projection) assembles it where the passwords
+// are, so a secret store holds only the passwords the bootstrap Job sets on the
+// roles, and nobody assembles a connection string by hand.
+//
+// External-identity mode holds no password, so there is nothing to assemble a
+// value from: its connections stay keys without values, as before.
+func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInstance, withSSL bool) *basev0.Configuration {
+	readOnly := &basev0.ConfigurationValue{Key: readOnlyConnectionKey, Secret: true}
+	readWrite := &basev0.ConfigurationValue{Key: readWriteConnectionKey, Secret: true}
+	if !s.externalIdentity() {
+		readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
+		readOnly.Template = postgresConnectionTemplate(
+			instance.Address, s.DatabaseName, readOnlyRole, "POSTGRES_READ_ONLY_PASSWORD", withSSL,
+		)
+		readWrite.Template = postgresConnectionTemplate(
+			instance.Address, s.DatabaseName, readWriteRole, "POSTGRES_READ_WRITE_PASSWORD", withSSL,
+		)
+	}
+	values := []*basev0.ConfigurationValue{readOnly, readWrite}
+	// Settings were validated before any render reached here, so a resolution
+	// error cannot occur; an empty set renders no login.
+	logins, _ := s.runtimeLogins()
+	for _, login := range logins {
+		value := &basev0.ConfigurationValue{Key: login.connectionKey, Secret: true}
+		if !s.externalIdentity() {
+			value.Template = postgresConnectionTemplate(instance.Address, s.DatabaseName, login.role, login.passwordKey, withSSL)
+		}
+		values = append(values, value)
+	}
 	return &basev0.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
 		Infos: []*basev0.ConfigurationInformation{
-			{
-				Name: "postgres",
-				ConfigurationValues: []*basev0.ConfigurationValue{
-					{Key: readOnlyConnectionKey, Secret: true},
-					{Key: readWriteConnectionKey, Secret: true},
-				},
-			},
+			{Name: "postgres", ConfigurationValues: values},
 		},
 	}
 }
 
+// postgresSSLMode is the sslmode a connection to address pins, or "" when it
+// pins none and leaves the client's default.
+func postgresSSLMode(address string, withSSL bool) string {
+	if !withSSL || strings.Contains(address, "localhost") || strings.Contains(address, "host.docker.internal") {
+		return "disable"
+	}
+	return ""
+}
+
 func postgresConnectionString(address, database, user, password string, withSSL, passwordless bool) string {
 	query := url.Values{}
-	if !withSSL || strings.Contains(address, "localhost") || strings.Contains(address, "host.docker.internal") {
-		query.Set("sslmode", "disable")
+	if sslMode := postgresSSLMode(address, withSSL); sslMode != "" {
+		query.Set("sslmode", sslMode)
 	}
 	// External-identity mode carries no password: the consumer acquires a
 	// short-lived token at connect time, so the DSN keeps only the principal.
@@ -502,6 +600,27 @@ func postgresConnectionString(address, database, user, password string, withSSL,
 		RawQuery: query.Encode(),
 	}
 	return connection.String()
+}
+
+// postgresConnectionTemplate is postgresConnectionString with the password
+// left as a reference to passwordKey in this service's "postgres" secret
+// configuration. Every other part is built by the same url.URL encoding, so the
+// assembled value addresses the same role, host, database and sslmode as the
+// value this agent renders when it holds the password itself.
+func postgresConnectionTemplate(address, database, user, passwordKey string, withSSL bool) *basev0.ConfigurationValueTemplate {
+	withoutPassword := postgresConnectionString(address, database, user, "", withSSL, true)
+	// withoutPassword is "postgresql://<user>@<host>/<database>[?query]"; the
+	// escaped user never contains "@", so the first one separates the userinfo.
+	userinfo, target, _ := strings.Cut(withoutPassword, "@")
+	return &basev0.ConfigurationValueTemplate{Segments: []*basev0.ConfigurationValueTemplateSegment{
+		{Content: &basev0.ConfigurationValueTemplateSegment_Literal{Literal: userinfo + ":"}},
+		{Content: &basev0.ConfigurationValueTemplateSegment_Reference{Reference: &basev0.ConfigurationValueReference{
+			Configuration: "postgres",
+			Key:           passwordKey,
+			Escape:        basev0.ConfigurationValueEscape_CONFIGURATION_VALUE_ESCAPE_URL_USERINFO,
+		}}},
+		{Content: &basev0.ConfigurationValueTemplateSegment_Literal{Literal: "@" + target}},
+	}}
 }
 
 func main() {

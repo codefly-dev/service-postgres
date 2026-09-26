@@ -7,6 +7,15 @@ This service provisions Postgres as two explicit runtime capabilities:
 
   The **first** role in `runtime-read-write-roles` is set as the login's session default, so a caller that uses the secret as-is writes without issuing anything. Appending further roles does not change that default — reorder the list to change it. A caller that needs one of the other roles selects it with `SET ROLE`. Two consequences worth knowing: `RESET ROLE` returns to the default role, not to the login principal, so use `SET ROLE NONE` to drop to the unprivileged principal; and if the default role cannot be assumed (a migration has not created it yet, or reconciliation failed), the connection still opens as the principal — the server logs `WARNING: permission denied to set role` and writes fail with `42501` until the next successful reconciliation.
 
+- `postgres.<name>-connection`, once per entry in `runtime-logins`: a further read-write login for a consumer that must hold a **different** delegated role set, and must not be able to reach the managed read-write login's. Each is its own `NOINHERIT`, `NOBYPASSRLS` login with no direct table grants; its only write authority is membership of its own `read-write-roles` (created by migrations), the first of which is its session default. Its password is the `POSTGRES_<NAME>_PASSWORD` primitive (dashes become underscores); locally, when absent, it is derived from the owner secret like the reader's and writer's. In a restricted render the connection is a template over that primitive, and the bootstrap Job sets it. `runtime-logins` is refused with `external-instances` and with `auth-mode: external-identity`, whose principals this agent does not own.
+
+  ```yaml
+  runtime-read-write-roles: [app_request]
+  runtime-logins:
+    - name: maintenance
+      read-write-roles: [app_maintenance]
+  ```
+
 The migration owner is private to the Postgres service and its bootstrap job. It is never exported to dependent services. Newly generated services receive separate owner, reader, and writer secrets. Legacy owner-only services derive stable, domain-separated reader and writer credentials inside the agent so isolated checkouts start without copying developer-local configuration; explicit runtime secrets always take precedence.
 
 The bootstrap job applies migrations and reconciles runtime roles and grants on every deployment. Local Docker and Nix runtimes enforce the same contract.

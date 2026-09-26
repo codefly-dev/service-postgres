@@ -68,6 +68,20 @@ func TestBootstrapImageMatchesLocalRuntimeSchema(t *testing.T) {
 				MigrationSources: []MigrationSource{{Name: "api"}},
 			}
 		},
+		"declared runtime login": func(t *testing.T, location string) *Settings {
+			writeFixtureMigration(t, filepath.Join(location, "migrations"), "1_roles",
+				`CREATE ROLE app_request NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+CREATE ROLE app_maintenance NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+CREATE TABLE work_item (id UUID PRIMARY KEY);
+GRANT SELECT, INSERT ON work_item TO app_request, app_maintenance;`,
+				`DROP TABLE work_item; DROP ROLE app_maintenance; DROP ROLE app_request;`)
+			return &Settings{
+				DatabaseName:          parityDatabase,
+				Extensions:            []Extension{{Name: "hstore"}},
+				RuntimeReadWriteRoles: []string{"app_request"},
+				RuntimeLogins:         []RuntimeLogin{{Name: "maintenance", ReadWriteRoles: []string{"app_maintenance"}}},
+			}
+		},
 		"extension-only bootstrap": func(t *testing.T, location string) *Settings {
 			writeFixtureMigration(t, filepath.Join(location, "migrations"), "1_ignored",
 				`CREATE TABLE never_applied (id UUID PRIMARY KEY);`,
@@ -97,8 +111,8 @@ func TestBootstrapImageMatchesLocalRuntimeSchema(t *testing.T) {
 			applyLocally(ctx, t, location, settings, local.hostDSN)
 
 			bootstrapImage := buildBootstrapImage(ctx, t, location, settings)
-			runBootstrapImage(t, network, bootstrapImage, deployed.networkDSN)
-			runBootstrapImage(t, network, bootstrapImage, deployed.networkDSN)
+			runBootstrapImage(t, network, bootstrapImage, deployed.networkDSN, settings)
+			runBootstrapImage(t, network, bootstrapImage, deployed.networkDSN, settings)
 
 			readOnlyRole, readWriteRole := runtimeRoleNames(parityDatabase)
 			localSchema := snapshotSchema(ctx, t, local.hostDSN, readOnlyRole, readWriteRole)
@@ -119,6 +133,16 @@ func TestBootstrapImageMatchesLocalRuntimeSchema(t *testing.T) {
 				require.Contains(t, localSchema, "ledger: schema_migrations_api version=1 dirty=f")
 				require.Contains(t, localSchema, "ledger: schema_migrations_billing version=1 dirty=f")
 				require.NotContains(t, strings.Join(localSchema, "\n"), "ledger: schema_migrations ")
+			case "declared runtime login":
+				logins, err := resolveRuntimeLogins(settings)
+				require.NoError(t, err)
+				login := logins[0].role
+				require.Contains(t, localSchema, "role: "+login+" login=t super=f bypassrls=f")
+				require.Contains(t, localSchema, "membership: "+login+" in app_maintenance")
+				require.Contains(t, localSchema, "membership: "+readWriteRole+" in app_request")
+				require.NotContains(t, localSchema, "membership: "+login+" in app_request")
+				require.NotContains(t, localSchema, "membership: "+readWriteRole+" in app_maintenance")
+				require.Contains(t, localSchema, "config: "+login+" role=app_maintenance")
 			case "own and sibling sources":
 				require.Contains(t, localSchema, "table: store_item")
 				require.Contains(t, localSchema, "ledger: schema_migrations version=1 dirty=f")
@@ -140,6 +164,12 @@ func applyLocally(ctx context.Context, t *testing.T, location string, settings *
 	runtime.readOnlyPassword = parityReadOnlyPassword
 	runtime.readWritePassword = parityReadWritePasword
 	runtime.connection = dsn
+	logins, err := resolveRuntimeLogins(settings)
+	require.NoError(t, err)
+	runtime.loginPasswords = make(map[string]string, len(logins))
+	for _, login := range logins {
+		runtime.loginPasswords[login.name] = parityLoginPassword(login)
+	}
 
 	prerequisites, err := runtime.resolveSchemaPrerequisites()
 	require.NoError(t, err)
@@ -175,14 +205,24 @@ func buildBootstrapImage(ctx context.Context, t *testing.T, location string, set
 	return tag
 }
 
-func runBootstrapImage(t *testing.T, network, tag, dsn string) {
+func runBootstrapImage(t *testing.T, network, tag, dsn string, settings *Settings) {
 	t.Helper()
-	runDocker(t, "run", "--rm", "--network", network,
-		"--env", migrationConnectionEnvironmentKey+"="+dsn,
-		"--env", "POSTGRES_USER="+parityOwnerUser,
-		"--env", "POSTGRES_READ_ONLY_PASSWORD="+parityReadOnlyPassword,
-		"--env", "POSTGRES_READ_WRITE_PASSWORD="+parityReadWritePasword,
-		tag)
+	arguments := []string{"run", "--rm", "--network", network,
+		"--env", migrationConnectionEnvironmentKey + "=" + dsn,
+		"--env", "POSTGRES_USER=" + parityOwnerUser,
+		"--env", "POSTGRES_READ_ONLY_PASSWORD=" + parityReadOnlyPassword,
+		"--env", "POSTGRES_READ_WRITE_PASSWORD=" + parityReadWritePasword,
+	}
+	logins, err := resolveRuntimeLogins(settings)
+	require.NoError(t, err)
+	for _, login := range logins {
+		arguments = append(arguments, "--env", login.passwordKey+"="+parityLoginPassword(login))
+	}
+	runDocker(t, append(arguments, tag)...)
+}
+
+func parityLoginPassword(login runtimeLogin) string {
+	return "parity-" + login.name + "-password"
 }
 
 // snapshotSchema renders every externally visible part of the schema contract
@@ -201,7 +241,16 @@ func snapshotSchema(ctx context.Context, t *testing.T, dsn, readOnlyRole, readWr
 		`SELECT format('extension: %s', extname) FROM pg_extension ORDER BY extname`)...)
 	snapshot = append(snapshot, queryLines(ctx, t, db,
 		`SELECT format('role: %s login=%s super=%s bypassrls=%s', rolname, rolcanlogin, rolsuper, rolbypassrls)
-		 FROM pg_roles WHERE rolname IN ($1, $2) ORDER BY rolname`, readOnlyRole, readWriteRole)...)
+		 FROM pg_roles WHERE rolname IN ($1, $2) OR rolname LIKE 'codefly\_%' ORDER BY rolname`, readOnlyRole, readWriteRole)...)
+	snapshot = append(snapshot, queryLines(ctx, t, db,
+		`SELECT format('membership: %s in %s', member.rolname, granted.rolname)
+		 FROM pg_auth_members m
+		 JOIN pg_roles member ON member.oid = m.member
+		 JOIN pg_roles granted ON granted.oid = m.roleid
+		 WHERE member.rolname LIKE 'codefly\_%' ORDER BY 1`)...)
+	snapshot = append(snapshot, queryLines(ctx, t, db,
+		`SELECT format('config: %s %s', rolname, array_to_string(rolconfig, ','))
+		 FROM pg_roles WHERE rolname LIKE 'codefly\_%' AND rolconfig IS NOT NULL ORDER BY 1`)...)
 	snapshot = append(snapshot, queryLines(ctx, t, db,
 		`SELECT format('grant: %s on %s %s', grantee, table_name, privilege_type)
 		 FROM information_schema.role_table_grants WHERE grantee IN ($1, $2)

@@ -605,3 +605,48 @@ func renderTemplate(t *testing.T, fsys fs.FS, name string, parameters DockerTemp
 	}
 	return rendered.String()
 }
+
+// A restricted render of the managed server hands the migration owner over as
+// libpq's environment, from the primitives the server is initialized with, so
+// no assembled owner connection string has to exist anywhere. The program must
+// then connect through the empty URL and never demand the connection variable.
+func TestBootstrapProgramConnectsThroughLibpqEnvironmentForTheManagedOwner(t *testing.T) {
+	program := renderStagedTemplate(t, "templates/bootstrap/bootstrap.sh.tmpl", testBootstrapTemplating())
+	bin := t.TempDir()
+	calls := filepath.Join(t.TempDir(), "calls")
+	for _, name := range []string{"pg_isready", "psql"} {
+		body := fmt.Sprintf("#!/bin/sh\necho \"%s $*\" >> %q\nexit 0\n", name, calls)
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := exec.Command("/bin/sh", "-c", program)
+	command.Env = []string{
+		"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"CODEFLY_POSTGRES_OWNER_FROM_LIBPQ_ENVIRONMENT=true",
+		"PGHOST=store.platform.svc.cluster.local",
+		"PGPORT=5432",
+		"PGDATABASE=accounts",
+		"PGUSER=owner",
+		"PGPASSWORD=owner-secret",
+		"POSTGRES_DB=accounts",
+	}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("bootstrap refused the libpq environment: %v\n%s", err, output)
+	}
+	recorded, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"pg_isready -q -d postgresql:///",
+		"psql postgresql:/// --no-psqlrc --set=ON_ERROR_STOP=1 --file=/app/bootstrap.sql",
+	} {
+		if !strings.Contains(string(recorded), expected) {
+			t.Fatalf("bootstrap did not run %q:\n%s", expected, recorded)
+		}
+	}
+	if strings.Contains(string(recorded), "owner-secret") {
+		t.Fatalf("the owner password reached a command line:\n%s", recorded)
+	}
+}
