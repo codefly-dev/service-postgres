@@ -166,7 +166,16 @@ may require distinct reader/writer socket directories using
 `WithDistinctProxySockets()`. This checks the local binding only; the deployment
 owner must attest the proxy's remote TLS, identity and isolation separately.
 
-In either explicit profile, duplicate keys, case aliases, unknown options,
+`MeshProtected` is a plaintext TCP connection to one named host, for a store the
+platform's service mesh reaches over mutual TLS between workload identities — the
+connection the Postgres agent renders for an in-cluster store. It requires
+`sslmode=disable` literally, allows a password, and rejects CA/client-certificate
+files, passfiles, socket hosts, pool settings and fallbacks. Selecting it is the
+service's assertion that the mesh covers the hop; it is never inferred from a URL.
+`LocalLoopback` is the same shape restricted to `localhost` or a literal loopback
+address: what a local development run of the agent serves.
+
+In any explicit profile, duplicate keys, case aliases, unknown options,
 session-authorization injection, endpoint/login/database overrides and any `PG*`
 environment variable (including an empty one) fail before pool creation. The only
 accepted startup role is the exact nonempty `ApplicationRole`; empty forbids a URL
