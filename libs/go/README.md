@@ -98,17 +98,23 @@ exactly as with restricted sessions.
 Both lifecycle boundaries run the same ordered chain: any connection hook the
 caller already set, then this library's mandatory checks (the maintenance role
 qualification, on new connections only), then the restricted-session policy, then
-the capability's connection policy. A refusal at any step destroys that
-connection and fails the acquisition with that error, so a refused connection
-never serves application traffic and the reason reaches the caller. A prior hook
-keeps its own verdict: pgx's `PrepareConn` semantics are preserved unchanged,
-including a prior hook that asks for a retry rather than a failure.
+the capability's connection policy.
+
+A refusal by one of this library's own checks — restricted session or the
+capability policy — destroys that connection and fails the acquisition with that
+error, so a refused connection never serves application traffic and the reason
+reaches the caller. A prior hook the caller set keeps its own verdict instead,
+with pgx's `PrepareConn` semantics unchanged: returning true with an error
+releases the connection to the pool and fails the query rather than destroying
+it, and returning false with no error asks pgx to retry on a fresh connection
+rather than failing. Only the library's refusals are destructive.
 
 Checkout runs the policy on every transaction, so a policy costs whatever it
 queries, per transaction, on top of the restricted-session round trip. Connect
 runs it once per physical connection, including reconnects and background pool
 refills. When `WithOperationTimeout` is set it bounds each boundary's whole chain
-— one budget for the chain, not one per check. That bound matters on the connect
+— one budget for the chain, not one per check, and the caller's own prior hook is
+inside it. That bound matters on the connect
 path: pgx deliberately lets a connection finish building after its acquire is
 cancelled, so a connect-time check has no deadline of its own. The bound refuses
 a check that outlives it; it cannot interrupt callback code that ignores its

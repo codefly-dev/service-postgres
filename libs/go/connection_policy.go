@@ -89,22 +89,24 @@ func installConnectionValidation(pc *pgxpool.Config, c config, v connectionValid
 	if !anyCheck(onConnect) {
 		return
 	}
-	// One bounded context covers a whole boundary, not one timeout per callback,
-	// so a chain cannot outlast the caller's operation budget by running several
-	// checks back to back. puddle hands the connect path a context whose
+	// One bounded context covers a whole boundary, the caller's own hook
+	// included, not one timeout per callback: a chain cannot outlast the
+	// caller's operation budget by running several checks back to back, and no
+	// step of it runs unbounded. puddle hands the connect path a context whose
 	// deadline and cancellation come from the pool rather than from the caller
 	// (it deliberately lets a connection finish after its Acquire is cancelled),
-	// so without this bound a connect-time check has no deadline at all.
+	// so without this bound a connect-time step has no deadline at all.
 	//
 	// The bound cannot stop a callback that ignores its context; it can only
-	// refuse the connection afterwards. Nothing here runs a check in a detached
+	// refuse the connection afterwards. Nothing here runs a step in a detached
 	// goroutine, so no callback keeps using a connection after it is refused.
-	validate := func(ctx context.Context, conn *pgx.Conn, checks []ConnectionPolicy) error {
+	bounded := func(ctx context.Context) (context.Context, context.CancelFunc) {
 		if c.operationTimeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, c.operationTimeout)
-			defer cancel()
+			return context.WithTimeout(ctx, c.operationTimeout)
 		}
+		return ctx, func() {}
+	}
+	validate := func(ctx context.Context, conn *pgx.Conn, checks []ConnectionPolicy) error {
 		for _, check := range checks {
 			if check == nil {
 				continue
@@ -122,8 +124,13 @@ func installConnectionValidation(pc *pgxpool.Config, c config, v connectionValid
 	}
 	afterConnect := pc.AfterConnect
 	pc.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		ctx, cancel := bounded(ctx)
+		defer cancel()
 		if afterConnect != nil {
 			if err := afterConnect(ctx, conn); err != nil {
+				return err
+			}
+			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
@@ -144,12 +151,18 @@ func installConnectionValidation(pc *pgxpool.Config, c config, v connectionValid
 	}
 	pc.BeforeAcquire = nil
 	pc.PrepareConn = func(ctx context.Context, conn *pgx.Conn) (bool, error) {
+		ctx, cancel := bounded(ctx)
+		defer cancel()
 		if prepare != nil {
 			// Anything other than (true, nil) is the prior hook's own verdict and
 			// is returned unchanged: (true, err) releases the connection and
 			// fails the query, (false, nil) asks pgx to retry on a fresh one.
 			if ok, err := prepare(ctx, conn); !ok || err != nil {
 				return ok, err
+			}
+			// Its success is only as current as the boundary it ran in.
+			if err := ctx.Err(); err != nil {
+				return false, err
 			}
 		}
 		if err := validate(ctx, conn, onCheckout); err != nil {

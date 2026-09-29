@@ -286,3 +286,131 @@ func TestMandatoryConnectCheckNeedsNoCheckoutHook(t *testing.T) {
 		t.Fatal("connect-only check added a checkout cost")
 	}
 }
+
+// priorHookForms are the three shapes a caller's own hook can take: one on the
+// connect boundary and the two pgx accepts on the checkout boundary.
+func priorHookForms() []struct {
+	name     string
+	install  func(*pgxpool.Config, func(context.Context))
+	boundary func(*pgxpool.Config, context.Context) (bool, error)
+} {
+	checkout := func(pc *pgxpool.Config, ctx context.Context) (bool, error) {
+		return pc.PrepareConn(ctx, nil)
+	}
+	return []struct {
+		name     string
+		install  func(*pgxpool.Config, func(context.Context))
+		boundary func(*pgxpool.Config, context.Context) (bool, error)
+	}{
+		{
+			name: "prior AfterConnect",
+			install: func(pc *pgxpool.Config, observe func(context.Context)) {
+				pc.AfterConnect = func(ctx context.Context, _ *pgx.Conn) error { observe(ctx); return nil }
+			},
+			boundary: func(pc *pgxpool.Config, ctx context.Context) (bool, error) {
+				err := pc.AfterConnect(ctx, nil)
+				return err == nil, err
+			},
+		},
+		{
+			name: "prior BeforeAcquire",
+			install: func(pc *pgxpool.Config, observe func(context.Context)) {
+				pc.BeforeAcquire = func(ctx context.Context, _ *pgx.Conn) bool { observe(ctx); return true }
+			},
+			boundary: checkout,
+		},
+		{
+			name: "prior PrepareConn",
+			install: func(pc *pgxpool.Config, observe func(context.Context)) {
+				pc.PrepareConn = func(ctx context.Context, _ *pgx.Conn) (bool, error) { observe(ctx); return true, nil }
+			},
+			boundary: checkout,
+		},
+	}
+}
+
+func TestConnectionValidationBoundsThePriorHookToo(t *testing.T) {
+	const budget = time.Minute
+	for _, form := range priorHookForms() {
+		t.Run(form.name, func(t *testing.T) {
+			var seen []context.Context
+			observe := func(ctx context.Context) { seen = append(seen, ctx) }
+			pc := policyPoolConfig(t)
+			form.install(pc, observe)
+			c, err := configured(
+				WithConnectionPolicies(func(ctx context.Context, _ *pgx.Conn) error { observe(ctx); return nil }, nil),
+				WithOperationTimeout(budget),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			installConnectionValidation(pc, c, connectionValidation{capability: "read-only", policy: c.readerPolicy})
+
+			// The connect boundary is reached through a context that carries no
+			// deadline of its own, exactly as puddle's constructor supplies it.
+			if ok, err := form.boundary(pc, context.Background()); !ok || err != nil {
+				t.Fatalf("boundary = %v, %v", ok, err)
+			}
+			if len(seen) != 2 {
+				t.Fatalf("chain ran %d steps", len(seen))
+			}
+			prior, ok := seen[0].Deadline()
+			if !ok {
+				t.Fatal("the prior hook ran outside the configured operation timeout")
+			}
+			policy, ok := seen[1].Deadline()
+			if !ok || !prior.Equal(policy) {
+				t.Fatal("the prior hook and the policy did not share one boundary budget")
+			}
+			if time.Until(prior) > budget {
+				t.Fatal("the shared budget exceeded the configured operation timeout")
+			}
+			for step, ctx := range seen {
+				if ctx.Err() == nil {
+					t.Fatalf("step %d context outlived its boundary", step)
+				}
+			}
+
+			// An earlier caller deadline is never extended, for the prior hook either.
+			seen = nil
+			parent, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer stop()
+			if ok, err := form.boundary(pc, parent); !ok || err != nil {
+				t.Fatalf("bounded boundary = %v, %v", ok, err)
+			}
+			if deadline, ok := seen[0].Deadline(); !ok || time.Until(deadline) > 50*time.Millisecond {
+				t.Fatal("the prior hook's deadline was extended past the caller's")
+			}
+		})
+	}
+}
+
+func TestConnectionValidationRefusesAfterAnExpiredPriorHook(t *testing.T) {
+	for _, form := range priorHookForms() {
+		t.Run(form.name, func(t *testing.T) {
+			policyRuns := 0
+			pc := policyPoolConfig(t)
+			form.install(pc, func(context.Context) {})
+			c, err := configured(
+				WithConnectionPolicies(func(context.Context, *pgx.Conn) error { policyRuns++; return nil }, nil),
+				WithOperationTimeout(time.Minute),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			installConnectionValidation(pc, c, connectionValidation{capability: "read-only", policy: c.readerPolicy})
+			// A prior hook that reports success on a boundary whose budget is
+			// already gone has validated nothing current, so the later checks must
+			// not run on its verdict.
+			expired, stop := context.WithCancel(context.Background())
+			stop()
+			ok, err := form.boundary(pc, expired)
+			if ok || !errors.Is(err, context.Canceled) {
+				t.Fatalf("expired boundary = %v, %v", ok, err)
+			}
+			if policyRuns != 0 {
+				t.Fatal("the policy ran on an expired boundary after the prior hook succeeded")
+			}
+		})
+	}
+}
