@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // WithRestrictedSession makes Open and OpenMaintenance reject privileged or
@@ -59,25 +58,4 @@ func checkRestrictedSession(ctx context.Context, conn *pgx.Conn, denied []string
 		return errors.New("Postgres session does not satisfy its restricted role policy")
 	}
 	return nil
-}
-
-func installRestrictedSession(pc *pgxpool.Config, c config) {
-	if !c.restrictedSession {
-		return
-	}
-	after, before := pc.AfterConnect, pc.BeforeAcquire
-	pc.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		if after != nil {
-			if err := after(ctx, conn); err != nil {
-				return err
-			}
-		}
-		return checkRestrictedSession(ctx, conn, c.deniedRoles)
-	}
-	pc.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
-		if before != nil && !before(ctx, conn) {
-			return false
-		}
-		return checkRestrictedSession(ctx, conn, c.deniedRoles) == nil
-	}
 }

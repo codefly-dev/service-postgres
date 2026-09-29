@@ -215,7 +215,7 @@ func TestRestrictedSessionPostgres(t *testing.T) {
 		pc.AfterConnect = func(context.Context, *pgx.Conn) error { after = true; return nil }
 		pc.BeforeAcquire = func(context.Context, *pgx.Conn) bool { before = true; return true }
 		c, _ := configured(policy)
-		installRestrictedSession(pc, c)
+		installConnectionValidation(pc, c, connectionValidation{capability: "read-only"})
 		pool, err := pgxpool.NewWithConfig(ctx, pc)
 		if err != nil {
 			t.Fatal(err)
