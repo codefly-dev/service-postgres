@@ -79,7 +79,7 @@ func OpenMaintenance(ctx context.Context, connection, applicationRole string, op
 		installAccessTokenProvider(pc, c.accessTokenProvider)
 	}
 	// Qualify each new backend, including after a reconnect or credential rotation.
-	pc.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+	qualify := func(ctx context.Context, conn *pgx.Conn) error {
 		var safe bool
 		err := conn.QueryRow(ctx, `SELECT current_user=$1 AND NOT a.rolcanlogin
 		 AND NOT (a.rolsuper OR a.rolcreatedb OR a.rolcreaterole OR a.rolreplication OR a.rolbypassrls)
@@ -95,7 +95,9 @@ func OpenMaintenance(ctx context.Context, connection, applicationRole string, op
 		}
 		return nil
 	}
-	installRestrictedSession(pc, c)
+	installConnectionValidation(pc, c, connectionValidation{
+		capability: "maintenance", onConnect: qualify, policy: c.maintenancePolicy,
+	})
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
 		return nil, nil, profileConnectionError(c.maintenanceProfile, errors.New("cannot open maintenance Postgres capability"))

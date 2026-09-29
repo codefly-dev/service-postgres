@@ -40,8 +40,12 @@ func Open(
 		installAccessTokenProvider(readerConfig, configuration.accessTokenProvider)
 		installAccessTokenProvider(writerConfig, configuration.accessTokenProvider)
 	}
-	installRestrictedSession(readerConfig, configuration)
-	installRestrictedSession(writerConfig, configuration)
+	installConnectionValidation(readerConfig, configuration, connectionValidation{
+		capability: "read-only", policy: configuration.readerPolicy,
+	})
+	installConnectionValidation(writerConfig, configuration, connectionValidation{
+		capability: "read-write", policy: configuration.writerPolicy,
+	})
 	readerPool, err := pgxpool.NewWithConfig(ctx, readerConfig)
 	if err != nil {
 		return nil, nil, profileConnectionError(configuration.readerProfile, fmt.Errorf("open read-only Postgres capability: %w", err))

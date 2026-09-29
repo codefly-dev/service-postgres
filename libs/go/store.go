@@ -159,6 +159,9 @@ type config struct {
 	readerProfile        ConnectionProfile
 	writerProfile        ConnectionProfile
 	maintenanceProfile   ConnectionProfile
+	readerPolicy         ConnectionPolicy
+	writerPolicy         ConnectionPolicy
+	maintenancePolicy    ConnectionPolicy
 	distinctProxySockets bool
 }
 

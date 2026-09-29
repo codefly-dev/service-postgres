@@ -60,8 +60,10 @@ BYPASSRLS, CREATEROLE or CREATEDB), or the current database owner. A missing nam
 role fails closed. With no arguments it still checks privileged and owner roles.
 The policy uses read-only catalog queries on every new physical connection and
 every pool checkout, adding a catalog round trip to checkout. A newly forbidden
-connection is discarded before the application transaction begins. Errors do not
-expose the denied role names or credentials.
+connection is discarded before the application transaction begins, and the
+acquisition fails with that refusal rather than retrying on fresh connections
+until pgx's attempt budget is exhausted. Errors do not expose the denied role
+names or credentials.
 
 This does not grant privileges, change RLS, audit table/function grants or replace
 separate process credentials. It cannot fence a concurrent GRANT after checkout;
@@ -75,6 +77,68 @@ The isolated regression below also exercises safe sessions, direct/transitive
 membership denial, privileged/owner denial, permission changes on pooled sessions,
 reconnection after revoke and composition with maintenance validation. It uses
 fixture-only roles and no cloud identities.
+
+## Connection policies
+
+`WithConnectionPolicies(reader, writer)` carries an application's own
+connection-authority rule on the pools `Open` owns, one policy per capability.
+`WithMaintenanceConnectionPolicy` does the same for the separately wired
+maintenance capability. A `ConnectionPolicy` is
+`func(context.Context, *pgx.Conn) error`: nil admits the connection, any error
+refuses it. The policy itself stays in the application; this library owns only
+the lifecycle that runs it.
+
+Coverage is per capability and never crosses. The reader policy runs on the
+read-only pool and the writer policy on the read-write pool, each with its own
+login, and neither reaches maintenance; the maintenance policy reaches neither of
+them. Pools a caller builds and passes to `NewFactory` or `NewMaintenance` are
+not rewired by any of these options — their owner enforces the equivalent policy,
+exactly as with restricted sessions.
+
+Both lifecycle boundaries run the same ordered chain: any connection hook the
+caller already set, then this library's mandatory checks (the maintenance role
+qualification, on new connections only), then the restricted-session policy, then
+the capability's connection policy.
+
+A refusal by one of this library's own checks — restricted session or the
+capability policy — destroys that connection and fails the acquisition with that
+error, so a refused connection never serves application traffic and the reason
+reaches the caller. A prior hook the caller set keeps its own verdict instead,
+with pgx's `PrepareConn` semantics unchanged: returning true with an error
+releases the connection to the pool and fails the query rather than destroying
+it, and returning false with no error asks pgx to retry on a fresh connection
+rather than failing. Only the library's refusals are destructive.
+
+Checkout runs the policy on every transaction, so a policy costs whatever it
+queries, per transaction, on top of the restricted-session round trip. Connect
+runs it once per physical connection, including reconnects and background pool
+refills. When `WithOperationTimeout` is set it bounds each boundary's whole chain
+— one budget for the chain, not one per check, and the caller's own prior hook is
+inside it. That bound matters on the connect
+path: pgx deliberately lets a connection finish building after its acquire is
+cancelled, so a connect-time check has no deadline of its own. The bound refuses
+a check that outlives it; it cannot interrupt callback code that ignores its
+context.
+
+A policy is a point-in-time check, not a fence. A `GRANT` landing after a
+connection is validated is visible only at the next boundary, so this is not a
+substitute for changing authority under a controlled procedure and draining the
+workloads that hold connections.
+
+A nil policy installs nothing of its own, with one qualification: a capability
+that also enables `WithRestrictedSession` gets the refusal behavior described
+above either way, because both checks now share one chain. A refused checkout
+fails with that refusal rather than retrying on fresh connections until pgx's
+attempt budget reports a generic hook bug. A capability with neither a policy
+nor a restricted session has no connection hook installed at all and is
+unchanged.
+
+The isolated regression exercises both boundaries and hook ordering, per-capability
+logins, refusal at connect, a pooled connection refused after a `GRANT` with the
+application callback never running, single-invocation refusal, cancelled contexts,
+a blocking policy bounded on the connect path, background pool refill, failed-startup
+and shutdown connection cleanup, and maintenance isolation in both directions. It
+uses fixture-only roles and no cloud identities.
 
 ## External-identity role administration
 

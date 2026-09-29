@@ -68,9 +68,12 @@ on loopback and cross-builds the two commands for the fixture's architecture:
 POSTGRES_TEST_IMAGE=postgres@sha256:… python3 scripts/qualify-controlplane.py
 ```
 
-Two more skip plainly without a DSN, so a green local run says nothing about
-them: `connection_profile_postgres_test.go` (`CONNECTION_PROFILE_TEST_DSN`) and
-`session_policy_test.go` (`SESSION_POLICY_TEST_DSN`).
+Three more skip plainly without a DSN, so a green local run says nothing about
+them: `connection_profile_postgres_test.go` (`CONNECTION_PROFILE_TEST_DSN`), and
+`session_policy_test.go` and `connection_policy_postgres_test.go` (both
+`SESSION_POLICY_TEST_DSN`). The qualify script selects the last two by name, so a
+new DSN-gated test whose name matches neither `^TestRestrictedSession` nor
+`^TestConnectionPolicy` runs nowhere.
 
 ## Consumer graph
 

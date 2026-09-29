@@ -105,7 +105,8 @@ def main():
                             "./bootstrap"], cwd=CHILD, env=env, check=True, timeout=120)
         print(f"Fixture image: {image}", flush=True)
         subprocess.run(
-            ["go", "test", "-race", "-count=1", "-v", ".", "-run", "^TestRestrictedSession"],
+            ["go", "test", "-race", "-count=1", "-v", ".",
+             "-run", "^(TestRestrictedSession|TestConnectionPolicy)"],
             cwd=CHILD,
             env=env,
             check=True,
