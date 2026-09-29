@@ -117,8 +117,15 @@ context.
 A policy is a point-in-time check, not a fence. A `GRANT` landing after a
 connection is validated is visible only at the next boundary, so this is not a
 substitute for changing authority under a controlled procedure and draining the
-workloads that hold connections. Nil policies install nothing and keep existing
-behavior for that capability.
+workloads that hold connections.
+
+A nil policy installs nothing of its own, with one qualification: a capability
+that also enables `WithRestrictedSession` gets the refusal behavior described
+above either way, because both checks now share one chain. A refused checkout
+fails with that refusal rather than retrying on fresh connections until pgx's
+attempt budget reports a generic hook bug. A capability with neither a policy
+nor a restricted session has no connection hook installed at all and is
+unchanged.
 
 The isolated regression exercises both boundaries and hook ordering, per-capability
 logins, refusal at connect, a pooled connection refused after a `GRANT` with the
