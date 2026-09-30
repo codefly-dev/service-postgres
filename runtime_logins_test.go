@@ -10,6 +10,7 @@ import (
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	"github.com/codefly-dev/core/resources"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func maintenanceLogin() []RuntimeLogin {
@@ -112,7 +113,7 @@ func TestLoginPasswordsMustBeDistinct(t *testing.T) {
 }
 
 // The restricted render stores only primitives: the login's connection is a
-// template over its own password, and the Deploy demands a Secret reference
+// template over its own password, and the Deploy declares a Secret reference
 // for that password and hands it to the bootstrap Job that sets it.
 func TestRestrictedRenderTemplatesEachLoginOverItsOwnPassword(t *testing.T) {
 	builder, networkMappings := newDeploymentTestBuilder(t)
@@ -121,16 +122,11 @@ func TestRestrictedRenderTemplatesEachLoginOverItsOwnPassword(t *testing.T) {
 	references := promotablePostgresSecretReferences()
 	passwordKey := resources.ServiceSecretConfigurationKeyFromUnique("module/postgres", "postgres", "POSTGRES_MAINTENANCE_PASSWORD")
 
-	// Without the login's primitive the render is refused, naming it.
+	// The login's primitive is the agent's own key: the render declares it
+	// rather than demanding it be configured first. Nothing configures it here.
+	require.NotContains(t, references, passwordKey)
 	destination := t.TempDir()
 	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, references))
-	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
-	require.Contains(t, response.GetState().GetMessage(), "POSTGRES_MAINTENANCE_PASSWORD")
-
-	references[passwordKey] = &builderv0.KubernetesSecretKeyReference{Name: "postgres-secrets", Key: passwordKey}
-	destination = t.TempDir()
-	response, err = builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, references))
 	require.NoError(t, err)
 	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
@@ -158,8 +154,130 @@ func TestRestrictedRenderTemplatesEachLoginOverItsOwnPassword(t *testing.T) {
 	require.Equal(t, "POSTGRES_MAINTENANCE_PASSWORD", referenced[0].GetKey())
 	require.Equal(t, "postgresql://"+logins[0].role+":@postgres.example.com:5432/test?sslmode=disable", literals.String())
 
+	// The bootstrap Job reads the login password from a typed, non-optional
+	// secretKeyRef into the same Secret as the managed primitives — the render
+	// the CLI projects the service's ExternalSecret key from.
 	job := readDeploymentFile(t, destination, "base", "job.yaml")
-	require.Contains(t, job, "name: POSTGRES_MAINTENANCE_PASSWORD")
+	requireJobSecretKeyRef(t, job, "POSTGRES_MAINTENANCE_PASSWORD", "postgres-secrets", passwordKey)
+}
+
+// A service declaring a runtime login deploys without anyone having authored
+// that login's password primitive: the render is what declares the key, and the
+// declaration is the secretKeyRef the bootstrap Job carries. This is issue #165
+// at the level it failed — a restricted render refusing, not a list of names.
+func TestRestrictedRenderDeclaresEachLoginPasswordSecretReference(t *testing.T) {
+	for name, configure := range map[string]func(map[string]*builderv0.KubernetesSecretKeyReference, string){
+		"derived": func(map[string]*builderv0.KubernetesSecretKeyReference, string) {},
+		"configured": func(references map[string]*builderv0.KubernetesSecretKeyReference, key string) {
+			references[key] = &builderv0.KubernetesSecretKeyReference{Name: "postgres-secrets", Key: key}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			builder, networkMappings := newDeploymentTestBuilder(t)
+			builder.RuntimeReadWriteRoles = []string{"app_runtime_request"}
+			builder.RuntimeLogins = []RuntimeLogin{
+				{Name: "control-plane", ReadWriteRoles: []string{"app_control_plane"}},
+				{Name: "maintenance", ReadWriteRoles: []string{"app_runtime"}},
+			}
+			references := promotablePostgresSecretReferences()
+			for _, environmentVariable := range []string{"POSTGRES_CONTROL_PLANE_PASSWORD", "POSTGRES_MAINTENANCE_PASSWORD"} {
+				configure(references, resources.ServiceSecretConfigurationKeyFromUnique(
+					"module/postgres", "postgres", environmentVariable))
+			}
+
+			destination := t.TempDir()
+			response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, references))
+			require.NoError(t, err)
+			require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+			job := readDeploymentFile(t, destination, "base", "job.yaml")
+			for _, environmentVariable := range []string{"POSTGRES_CONTROL_PLANE_PASSWORD", "POSTGRES_MAINTENANCE_PASSWORD"} {
+				key := resources.ServiceSecretConfigurationKeyFromUnique("module/postgres", "postgres", environmentVariable)
+				requireJobSecretKeyRef(t, job, environmentVariable, "postgres-secrets", key)
+			}
+			// The server itself never receives a login password.
+			statefulSet := readDeploymentFile(t, destination, "base", "stateful-set.yaml")
+			require.NotContains(t, statefulSet, "name: POSTGRES_CONTROL_PLANE_PASSWORD")
+			require.NotContains(t, statefulSet, "name: POSTGRES_MAINTENANCE_PASSWORD")
+		})
+	}
+}
+
+// A configured login-password reference is held to the invariants the managed
+// primitives are: never optional, always the one Secret. Deriving the absent
+// case must not become a way to smuggle a weaker reference past them.
+func TestRestrictedRenderRejectsUnusableLoginPasswordSecretReference(t *testing.T) {
+	passwordKey := resources.ServiceSecretConfigurationKeyFromUnique(
+		"module/postgres", "postgres", "POSTGRES_MAINTENANCE_PASSWORD")
+	for name, broken := range map[string]struct {
+		reference *builderv0.KubernetesSecretKeyReference
+		message   string
+	}{
+		"optional": {
+			reference: &builderv0.KubernetesSecretKeyReference{Name: "postgres-secrets", Key: passwordKey, Optional: true},
+			message:   passwordKey + " Kubernetes Secret reference must not be optional",
+		},
+		"another secret": {
+			reference: &builderv0.KubernetesSecretKeyReference{Name: "other-secrets", Key: passwordKey},
+			message:   "postgres credential references must use one Kubernetes Secret",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			builder, networkMappings := newDeploymentTestBuilder(t)
+			builder.RuntimeReadWriteRoles = []string{"app_runtime_request"}
+			builder.RuntimeLogins = maintenanceLogin()
+			references := promotablePostgresSecretReferences()
+			references[passwordKey] = broken.reference
+
+			response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(
+				t.TempDir(), networkMappings, references))
+			require.NoError(t, err)
+			require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
+			require.Contains(t, response.GetState().GetMessage(), broken.message)
+			require.Nil(t, response.GetConfiguration())
+		})
+	}
+}
+
+// requireJobSecretKeyRef asserts the bootstrap Job reads environmentVariable
+// from a non-optional secretKeyRef naming secret/key — the shape the CLI reads
+// back to project the service's ExternalSecret, so the assertion is on the
+// rendered reference and not merely on the variable's name appearing.
+func requireJobSecretKeyRef(t *testing.T, manifest, environmentVariable, secret, key string) {
+	t.Helper()
+	var job struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Containers []struct {
+						Env []struct {
+							Name      string `yaml:"name"`
+							ValueFrom struct {
+								SecretKeyRef struct {
+									Name     string `yaml:"name"`
+									Key      string `yaml:"key"`
+									Optional bool   `yaml:"optional"`
+								} `yaml:"secretKeyRef"`
+							} `yaml:"valueFrom"`
+						} `yaml:"env"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(manifest), &job))
+	require.NotEmpty(t, job.Spec.Template.Spec.Containers)
+	for _, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name != environmentVariable {
+			continue
+		}
+		reference := env.ValueFrom.SecretKeyRef
+		require.Equal(t, secret, reference.Name, "%s Secret name", environmentVariable)
+		require.Equal(t, key, reference.Key, "%s Secret key", environmentVariable)
+		require.False(t, reference.Optional, "%s must not be optional", environmentVariable)
+		return
+	}
+	require.Failf(t, "missing secret reference", "bootstrap Job declares no %s", environmentVariable)
 }
 
 func TestRuntimeAccessTemplateProvisionsEachLoginWithItsOwnRoles(t *testing.T) {
