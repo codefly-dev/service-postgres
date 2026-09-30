@@ -927,20 +927,17 @@ func (s *Builder) selectPromotableSecretReferences(
 		"POSTGRES_READ_ONLY_PASSWORD",
 		"POSTGRES_READ_WRITE_PASSWORD",
 	}
+	// The four managed primitives are authored outside this agent — the factory
+	// scaffolds them into the service's own secret configuration — so a render
+	// that reaches here without one is a misconfigured service, and saying so
+	// is the point.
 	primitives := []string{
 		"POSTGRES_USER",
 		"POSTGRES_PASSWORD",
 		"POSTGRES_READ_ONLY_PASSWORD",
 		"POSTGRES_READ_WRITE_PASSWORD",
 	}
-	// Each declared login's password is one more primitive: the bootstrap Job
-	// sets it on the login's role, and consumers' connections are templated
-	// over it. It lives in the same Secret as the others.
-	for _, login := range logins {
-		primitives = append(primitives, login.passwordKey)
-		bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, login.passwordKey)
-	}
-	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(primitives)+2)
+	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(primitives)+len(logins)+2)
 	secretName := ""
 	for _, environmentVariable := range primitives {
 		configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(
@@ -962,6 +959,20 @@ func (s *Builder) selectPromotableSecretReferences(
 		}
 		selected[environmentVariable] = reference
 	}
+	// Each declared login's password is one more primitive: the bootstrap Job
+	// sets it on the login's role, and consumers' connections are templated
+	// over it. It lives in the same Secret as the others — and, unlike them,
+	// this agent is what names it, so this agent is what declares it. The set
+	// comes from the same resolved logins runtime-access.sql iterates, so the
+	// SQL and the references it reads cannot drift.
+	for _, login := range logins {
+		reference, err := s.loginPasswordSecretReference(configured, secretName, login)
+		if err != nil {
+			return nil, err
+		}
+		selected[login.passwordKey] = reference
+		bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, login.passwordKey)
+	}
 	// The Job connects as the migration owner through libpq's environment,
 	// from the same primitives the StatefulSet initializes the server with —
 	// never from an assembled connection string an operator has to store.
@@ -979,6 +990,51 @@ func (s *Builder) selectPromotableSecretReferences(
 		StatefulSet:  selectForWorkload(statefulSetEnvironmentVariables),
 		BootstrapJob: selectForWorkload(bootstrapJobEnvironmentVariables),
 	}, nil
+}
+
+// loginPasswordSecretReference resolves the Secret key a declared login's
+// password arrives on in a restricted render.
+//
+// A declared login's password key is named by this agent — resolveRuntimeLogins
+// derives POSTGRES_<NAME>_PASSWORD from the declaration, and runtime-access.sql
+// reads exactly that variable — so nothing outside the agent knows the key
+// exists until a render says so. The restricted render IS that declaration: the
+// CLI projects a service's ExternalSecret from precisely the non-optional
+// secretKeyRefs its manifests carry, so a key the agent refuses to render is a
+// key the secret store is never asked to hold. Demanding the reference first
+// closes the loop on itself — no render, no declared key, no value, no render —
+// which is why a service declaring its first login could not deploy at all.
+// The agent therefore derives the reference into the one Secret the render
+// already uses, with the configuration key the CLI itself would have produced.
+//
+// This declares the key; it does not mandate a distinct value. Locally the
+// password stays optional and is derived from the owner secret when absent
+// (LoadConfiguration), exactly as the reader's and writer's are.
+//
+// An explicitly configured reference still wins — a service that does author
+// the primitive keeps that reference — and is held to the same invariants as
+// the managed primitives: never optional, always the one Secret.
+func (s *Builder) loginPasswordSecretReference(
+	configured map[string]*builderv0.KubernetesSecretKeyReference,
+	secretName string,
+	login runtimeLogin,
+) (*builderv0.KubernetesSecretKeyReference, error) {
+	configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(
+		s.Unique(),
+		"postgres",
+		login.passwordKey,
+	)
+	reference := configured[configurationKey]
+	if reference == nil || reference.GetName() == "" || reference.GetKey() == "" {
+		return &builderv0.KubernetesSecretKeyReference{Name: secretName, Key: configurationKey}, nil
+	}
+	if reference.GetOptional() {
+		return nil, fmt.Errorf("%s Kubernetes Secret reference must not be optional", configurationKey)
+	}
+	if reference.GetName() != secretName {
+		return nil, fmt.Errorf("postgres credential references must use one Kubernetes Secret")
+	}
+	return reference, nil
 }
 
 func (s *Builder) selectExternalSecretReferences(
