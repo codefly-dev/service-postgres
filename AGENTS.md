@@ -149,6 +149,8 @@ Loaded on demand rather than carried here — `.claude/skills/`:
 ## Workflow
 
 - Branch and PR; never commit to `main`. Conventional Commits for the title.
+- Release flow: `docs/releases.md`. Keep dev tags publishing when repinning
+  core; only normal releases use its default-branch reachability gate.
 - The PR body carries the fix-or-hack classification and what you did not
   verify. Both are rules above; answer them there rather than omitting them.
 - `agentcontext_test.go` holds this file's length budget and each skill's

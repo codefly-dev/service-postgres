@@ -26,6 +26,8 @@ type workflowConcurrency struct {
 }
 
 type workflowJob struct {
+	If             string            `yaml:"if"`
+	Needs          string            `yaml:"needs"`
 	Permissions    map[string]string `yaml:"permissions"`
 	TimeoutMinutes int               `yaml:"timeout-minutes"`
 	Steps          []workflowStep    `yaml:"steps"`
