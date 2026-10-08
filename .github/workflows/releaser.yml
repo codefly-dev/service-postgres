@@ -71,11 +71,11 @@ jobs:
           .github/scripts/tag-runtime-image.sh "$name:$RELEASE_TAG" "$name:$tag"
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && !contains(github.ref_name, '-dev.')
     needs: image
     permissions:
       contents: read
-    uses: codefly-dev/core/.github/workflows/go-service-release.yml@08e37db5962cd98ddf77f8fb7dffe810a7ca1fc9
+    uses: codefly-dev/core/.github/workflows/go-service-release.yml@e54bc852f3d40cd1aeafc0ced2369a8c13a51bb8 # core v0.16.0
     with:
       # The bootstrap-image tests build linux/arm64 and refuse to run without
       # emulation registered ("CI must register emulation"). ci.yml gets it from
@@ -84,6 +84,92 @@ jobs:
       # binfmt registration is the same thing setup-qemu-action does.
       setup-run: docker run --privileged --rm tonistiigi/binfmt --install arm64
     secrets: inherit
+
+  # Iteration tags deliberately point off main. Build without the release PAT,
+  # then upload data from a fresh runner; core's release gate stays intact.
+  dev-build:
+    if: github.event_name == 'push' && contains(github.ref_name, '-dev.')
+    needs: image
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate dev tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9a-f]+$ ]]
+          .github/scripts/release-backfill.sh validate-tag .
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - name: Test
+        run: go test -v ./...
+      - name: Install Syft for archive SBOMs
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c
+        with:
+          syft-version: v1.44.0
+      - name: Build dev release
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94
+        with:
+          version: '~> v2'
+          args: release --clean --skip=publish,announce
+      - name: Upload dev release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dev-release
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sbom.json
+            dist/*_checksums.txt
+            dist/CHANGELOG.md
+
+  dev-publish:
+    if: github.event_name == 'push' && contains(github.ref_name, '-dev.')
+    needs: dev-build
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # No source checkout, hooks, or executables from the build job. The token
+      # is repository-scoped and only passed to the upload step, never GH_PAT.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: dev-release
+          path: dist
+      - name: Publish dev prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9a-f]+$ ]]
+          prefix="dist/service-postgres_${RELEASE_TAG#v}"
+          assets=("${prefix}_checksums.txt")
+          for platform in darwin_amd64 darwin_arm64 linux_amd64; do
+            assets+=("${prefix}_${platform}.tar.gz" "${prefix}_${platform}.tar.gz.sbom.json")
+          done
+          for asset in "${assets[@]}" dist/CHANGELOG.md; do
+            if [[ ! -s "$asset" ]]; then
+              echo "::error::missing or empty dev release file: $asset" >&2
+              exit 1
+            fi
+          done
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --verify-tag --prerelease --latest=false \
+            --title "$RELEASE_TAG" --notes-file dist/CHANGELOG.md
 
   backfill:
     if: github.event_name == 'workflow_dispatch'
