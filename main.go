@@ -410,6 +410,10 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 	// implementation promises — not one this agent adds. Declaring explicitly
 	// means carrying those promises forward rather than replacing them.
 	advertisement.Contract = contract.Current()
+	// The deployment path is core's DeployKustomize, which judges dependency
+	// edges with the request's composition provenance on this core; the host
+	// requires the live advertisement, not the linked core version.
+	advertisement.Contract.Capabilities = append(advertisement.Contract.Capabilities, contract.DeploymentCompositionProvenance)
 	advertisement.Contract.Capabilities = append(advertisement.Contract.Capabilities, hostResourceRecoveryCapability)
 
 	return advertisement, nil
