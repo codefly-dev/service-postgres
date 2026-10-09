@@ -604,7 +604,7 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 			}
 			parameters.BootstrapJobName = bootstrapJobName
 			s.Wool.Debug("exporting configuration", wool.Field("conf", resources.MakeConfigurationSummary(configuration)))
-			if services.IsRestrictedOutputProfile(deployment.Profile) {
+			if restrictedOutput(deployment.Profile) {
 				restrictedConfiguration = configuration
 				return nil
 			}
@@ -645,7 +645,7 @@ func (s *Builder) immutableBootstrapJobName(
 			Namespace:   deployment.Kubernetes.GetNamespace(),
 			Image:       s.DockerImage(deployment.Kubernetes.GetBuildContext()),
 			Profile:     deployment.Profile,
-			Restricted:  services.IsRestrictedOutputProfile(deployment.Profile),
+			Restricted:  restrictedOutput(deployment.Profile),
 		},
 		Deployment: services.DeploymentParameters{Parameters: parameters},
 	}
@@ -719,7 +719,7 @@ func (s *Builder) prepareDeployment(
 		parameters.ExternalBindingID = externalBindingID(req.GetEnvironment().GetName(), binding)
 	}
 	withSSL := s.deploymentWithSSL(binding)
-	if services.IsRestrictedOutputProfile(deployment.Profile) {
+	if restrictedOutput(deployment.Profile) {
 		workloadReferences, referencesErr := s.selectPromotableSecretReferences(
 			deployment.Kubernetes.GetSecretReferences(),
 			binding != nil,
@@ -1107,13 +1107,31 @@ func (s *Builder) Create(ctx context.Context, req *builderv0.CreateRequest) (*bu
 	return s.Builder.CreateResponse(ctx, s.Settings)
 }
 
+// restrictedOutput reports whether the deployment selects the restricted,
+// portable output contract. It replaces services.IsRestrictedOutputProfile,
+// retired in favour of a parsed profile: an unknown or unselected profile is
+// now an ERROR rather than silently "not restricted", and it is read as
+// RESTRICTED here -- the other direction would hand a restricted render the
+// secrets it exists to refuse.
+func restrictedOutput(profile builderv0.KubernetesOutputProfile) bool {
+	parsed, err := services.ParseOutputProfile(profile)
+	if err != nil {
+		return true
+	}
+	return parsed.Restricted()
+}
+
 func (s *Builder) CreateEndpoints(ctx context.Context) error {
 	tcp, err := resources.LoadTCPAPI(ctx)
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot load tcp api")
 	}
 	endpoint := s.Base.BaseEndpoint(standards.TCP)
-	endpoint.Visibility = resources.VisibilityExternal
+	// PRIVATE, not the retired `external`: reach is visibility, addressing is
+	// exposure, where it lives is location -- and on a store `external` was a
+	// false claim either way, since the render allocates this service its own
+	// in-cluster address. Every composed store already declares private.
+	endpoint.Visibility = resources.VisibilityPrivate
 	s.TcpEndpoint, err = resources.NewAPI(ctx, endpoint, resources.ToTCPAPI(tcp))
 	s.Endpoints = []*v0.Endpoint{s.TcpEndpoint}
 	return nil
