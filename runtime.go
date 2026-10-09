@@ -822,7 +822,21 @@ func (s *Runtime) retentionSummary(action string) string {
 }
 
 func (s *Runtime) Test(ctx context.Context, req *runtimev0.TestRequest) (*runtimev0.TestResponse, error) {
-	return s.Runtime.TestResponse()
+	// A RUN-LEVEL verdict, stated. This agent ships no tests of its own -- it
+	// runs a datastore -- so the honest run is zero tests and zero failures,
+	// which is what the status-only answer always meant. It has to be said:
+	// core's helpers fill the counts but leave Result nil, and the CLI promotes
+	// nothing to a pass -- only an explicit TestRunResult_PASSED is one
+	// (cli pkg/testrun/verdict.go); UNKNOWN is refused by name.
+	response, err := s.Runtime.TestResponseWithResults(0, 0, 0, 0, 0, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	response.Result = &runtimev0.TestRunResult{
+		State:   runtimev0.TestRunResult_PASSED,
+		Message: "this agent ships no tests of its own: zero run, zero failed",
+	}
+	return response, nil
 }
 
 /* Details
