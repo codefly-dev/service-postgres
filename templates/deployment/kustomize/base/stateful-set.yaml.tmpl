@@ -89,9 +89,13 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
-          # pg_isready is the canonical "is postgres accepting
-          # connections" check. The shell resolves the secret-backed
-          # database owner and declared database at probe time.
+          # TCP probes on the postgres port. A cell's execution admission
+          # refuses any container with an exec probe or hook: the image digest
+          # says which bytes run, and an exec probe says what they do inside a
+          # pod that already holds the workload's identity. The official
+          # image's first-boot server listens on the Unix socket only, so the
+          # port accepts only once initialization is done and the real server
+          # is up.
           # Probes intentionally separated:
           #   startup:    grants up to 60s for first-boot init
           #               (which can run schema migrations).
@@ -100,18 +104,18 @@ spec:
           #   liveness:   restarts only on hard hangs — not on
           #               momentary connection saturation.
           startupProbe:
-            exec:
-              command: ["/bin/sh", "-ec", "exec pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            tcpSocket:
+              port: postgres
             periodSeconds: 5
             failureThreshold: 12
           readinessProbe:
-            exec:
-              command: ["/bin/sh", "-ec", "exec pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            tcpSocket:
+              port: postgres
             periodSeconds: 10
             timeoutSeconds: 3
           livenessProbe:
-            exec:
-              command: ["/bin/sh", "-ec", "exec pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            tcpSocket:
+              port: postgres
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 3

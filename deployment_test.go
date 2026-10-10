@@ -533,10 +533,10 @@ func TestPromotableGitOpsDeploymentReturnsReferenceOnlyConfigurationAndScopesSec
 	} {
 		require.NotContains(t, statefulSet, unexpected)
 	}
-	require.Equal(t, 3, strings.Count(
-		statefulSet,
-		`command: ["/bin/sh", "-ec", "exec pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]`,
-	))
+	// A cell's execution admission refuses an exec probe: the store is
+	// probed on its port, by startup, readiness and liveness alike.
+	require.Equal(t, 3, strings.Count(statefulSet, "tcpSocket:\n              port: postgres"))
+	require.NotContains(t, statefulSet, "pg_isready")
 
 	job := readDeploymentFile(t, destination, "base", "job.yaml")
 	for _, expected := range []string{
