@@ -22,6 +22,22 @@ They land hard here: this repo ships a *database*, and most of what it guards is
 invisible from a healthy boot. A half-applied migration, a role never granted, a
 tag left on an older digest — each of those serves traffic and is still wrong.
 
+- **Prove reuse before you build.** The default answer is that the platform
+  already has it and your change fills a gap or adds a helper on it, so the PR
+  body names what you reused and what you deliberately did not. A second
+  mechanism for a job one seam already does is refused however clean it is. Two
+  tells you are reinventing: what you are writing re-answers a question an
+  existing seam answered, and your reason for its placement is that a
+  convenient loop was already there rather than that the responsibility belongs
+  to it.
+- **Build the simplest thing that works; size is the signal.** A coding task's
+  budget is about **500 hand-written lines** — generated output does not count,
+  tests count apart — and past **2,000** the change has become a second system,
+  so **stop and ask the user** instead of finishing it. Two tells, checkable
+  before the code exists: you cannot name the one responsibility the change
+  adds, and it is growing to make the end goal pass rather than to put a
+  behaviour where it belongs. Wanting it to work licenses no means to get
+  there.
 - **A gap in the tooling is a bug in the tooling — never a reason to reach
   around it.** When the CLI cannot express what a composition needs, the answer
   is the capability fixed in whichever tool owns it, named in the PR. It is
