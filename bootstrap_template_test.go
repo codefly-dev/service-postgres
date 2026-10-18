@@ -341,7 +341,7 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "bootstrap", "bootstrap.sh"), []byte("set -eu\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tag := fmt.Sprintf("service-postgres-bootstrap-targetarch-test:%d", time.Now().UnixNano())
+	tag := uniqueDockerName("service-postgres-bootstrap-targetarch-test:")
 	t.Cleanup(func() {
 		_ = exec.Command("docker", "image", "rm", tag).Run()
 	})
@@ -427,7 +427,7 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 		}
 	}
 
-	tag := fmt.Sprintf("service-postgres-bootstrap-migrations-test:%d", time.Now().UnixNano())
+	tag := uniqueDockerName("service-postgres-bootstrap-migrations-test:")
 	t.Cleanup(func() {
 		_ = exec.Command("docker", "image", "rm", tag).Run()
 	})
@@ -488,7 +488,7 @@ func startBootstrapPostgres(t *testing.T) string {
 		t.Fatal("no pinned POSTGRES_IMAGE in Dockerfile")
 	}
 
-	name := fmt.Sprintf("service-postgres-bootstrap-db-%d", time.Now().UnixNano())
+	name := uniqueDockerName("service-postgres-bootstrap-db-")
 	t.Cleanup(func() {
 		_ = exec.Command("docker", "rm", "--force", name).Run()
 	})

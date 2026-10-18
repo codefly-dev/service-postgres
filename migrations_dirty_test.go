@@ -74,7 +74,7 @@ func startDisposablePostgres(t *testing.T) *disposableServer {
 	ctx = runtime.Wool.Inject(ctx)
 
 	port := freeTCPPort(t)
-	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, testRuntimeImage(t), fmt.Sprintf("dirty-migration-%d", time.Now().UnixNano()))
+	runner, err := dockerrun.NewDockerHeadlessEnvironment(ctx, testRuntimeImage(t), uniqueDockerName("dirty-migration-"))
 	if err != nil {
 		mandatory := os.Getenv(testRuntimeImageEnv) != ""
 		if mandatory || !dockerDaemonUnavailable(err) {
