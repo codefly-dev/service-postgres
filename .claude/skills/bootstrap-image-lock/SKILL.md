@@ -19,19 +19,26 @@ the migrate checksums from the release's published `sha256sum.txt`.
 .github/scripts/update-bootstrap-lock.sh --check    # report drift, write nothing, exit 1 if stale
 ALPINE_BRANCH=v3.22 .github/scripts/update-bootstrap-lock.sh
 MIGRATE_VERSION=v4.20.0 .github/scripts/update-bootstrap-lock.sh
+BOOTSTRAP_PACKAGES="postgresql17-client" .github/scripts/update-bootstrap-lock.sh
 go test ./... && git commit bootstrap-image.json
 ```
 
 A plain rerun re-resolves the lock's *own* intent: the branch, migrate version
 and package set are read back out of the current file, so it cannot silently
 revert someone's deliberate bump. The environment variables are the only way to
-change what is targeted.
+change what is targeted, the package set included (`BOOTSTRAP_PACKAGES`).
+
+Pin only what the image runs. The migrate archive is fetched with the base's
+busybox `wget` and verified against the lock's sha256, so no download tool is
+pinned: every pin is one more package a rolling repository can withdraw, and
+Alpine's per-architecture builders publish a replacement at different times, so
+for that lag no lock is satisfiable on both architectures (#189).
 
 ## "unable to select packages" is the feature
 
 Alpine publishes no immutable package snapshot — a release branch keeps only the
 newest `-rN` of each package. Pinning exact versions trades availability for
-integrity: once upstream replaces `curl` or `postgresql17-client`, the build
+integrity: once upstream replaces a pinned package (`postgresql17-client`), the build
 fails loudly instead of quietly installing different bytes.
 
 That failure is the signal to rerun the script, and it is also how a security

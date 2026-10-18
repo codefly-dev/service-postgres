@@ -6,13 +6,16 @@
 #   .github/scripts/update-bootstrap-lock.sh --check         # report drift, write nothing, exit 1 if stale
 #   ALPINE_BRANCH=v3.22 .github/scripts/update-bootstrap-lock.sh
 #   MIGRATE_VERSION=v4.20.0 .github/scripts/update-bootstrap-lock.sh
+#   BOOTSTRAP_PACKAGES="postgresql17-client" .github/scripts/update-bootstrap-lock.sh
 #
 # Every value is resolved from upstream, never authored here: the base digest comes
 # from the registry, package versions from inside the digest-pinned base on both
 # architectures, and the migrate archive checksums from the release's published
 # sha256sum.txt. What the run targets — Alpine branch, migrate version, package set
 # — is read out of the current lock, so a plain rerun re-resolves the lock's own
-# intent instead of a default that could silently revert someone's bump. Run
+# intent instead of a default that could silently revert someone's bump. The
+# environment variables are the only way to change what is targeted, the package
+# set (BOOTSTRAP_PACKAGES, space-separated) included. Run
 # `go test ./...` afterwards and commit the diff.
 #
 # The checksum file ships in the same GitHub release as the archives it covers, so
@@ -24,7 +27,7 @@
 #
 # Alpine publishes no immutable package snapshot — a release branch keeps only the
 # newest -rN of each package. Pinning exact versions therefore trades availability
-# for integrity: once upstream replaces curl or postgresql17-client, the build fails
+# for integrity: once upstream replaces a pinned package, the build fails
 # with "unable to select packages" instead of silently installing different bytes.
 # That failure is the signal to run this script, which is also how a security fix
 # reaches the image: rerun it, the resolved versions move, and the lock records what
@@ -50,8 +53,20 @@ LOCK="$(git rev-parse --show-toplevel)/bootstrap-image.json"
 lock_branch=$(jq -er '.packages.repositories[0] | capture("/(?<branch>v[0-9]+\\.[0-9]+)/").branch' "$LOCK")
 ALPINE_BRANCH=${ALPINE_BRANCH:-$lock_branch}
 MIGRATE_VERSION=${MIGRATE_VERSION:-$(jq -er '.migrate.version' "$LOCK")}
-mapfile -t PACKAGES < <(jq -er '.packages.pinned[].name' "$LOCK")
+if [[ -n "${BOOTSTRAP_PACKAGES:-}" ]]; then
+  read -r -a PACKAGES <<<"$BOOTSTRAP_PACKAGES"
+else
+  mapfile -t PACKAGES < <(jq -er '.packages.pinned[].name' "$LOCK")
+fi
 mapfile -t ARCHITECTURES < <(jq -er '.migrate.archives[].architecture' "$LOCK")
+# A package name reaches a shell inside the resolver container, so it is held to
+# apk's own name shape here rather than trusted as typed.
+for package in "${PACKAGES[@]}"; do
+  if [[ ! "$package" =~ ^[a-z0-9][a-z0-9._+-]*$ ]]; then
+    echo "not an apk package name: ${package@Q}" >&2
+    exit 1
+  fi
+done
 if [[ "${#PACKAGES[@]}" -eq 0 || "${#ARCHITECTURES[@]}" -eq 0 ]]; then
   echo "could not read the package or architecture set from $LOCK" >&2
   exit 1
@@ -92,6 +107,10 @@ resolve_package_versions() {
         # older, unpatched build.
         candidate=\$(apk policy \"\$package\" | awk '/^  [^ ]/ { sub(/:\$/, \"\", \$1); version=\$1 } END { print version }')
         selected=\$(apk add --simulate \"\$package\" | sed -n \"s/.* Installing \$package (\(.*\))\$/\1/p\" | tail -1)
+        if [ -z \"\$candidate\" ]; then
+          echo \"\$package: no candidate in the repositories\" >&2
+          exit 1
+        fi
         if [ \"\$candidate\" != \"\$selected\" ]; then
           echo \"\$package: apk policy offers \$candidate but apk would install \$selected\" >&2
           exit 1

@@ -80,16 +80,20 @@ func TestBootstrapImageLockChecksumsMatchPublishedArchives(t *testing.T) {
 	}
 }
 
-// The bootstrap image downloads the migrate archive with curl and its command
-// reconciles runtime access with psql, so both tools must stay pinned in the lock
-// rather than being pulled from whatever the repository serves.
+// The bootstrap command reconciles runtime access with psql, so the client stays
+// pinned in the lock rather than pulled from whatever the repository serves. No
+// download tool is: the migrate archive is fetched with the base's busybox wget
+// and verified against the lock's sha256, so a package installed only to download
+// it would add one more pin a rolling repository can withdraw (#189) and one more
+// binary in a production Job image, for no integrity it does not already have.
 func TestBootstrapImageLockPinsBuildAndCommandTooling(t *testing.T) {
 	pinned := map[string]string{}
 	for _, entry := range bootstrapLock.Packages.Pinned {
 		pinned[entry.Name] = entry.Version
 	}
-	require.Contains(t, pinned, "curl")
 	require.Contains(t, pinned, "postgresql17-client")
+	require.NotContains(t, pinned, "curl", "the archive download needs no installed tool")
+	require.NotContains(t, pinned, "wget", "the archive download needs no installed tool")
 }
 
 func TestBootstrapProvenanceExposesEveryResolvedInput(t *testing.T) {
@@ -272,7 +276,9 @@ func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 		require.Contains(t, dockerfile, `"`+repository+`"`)
 	}
 	require.Contains(t, dockerfile, ">/etc/apk/repositories")
-	require.Contains(t, dockerfile, "apk add --no-cache "+bootstrapLock.Packages.Specs())
+	// The apk line installs the locked set and nothing else: an unpinned package
+	// appended to it would ship whatever the repository serves that day.
+	require.Regexp(t, `(?m)apk add --no-cache `+regexp.QuoteMeta(bootstrapLock.Packages.Specs())+`$`, dockerfile)
 
 	script := bootstrapMigrateInstallScript(t, dockerfile)
 	for _, archive := range bootstrapLock.Migrate.Archives {
@@ -281,10 +287,11 @@ func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 	require.Contains(t, script, "/releases/download/"+bootstrapLock.Migrate.Version+"/migrate.linux-${architecture}.tar.gz")
 
 	// The archive lands in a file that is checksum-verified before anything reads
-	// it, so unverified bytes never reach tar — the shape a curl-into-tar pipe
+	// it, so unverified bytes never reach tar — the shape a download-into-tar pipe
 	// cannot have.
 	require.NotContains(t, script, "| tar")
-	download := strings.Index(script, "-o /tmp/migrate.tar.gz")
+	require.NotContains(t, script, "curl", "the download uses the base's busybox wget")
+	download := strings.Index(script, "wget -q -O /tmp/migrate.tar.gz")
 	verification := strings.Index(script, "sha256sum -c -")
 	extraction := strings.Index(script, "tar -xzf")
 	installation := strings.Index(script, "install -m 0755")
@@ -345,7 +352,7 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 
 			resolved, err := exec.Command("docker", "run", "--rm", "--platform", platform,
 				"--entrypoint", "sh", tag, "-c",
-				"migrate -version; uname -m; cat /etc/alpine-release; psql --version",
+				"migrate -version; uname -m; cat /etc/alpine-release; psql --version; if command -v curl; then echo CURL-SHIPPED; fi",
 			).CombinedOutput()
 			require.NoError(t, err, string(resolved))
 			require.Contains(t, string(resolved), strings.TrimPrefix(bootstrapLock.Migrate.Version, "v"))
@@ -353,6 +360,7 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 			require.Contains(t, string(resolved), bootstrapLock.Base.Version)
 			client, _, _ := strings.Cut(bootstrapPinnedVersion(t, "postgresql17-client"), "-r")
 			require.Contains(t, string(resolved), "(PostgreSQL) "+client)
+			require.NotContains(t, string(resolved), "CURL-SHIPPED", "no download tool is installed into the image")
 		})
 	}
 }
@@ -398,7 +406,7 @@ func TestBootstrapImageRejectsTamperedMigrateArchive(t *testing.T) {
 	})
 	script := bootstrapMigrateInstallScript(t, dockerfile)
 
-	download := regexp.MustCompile(`curl -fsSL -o /tmp/migrate\.tar\.gz "[^"]+"`)
+	download := regexp.MustCompile(`wget -q -O /tmp/migrate\.tar\.gz "[^"]+"`)
 	require.Len(t, download.FindAllString(script, -1), 1, "install step no longer downloads the archive to a file")
 	script = download.ReplaceAllString(script, "cp /fixture/migrate.tar.gz /tmp/migrate.tar.gz")
 
