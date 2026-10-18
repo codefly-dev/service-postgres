@@ -59,6 +59,14 @@ else
   mapfile -t PACKAGES < <(jq -er '.packages.pinned[].name' "$LOCK")
 fi
 mapfile -t ARCHITECTURES < <(jq -er '.migrate.archives[].architecture' "$LOCK")
+# A package name reaches a shell inside the resolver container, so it is held to
+# apk's own name shape here rather than trusted as typed.
+for package in "${PACKAGES[@]}"; do
+  if [[ ! "$package" =~ ^[a-z0-9][a-z0-9._+-]*$ ]]; then
+    echo "not an apk package name: ${package@Q}" >&2
+    exit 1
+  fi
+done
 if [[ "${#PACKAGES[@]}" -eq 0 || "${#ARCHITECTURES[@]}" -eq 0 ]]; then
   echo "could not read the package or architecture set from $LOCK" >&2
   exit 1
@@ -99,6 +107,10 @@ resolve_package_versions() {
         # older, unpatched build.
         candidate=\$(apk policy \"\$package\" | awk '/^  [^ ]/ { sub(/:\$/, \"\", \$1); version=\$1 } END { print version }')
         selected=\$(apk add --simulate \"\$package\" | sed -n \"s/.* Installing \$package (\(.*\))\$/\1/p\" | tail -1)
+        if [ -z \"\$candidate\" ]; then
+          echo \"\$package: no candidate in the repositories\" >&2
+          exit 1
+        fi
         if [ \"\$candidate\" != \"\$selected\" ]; then
           echo \"\$package: apk policy offers \$candidate but apk would install \$selected\" >&2
           exit 1

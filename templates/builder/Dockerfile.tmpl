@@ -20,7 +20,7 @@ RUN printf '%s\n' {{ .Bootstrap.Packages.RepositoryArguments }} >/etc/apk/reposi
 # anything unpacks or runs it, so tampered release bytes never reach tar. The
 # base's busybox wget fetches it: the integrity is the lock's sha256, not the
 # transport, so no download tool is installed from the rolling package
-# repository just for this step, and none ships in the image.
+# repository just for this step.
 RUN set -eu; \
     architecture="${TARGETARCH:-$(apk --print-arch)}"; \
     case "${architecture}" in \

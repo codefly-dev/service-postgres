@@ -276,7 +276,9 @@ func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 		require.Contains(t, dockerfile, `"`+repository+`"`)
 	}
 	require.Contains(t, dockerfile, ">/etc/apk/repositories")
-	require.Contains(t, dockerfile, "apk add --no-cache "+bootstrapLock.Packages.Specs())
+	// The apk line installs the locked set and nothing else: an unpinned package
+	// appended to it would ship whatever the repository serves that day.
+	require.Regexp(t, `(?m)apk add --no-cache `+regexp.QuoteMeta(bootstrapLock.Packages.Specs())+`$`, dockerfile)
 
 	script := bootstrapMigrateInstallScript(t, dockerfile)
 	for _, archive := range bootstrapLock.Migrate.Archives {
@@ -350,7 +352,7 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 
 			resolved, err := exec.Command("docker", "run", "--rm", "--platform", platform,
 				"--entrypoint", "sh", tag, "-c",
-				"migrate -version; uname -m; cat /etc/alpine-release; psql --version",
+				"migrate -version; uname -m; cat /etc/alpine-release; psql --version; if command -v curl; then echo CURL-SHIPPED; fi",
 			).CombinedOutput()
 			require.NoError(t, err, string(resolved))
 			require.Contains(t, string(resolved), strings.TrimPrefix(bootstrapLock.Migrate.Version, "v"))
@@ -358,6 +360,7 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 			require.Contains(t, string(resolved), bootstrapLock.Base.Version)
 			client, _, _ := strings.Cut(bootstrapPinnedVersion(t, "postgresql17-client"), "-r")
 			require.Contains(t, string(resolved), "(PostgreSQL) "+client)
+			require.NotContains(t, string(resolved), "CURL-SHIPPED", "no download tool is installed into the image")
 		})
 	}
 }
