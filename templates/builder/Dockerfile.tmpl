@@ -17,7 +17,10 @@ RUN printf '%s\n' {{ .Bootstrap.Packages.RepositoryArguments }} >/etc/apk/reposi
     && apk add --no-cache {{ .Bootstrap.Packages.Specs }}
 
 # The archive is downloaded to a file and checksum-verified against the lock before
-# anything unpacks or runs it, so tampered release bytes never reach tar.
+# anything unpacks or runs it, so tampered release bytes never reach tar. The
+# base's busybox wget fetches it: the integrity is the lock's sha256, not the
+# transport, so no download tool is installed from the rolling package
+# repository just for this step, and none ships in the image.
 RUN set -eu; \
     architecture="${TARGETARCH:-$(apk --print-arch)}"; \
     case "${architecture}" in \
@@ -30,7 +33,7 @@ RUN set -eu; \
 {{- end }}
       *) echo "unsupported target architecture: ${architecture}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -o /tmp/migrate.tar.gz "https://github.com/golang-migrate/migrate/releases/download/{{ .Bootstrap.Migrate.Version }}/migrate.linux-${architecture}.tar.gz"; \
+    wget -q -O /tmp/migrate.tar.gz "https://github.com/golang-migrate/migrate/releases/download/{{ .Bootstrap.Migrate.Version }}/migrate.linux-${architecture}.tar.gz"; \
     printf '%s  %s\n' "${checksum}" /tmp/migrate.tar.gz | sha256sum -c -; \
     tar -xzf /tmp/migrate.tar.gz -C /tmp migrate; \
     install -m 0755 /tmp/migrate /usr/local/bin/migrate; \
