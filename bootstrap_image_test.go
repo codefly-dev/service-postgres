@@ -16,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -333,7 +332,7 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 			platform := "linux/" + architecture
 			requireDockerPlatform(t, platform)
 
-			tag := fmt.Sprintf("service-postgres-bootstrap-lock-test-%s:%d", architecture, time.Now().UnixNano())
+			tag := uniqueDockerName("service-postgres-bootstrap-lock-test-" + architecture + ":")
 			t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", tag).Run() })
 			build := exec.Command("docker", "build", "--platform", platform, "--tag", tag, context)
 			output, err := build.CombinedOutput()
@@ -378,7 +377,7 @@ func TestBootstrapImageLabelsCannotBeOverriddenAtBuildTime(t *testing.T) {
 	for argument := range bootstrapLock.RecipeBuildArgs() {
 		arguments = append(arguments, "--build-arg", argument+"=forged")
 	}
-	tag := fmt.Sprintf("service-postgres-bootstrap-forge-test:%d", time.Now().UnixNano())
+	tag := uniqueDockerName("service-postgres-bootstrap-forge-test:")
 	arguments[2] = tag
 	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", tag).Run() })
 

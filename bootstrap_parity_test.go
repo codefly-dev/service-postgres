@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -198,7 +200,7 @@ func buildBootstrapImage(ctx context.Context, t *testing.T, location string, set
 	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
 
-	tag := fmt.Sprintf("service-postgres-parity:%d", time.Now().UnixNano())
+	tag := uniqueDockerName("service-postgres-parity:")
 	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", "--force", tag).Run() })
 	runDocker(t, "build", "--file", filepath.Join(outputDirectory, "builder", "Dockerfile"),
 		"--tag", tag, outputDirectory)
@@ -292,7 +294,7 @@ type parityPostgres struct {
 // container through the network alias, mirroring how each really connects.
 func startParityPostgres(t *testing.T, network, role string) parityPostgres {
 	t.Helper()
-	alias := fmt.Sprintf("postgres-%s-%d", role, time.Now().UnixNano())
+	alias := uniqueDockerName("postgres-" + role + "-")
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "--force", alias).Run() })
 	runDocker(t, "run", "--detach", "--name", alias,
 		"--network", network, "--network-alias", alias,
@@ -334,10 +336,21 @@ func waitForParityPostgres(t *testing.T, container, dsn string) {
 
 func startParityNetwork(t *testing.T) string {
 	t.Helper()
-	network := fmt.Sprintf("codefly-postgres-parity-%d", time.Now().UnixNano())
+	network := uniqueDockerName("codefly-postgres-parity-")
 	runDocker(t, "network", "create", network)
 	t.Cleanup(func() { _ = exec.Command("docker", "network", "rm", network).Run() })
 	return network
+}
+
+// uniqueDockerName is prefix plus a suffix no two concurrent tests share. A clock
+// reading alone is not one: parallel subtests read the same value on a host whose
+// clock is coarser than a nanosecond, and docker refuses the second name.
+func uniqueDockerName(prefix string) string {
+	var random [6]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		panic(err)
+	}
+	return fmt.Sprintf("%s%d-%s", prefix, time.Now().UnixNano(), hex.EncodeToString(random[:]))
 }
 
 func runDocker(t *testing.T, args ...string) string {
@@ -393,7 +406,7 @@ func TestBootstrapImageRefusesDriftedStagedSources(t *testing.T) {
 	drifted := filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_store.up.sql")
 	require.NoError(t, os.WriteFile(drifted, []byte("CREATE TABLE something_else (id UUID PRIMARY KEY);\n"), 0o644))
 
-	tag := fmt.Sprintf("service-postgres-drift:%d", time.Now().UnixNano())
+	tag := uniqueDockerName("service-postgres-drift:")
 	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", "--force", tag).Run() })
 	runDocker(t, "build", "--file", filepath.Join(outputDirectory, "builder", "Dockerfile"),
 		"--tag", tag, outputDirectory)
@@ -461,7 +474,7 @@ func TestBootstrapImageBuildsTheWayTheCLIBuildsIt(t *testing.T) {
 	ignore := filepath.Join(outputDirectory, filepath.FromSlash(recipe.GetDockerignore()))
 	require.NoError(t, os.WriteFile(dockerfile+".dockerignore", mustReadFile(t, ignore), 0o644))
 
-	tag := fmt.Sprintf("service-postgres-cli-shape:%d", time.Now().UnixNano())
+	tag := uniqueDockerName("service-postgres-cli-shape:")
 	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", "--force", tag).Run() })
 	runDocker(t, "build", "--file", dockerfile, "--tag", tag, location)
 
