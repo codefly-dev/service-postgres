@@ -169,6 +169,12 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	w := s.Wool.In("runtime::init")
 
 	s.NetworkMappings = req.ProposedNetworkMappings
+	if s.SharedLocalServer && s.LocalServer != "" {
+		return s.Runtime.InitError(fmt.Errorf("shared-local-server and local-server are mutually exclusive"))
+	}
+	if s.LocalServer != "" {
+		return s.initOnLocalServer(ctx, req)
+	}
 
 	configuration := req.GetConfiguration()
 
@@ -355,7 +361,13 @@ func (s *Runtime) migrateOnInit(ctx context.Context) error {
 	if err := s.applySchema(ctx, prerequisites); err != nil {
 		return err
 	}
-	return s.ensureRuntimeAccessLocked(ctx)
+	if err := s.ensureRuntimeAccessLocked(ctx); err != nil {
+		return err
+	}
+	if s.SharedLocalServer {
+		return s.restrictLocalDatabase(ctx)
+	}
+	return nil
 }
 
 // applySchema brings the database up to the resolved prerequisites: extensions
@@ -677,6 +689,10 @@ func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtim
 	// watcher is running. Under lifecycleMu because it writes s.watcherCancel,
 	// which Destroy also clears.
 	s.StopWatcher()
+	if s.LocalServer != "" {
+		s.released = true
+		return s.stopResponse("released logical database; dependency owns the server and retained data")
+	}
 
 	// keep-running asks for a server the NEXT invocation reattaches to, and only
 	// the container backend can reattach: GetContainer adopts an existing
@@ -733,6 +749,10 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	// A leaked watcher would keep firing EventHandler at a database that is
 	// being removed. Idempotent when Stop already ran.
 	s.StopWatcher()
+	if s.LocalServer != "" {
+		s.released = true
+		return s.destroyResponse("released logical database; dependency owns the server and retained data")
+	}
 
 	if s.nixRuntime != nil {
 		if err := s.nixRuntime.Stop(ctx); err != nil {

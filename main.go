@@ -36,6 +36,13 @@ type Settings struct {
 	DatabaseName string `yaml:"database-name"`
 	HotReload    bool   `yaml:"hot-reload"`
 
+	// LocalServer is a declared Postgres dependency (module/service) whose
+	// server hosts this logical database during local runs. Deployment bindings
+	// remain governed by ExternalInstances. Empty retains the owned server.
+	LocalServer string `yaml:"local-server"`
+	// SharedLocalServer opts the owned local server into dependency sharing.
+	SharedLocalServer bool `yaml:"shared-local-server"`
+
 	// ExternalInstances binds named deployment environments to Postgres servers
 	// provisioned outside this service. DatabaseName and RuntimeReadWriteRoles
 	// attest that each environment targets this service's logical database
@@ -511,6 +518,9 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 		{Key: ownerConnectionKey, Value: ownerConnection, Secret: true},
 		{Key: readOnlyConnectionKey, Value: readOnlyConnection, Secret: true},
 		{Key: readWriteConnectionKey, Value: readWriteConnection, Secret: true},
+	}
+	if s.SharedLocalServer && s.LocalServer == "" {
+		values = append(values, &basev0.ConfigurationValue{Key: localServerConnectionKey, Value: ownerConnection, Secret: true})
 	}
 	logins, err := s.runtimeLogins()
 	if err != nil {

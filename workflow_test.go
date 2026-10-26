@@ -335,3 +335,15 @@ func TestReleaseStepPublishesBothLockedTagsPastALaggingRead(t *testing.T) {
 	)
 	require.Len(t, calls, 5, "one create, then each tag read past its 404")
 }
+
+func TestCIWorkflowEnforcesSharedServerRegression(t *testing.T) {
+	job := readWorkflow(t, ".github/workflows/ci.yml").Jobs["image"]
+	buildIndex, _ := findWorkflowStepAt(t, job, "Build runtime image")
+	regressionIndex, step := findWorkflowStepAt(t, job, "Shared local server regression")
+	require.Less(t, buildIndex, regressionIndex)
+	require.Empty(t, step.If)
+	require.Equal(t, "service-postgres:test", step.Env["SERVICE_POSTGRES_TEST_IMAGE"])
+	require.Contains(t, step.Run, "-race")
+	require.Contains(t, step.Run, "TestLocalServerLifecycleDocker")
+	require.Contains(t, findWorkflowStep(t, job, "Run unit tests").Run, "TestLocalServerLifecycleDocker")
+}

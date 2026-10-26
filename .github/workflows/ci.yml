@@ -65,7 +65,7 @@ jobs:
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
       - name: Run unit tests
-        run: go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
+        run: go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestLocalServerLifecycleDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
@@ -89,6 +89,11 @@ jobs:
         env:
           SERVICE_POSTGRES_TEST_IMAGE: service-postgres:test
         run: go test . -run '^(TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
+
+      - name: Shared local server regression
+        env:
+          SERVICE_POSTGRES_TEST_IMAGE: service-postgres:test
+        run: go test . -race -run '^TestLocalServerLifecycleDocker$' -count=1 -timeout 10m
 
       - name: Smoke test runtime image
         shell: bash

@@ -72,18 +72,18 @@ Derived from `.github/workflows/ci.yml` and the reusable
 go build ./...
 go vet ./...
 go mod tidy -diff        # CI fails on any diff
-go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
+go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestLocalServerLifecycleDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 ```
 
 That skip list is CI's unit step, and it is the inventory of what needs a
 container. Everything else is template rendering, lock parsing, workflow
-assertions and unit tests. The three migration regressions run after it,
+assertions and unit tests. The shared-server and three migration regressions run after it,
 against a locally built image:
 
 ```bash
 docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
 SERVICE_POSTGRES_TEST_IMAGE=service-postgres:test go test . \
-  -run '^(TestDirtyMigrationFailsClosed|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
+  -run '^(TestLocalServerLifecycleDocker|TestDirtyMigrationFailsClosed|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 ```
 
 `TestLifecycleContractDocker` runs later still, against the *published* image.

@@ -22,7 +22,7 @@ The bootstrap job applies migrations and reconciles runtime roles and grants on 
 
 ## Externally provisioned deployments
 
-Add an entry to `external-instances` when a deployment environment uses a managed Postgres server instead of a server owned by this service. Bindings are keyed by environment so staging and production cannot silently share an address. The deployment emits the bootstrap Job but no Service, StatefulSet, or persistent volume. Local Docker and Nix runs still provision their own Postgres server.
+Add an entry to `external-instances` when a deployment environment uses a managed Postgres server instead of a server owned by this service. Bindings are keyed by environment so staging and production cannot silently share an address. The deployment emits the bootstrap Job but no Service, StatefulSet, or persistent volume. Local Docker and Nix runs provision their own Postgres server by default. For local sharing, opt the owning service in with `shared-local-server: true`; a database service with a managed dependency on it can set `local-server: <module>/<service>`. Each borrower keeps a distinct database and migration-owner name, its migrations and runtime logins. It consumes Codefly-resolved configuration and never stops the owning server. See the agent repository’s `docs/local-shared-server.md` for composition, isolation and data migration instructions.
 
 ```yaml
 database-name: accounts
