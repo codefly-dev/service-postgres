@@ -122,7 +122,8 @@ variables only the qualify script supplies.
 | `migrations.go` | one golang-migrate lineage per source, budgets, fail-closed |
 | `schema.go`, `schemaplan.go` | prerequisite resolution into `bootstrap/plan.json` |
 | `runtime_access.go` | roles, grants, RLS, password vs `external-identity` |
-| `nixpg.go` | the docker-free backend, from the embedded `nix/flake.*` |
+| `nixpg.go` | the docker-free backend, from the embedded `nix/flake.*`: one server per run |
+| `forward.go`, `runtime_native.go` | a service's endpoint and database on its run's native server |
 | `hotreload.go` | forward-only migration reload |
 | `templates/` | everything embedded into the binary; `factory/` is what `Create` scaffolds |
 | `libs/go` | **separate module**: the Go client library, no core, no parent |
