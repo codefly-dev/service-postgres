@@ -248,7 +248,7 @@ func acquireRunServer(ctx context.Context, key, service, logLevel string, out io
 }
 
 // lockRunServer serializes every start, attach, release and collection of one
-// run server across the run's agent processes.
+// run server across the run's agent processes, including database provisioning.
 func lockRunServer(ctx context.Context, root string) (func(), error) {
 	lock := flock.New(filepath.Join(root, "lock"))
 	locked, err := lock.TryLockContext(ctx, 100*time.Millisecond)
@@ -673,11 +673,43 @@ func (n *nixPostgres) ping(ctx context.Context) error {
 // another service's database, copy it, or alter another service's roles. A
 // database another service of the run already claimed is refused by name.
 func (n *nixPostgres) provisionDatabase(ctx context.Context, service, database, owner, password string) error {
+	unlock, err := lockRunServer(ctx, n.root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	db, err := sql.Open("postgres", n.adminDSN("postgres"))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+
+	// The database records the service it belongs to, and that record is a
+	// comment any role with CREATEDB could have written on a database of its
+	// own. Its current owner is the half that cannot be forged: a service
+	// creating a database owns it, and it cannot hand ownership to an owner
+	// role it is not a member of — which the membership check above is what
+	// keeps true. A database owned by this service's own owner with no comment
+	// yet is the one legitimate gap, between CREATE DATABASE and COMMENT, and
+	// the comment is simply written.
+	marker := databaseClaim(service)
+	var claim sql.NullString
+	var currentOwner string
+	err = db.QueryRowContext(ctx,
+		`SELECT shobj_description(oid, 'pg_database'), pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1`,
+		database).Scan(&claim, &currentOwner)
+	createDatabase := errors.Is(err, sql.ErrNoRows)
+	switch {
+	case err != nil && !createDatabase:
+		return fmt.Errorf("look up database %q: %w", database, err)
+	case !createDatabase && currentOwner != owner:
+		return fmt.Errorf("database %q on this run's postgres server is owned by %q, not by %s's migration owner: give each service of a run its own database-name",
+			database, currentOwner, service)
+	case !createDatabase && claim.Valid && claim.String != marker:
+		return fmt.Errorf("database %q on this run's postgres server belongs to %s, not %s: give each service of a run its own database-name",
+			database, strings.TrimPrefix(claim.String, databaseClaimPrefix), service)
+	}
 
 	// A migration owner may create roles, because its migrations create the
 	// application's own NOLOGIN roles. On PostgreSQL 16 and later a role
@@ -710,38 +742,13 @@ func (n *nixPostgres) provisionDatabase(ctx context.Context, service, database, 
 		return fmt.Errorf("configure the migration owner: %w", err)
 	}
 
-	// The database records the service it belongs to, and that record is a
-	// comment any role with CREATEDB could have written on a database of its
-	// own. Its current owner is the half that cannot be forged: a service
-	// creating a database owns it, and it cannot hand ownership to an owner
-	// role it is not a member of — which the membership check above is what
-	// keeps true. A database owned by this service's own owner with no comment
-	// yet is the one legitimate gap, between CREATE DATABASE and COMMENT, and
-	// the comment is simply written.
-	marker := databaseClaim(service)
-	var claim sql.NullString
-	var currentOwner string
-	err = db.QueryRowContext(ctx,
-		`SELECT shobj_description(oid, 'pg_database'), pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1`,
-		database).Scan(&claim, &currentOwner)
 	quotedDatabase := pq.QuoteIdentifier(database)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	if createDatabase {
 		if _, err := db.ExecContext(ctx, `CREATE DATABASE `+quotedDatabase+` OWNER `+quotedOwner); err != nil {
 			return fmt.Errorf("create database %q: %w", database, err)
 		}
-		if _, err := db.ExecContext(ctx, `COMMENT ON DATABASE `+quotedDatabase+` IS `+pq.QuoteLiteral(marker)); err != nil {
-			return fmt.Errorf("record database %q's service: %w", database, err)
-		}
-	case err != nil:
-		return fmt.Errorf("look up database %q: %w", database, err)
-	case currentOwner != owner:
-		return fmt.Errorf("database %q on this run's postgres server is owned by %q, not by %s's migration owner: give each service of a run its own database-name",
-			database, currentOwner, service)
-	case claim.Valid && claim.String != marker:
-		return fmt.Errorf("database %q on this run's postgres server belongs to %s, not %s: give each service of a run its own database-name",
-			database, strings.TrimPrefix(claim.String, databaseClaimPrefix), service)
-	case !claim.Valid:
+	}
+	if !claim.Valid {
 		if _, err := db.ExecContext(ctx, `COMMENT ON DATABASE `+quotedDatabase+` IS `+pq.QuoteLiteral(marker)); err != nil {
 			return fmt.Errorf("record database %q's service: %w", database, err)
 		}
@@ -942,25 +949,18 @@ func stopServer(root, dataDir string) (bool, error) {
 	return true, nil
 }
 
-// signalPostmaster delivers a signal to a recorded postmaster, and only while
-// that exact birth is still the process behind the number.
-//
-// The confirmation and the delivery are two system calls, so a process that
-// exits between them cannot be signalled by this call at all (the signal is
-// then rejected, as the PID no longer resolves) unless the number is reused in
-// that same window. Narrowing it to those microseconds is the most a caller
-// can do for a process that is not its child; what this removes is the real
-// exposure, which is a file on disk naming a PID whose process died minutes,
-// hours or a reboot ago.
+// signalPostmaster re-establishes the recorded birth, then delegates delivery
+// to Core's kernel-bound process handle. A PID reused after inspection cannot
+// receive the signal; PostgreSQL shutdown policy remains here.
 func signalPostmaster(postmaster processMark, signal syscall.Signal) error {
-	if !postmaster.confirmed() {
-		return fmt.Errorf("postgres server %d is no longer the process this run started", postmaster.PID)
-	}
-	process, err := os.FindProcess(postmaster.PID)
+	identity, err := runners.InspectProcess(postmaster.PID)
 	if err != nil {
 		return err
 	}
-	return process.Signal(signal)
+	if identity.StartID != postmaster.StartID || identity.BootID != postmaster.BootID {
+		return fmt.Errorf("postgres server %d is no longer the process this run started: %w", postmaster.PID, runners.ErrProcessNotFound)
+	}
+	return runners.SignalProcess(context.Background(), identity, signal)
 }
 
 // forgetPostmasterRecord drops a record no server answers to any more, so a

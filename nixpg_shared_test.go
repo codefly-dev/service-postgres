@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -127,6 +128,11 @@ func TestRunServerRefusesTwoServicesClaimingOneDatabase(t *testing.T) {
 	workspace := t.TempDir()
 	first := newPostgresFixtureAt(t, ctx, workspace, "shared", "first", resources.NewRuntimeContextNix())
 	second := newPostgresFixtureAt(t, ctx, workspace, "shared", "second", resources.NewRuntimeContextNix())
+	for _, value := range second.configuration.Infos[0].ConfigurationValues {
+		if value.Key == "POSTGRES_PASSWORD" {
+			value.Value = "second-owner-password"
+		}
+	}
 
 	run, _ := first.start(t, ctx)
 
@@ -252,4 +258,38 @@ func TestRunServerRefusesAnOwnerRoleAnotherServiceCreated(t *testing.T) {
 	require.Equal(t, runtimev0.InitStatus_ERROR, init.GetStatus().GetState())
 	require.Contains(t, init.GetStatus().GetMessage(), "was not created for victim/store")
 	require.Nil(t, refused.nixRuntime, "a refused service holds no server")
+}
+
+// Competing initial claims must choose one service before either can alter the
+// shared owner role. The losing service's password must never become usable.
+func TestRunServerSerializesInitialDatabaseClaims(t *testing.T) {
+	requireNix(t)
+	ctx := t.Context()
+	fixture := newPostgresFixtureAt(t, ctx, t.TempDir(), "seed", "store", resources.NewRuntimeContextNix())
+	run, _ := fixture.start(t, ctx)
+	const database = "contended"
+	owner := nativeOwnerRole(database)
+	start := make(chan struct{})
+	results := make(chan int, 2)
+	for i := range 2 {
+		go func() {
+			<-start
+			err := run.nixRuntime.provisionDatabase(ctx, fmt.Sprintf("claimant/%d", i), database, owner, fmt.Sprintf("password-%d", i))
+			if err != nil {
+				results <- -1
+			} else {
+				results <- i
+			}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	require.NotEqual(t, first == -1, second == -1, "exactly one initial claim succeeds")
+	winner := first
+	if winner == -1 {
+		winner = second
+	}
+	connection := withDatabase(t, run.connection, database)
+	require.NoError(t, connects(ctx, withUser(t, connection, owner, fmt.Sprintf("password-%d", winner))))
+	require.Error(t, connects(ctx, withUser(t, connection, owner, fmt.Sprintf("password-%d", 1-winner))))
 }

@@ -51,6 +51,10 @@ On the Nix runtime every Postgres service of a run shares **one** Postgres serve
 - **Endpoints.** The server listens on no TCP port, only on a private Unix socket. Each service's agent listens on the service's own allocated port, on loopback, and forwards every connection to that socket; authentication stays between the client and the server.
 - **Lifecycle.** The first service to start starts the server; each stop or destroy releases that service, and the last one stops the server, which frees its shared memory. A run killed without stopping leaves a server no live agent holds; the next service to start on the machine stops it. The cluster directory is retained per run, as each service's was.
 
+Native shutdown signals the recorded process birth through Core, so a reused PID is not a shutdown target.
+
+Database provisioning is serialized under the run server lock. An existing database claim is checked before changing its owner role, so a refused second service cannot rotate the first service's password.
+
 Existing per-service native clusters are not migrated: a run's first start on this version creates its databases empty and migrates them, and the old directories are left where they are.
 
 ## Lifecycle: stop, keep-running, destroy
