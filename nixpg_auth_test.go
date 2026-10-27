@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -12,23 +11,14 @@ import (
 	"github.com/lib/pq"
 )
 
-func TestNewNixPostgresRejectsEmptyPasswordBeforeProvisioning(t *testing.T) {
-	if _, err := newNixPostgres(context.Background(), t.TempDir(), 5432, "postgres", "", "postgres", "", nil); err == nil {
-		t.Fatal("native postgres accepted an empty password")
-	}
-}
-
 func TestInitdbUsesPrivatePasswordFileAndSCRAM(t *testing.T) {
 	root := t.TempDir()
-	n := &nixPostgres{dataDir: filepath.Join(root, "data"), user: "postgres", password: `s p#ss"word`}
-	if err := os.MkdirAll(n.dataDir, 0o700); err != nil {
+	n := &nixPostgres{root: root, dataDir: filepath.Join(root, "pgdata")}
+	const password = `s p#ss"word`
+	if err := writeOwnerOnly(n.adminPasswordPath(), password+"\n"); err != nil {
 		t.Fatal(err)
 	}
-	passwordFile, err := n.writeInitPasswordFile()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(passwordFile)
+	passwordFile := n.adminPasswordPath()
 	info, err := os.Stat(passwordFile)
 	if err != nil {
 		t.Fatal(err)
@@ -41,32 +31,42 @@ func TestInitdbUsesPrivatePasswordFileAndSCRAM(t *testing.T) {
 		t.Fatalf("initdb args do not require SCRAM: %q", args)
 	}
 	joined := strings.Join(args, " ")
-	if strings.Contains(joined, "trust") || strings.Contains(joined, n.password) {
+	if strings.Contains(joined, "trust") || strings.Contains(joined, password) {
 		t.Fatalf("unsafe initdb args: %q", args)
+	}
+	if !slices.Contains(args, serverAdminRole) {
+		t.Fatalf("initdb args do not name the run server's administrator: %q", args)
+	}
+	read, err := n.readAdminPassword()
+	if err != nil || read != password {
+		t.Fatalf("administrator password did not round trip: %q, %v", read, err)
 	}
 }
 
 func TestAdminDSNEncodesCredentialsAndTargetsOwnedSocket(t *testing.T) {
 	n := &nixPostgres{
-		user: "db user", password: `p@ss:/?#[]`, port: 5432,
-		socketDir: filepath.Join(t.TempDir(), "private socket"),
+		adminPassword: `p@ss:/?#[]`,
+		socketDir:     filepath.Join(t.TempDir(), "private socket"),
 	}
-	parsed, err := url.Parse(n.adminDSN())
+	parsed, err := url.Parse(n.adminDSN("orders db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.User.Username() != n.user {
-		t.Fatalf("username = %q, want %q", parsed.User.Username(), n.user)
+	if parsed.User.Username() != serverAdminRole {
+		t.Fatalf("username = %q, want %q", parsed.User.Username(), serverAdminRole)
+	}
+	if parsed.Path != "/orders db" {
+		t.Fatalf("database = %q, want the service's", parsed.Path)
 	}
 	password, ok := parsed.User.Password()
-	if !ok || password != n.password {
+	if !ok || password != n.adminPassword {
 		t.Fatalf("password did not round trip: %q", password)
 	}
 	if parsed.Host != "" || parsed.Query().Get("host") != n.socketDir ||
 		parsed.Query().Get("port") != "5432" || parsed.Query().Get("sslmode") != "disable" {
 		t.Fatalf("unexpected DSN %q", parsed.String())
 	}
-	pqDSN, err := pq.ParseURL(n.adminDSN())
+	pqDSN, err := pq.ParseURL(n.adminDSN("orders db"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,26 +2,30 @@ package main
 
 import "testing"
 
-func TestNixPostgresStateKeyPreservesUnscopedIdentity(t *testing.T) {
-	const location = "/workspace/modules/infra/services/postgres"
-	if got := nixPostgresStateKey(location, ""); got != location {
-		t.Fatalf("unscoped state key = %q, want existing location %q", got, location)
+func TestRunServerKeyIsStablePerRun(t *testing.T) {
+	const workspace = "/workspace/robin/playground"
+	if runServerKey(workspace, "qa") != runServerKey(workspace, "qa") {
+		t.Fatal("one run produced two server keys")
 	}
 }
 
-func TestNixPostgresStateKeySeparatesNamingScopes(t *testing.T) {
-	const location = "/workspace/modules/infra/services/postgres"
-	first := nixPostgresStateKey(location, "qualification-a")
-	repeated := nixPostgresStateKey(location, "qualification-a")
-	second := nixPostgresStateKey(location, "qualification-b")
-
-	if first != repeated {
-		t.Fatalf("same naming scope produced unstable keys %q and %q", first, repeated)
+// TestRunServerKeySeparatesRuns pins the isolation boundary: a naming scope or
+// another workspace is another run, with its own server, data and credentials.
+func TestRunServerKeySeparatesRuns(t *testing.T) {
+	const workspace = "/workspace/robin/playground"
+	keys := map[string]string{
+		"unscoped":         runServerKey(workspace, ""),
+		"scope a":          runServerKey(workspace, "qualification-a"),
+		"scope b":          runServerKey(workspace, "qualification-b"),
+		"other workspace":  runServerKey("/workspace/other", "qualification-a"),
+		"ambiguous concat": runServerKey(workspace+"\x00naming-scope\x00qualification", "-a"),
 	}
-	if first == second {
-		t.Fatalf("different naming scopes shared state key %q", first)
-	}
-	if serviceHash(first) == serviceHash(second) {
-		t.Fatal("different naming scopes shared the same runtime-root hash")
+	seen := map[string]string{}
+	for name, key := range keys {
+		hash := serviceHash(key)[:16]
+		if other, ok := seen[hash]; ok {
+			t.Fatalf("%s and %s share a run server", name, other)
+		}
+		seen[hash] = name
 	}
 }

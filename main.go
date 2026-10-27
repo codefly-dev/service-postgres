@@ -363,8 +363,11 @@ type Service struct {
 	// Settings
 	*Settings
 
-	postgresUser      string
-	postgresPassword  string
+	postgresUser     string
+	postgresPassword string
+	// nativeOwner, when set, is the migration owner's role on the run's shared
+	// native server, and replaces the configured POSTGRES_USER there.
+	nativeOwner       string
 	readOnlyPassword  string
 	readWritePassword string
 	// loginPasswords holds each declared runtime login's password by login name.
@@ -433,6 +436,9 @@ func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configurat
 	s.postgresUser, err = resources.GetConfigurationValue(ctx, conf, "postgres", "POSTGRES_USER")
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot get user")
+	}
+	if s.nativeOwner != "" {
+		s.postgresUser = s.nativeOwner
 	}
 	s.postgresPassword, err = resources.GetConfigurationValue(ctx, conf, "postgres", "POSTGRES_PASSWORD")
 	if err != nil {

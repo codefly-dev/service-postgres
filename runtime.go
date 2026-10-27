@@ -50,9 +50,17 @@ type Runtime struct {
 	runnerEnvironment *dockerrun.DockerEnvironment
 
 	// nixRuntime is set instead of runnerEnvironment when the caller requests
-	// RuntimeContextNix — postgres then runs natively from a nix-provisioned
-	// binary (no Docker), serving the same connection string + database.
+	// RuntimeContextNix: this service's attachment to its run's one native
+	// postgres server (nixpg.go), serving the same connection string and
+	// database.
 	nixRuntime *nixPostgres
+
+	// extensionAdmin is the connection extensions are created with. On the
+	// run's shared server that is the server's administrator in this service's
+	// database — the migration owner is not a superuser there, and pgvector is
+	// not a trusted extension — the way a managed server's provider creates
+	// them. Empty elsewhere: the owner connection creates them.
+	extensionAdmin string
 
 	postgresPort uint16
 
@@ -170,6 +178,16 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 
 	s.NetworkMappings = req.ProposedNetworkMappings
 
+	// On the native runtime the service's database lives on its run's shared
+	// server, where roles are server-wide: the migration owner is this
+	// database's own role there, not the configured POSTGRES_USER every local
+	// service ships with.
+	native := req.GetRuntimeContext().GetKind() == resources.RuntimeContextNix
+	s.nativeOwner = ""
+	if native {
+		s.nativeOwner = nativeOwnerRole(s.DatabaseName)
+	}
+
 	configuration := req.GetConfiguration()
 
 	net, err := resources.FindNetworkMapping(ctx, s.NetworkMappings, s.TcpEndpoint)
@@ -235,31 +253,19 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 		return s.Runtime.InitError(err)
 	}
 
-	// Nix runtime: run postgres natively from a nix-provisioned binary instead
-	// of a Docker container — selected when the caller requests
-	// RuntimeContextNix (e.g. a host without Docker). Same connection string +
-	// database as the Docker path, so the rest of the agent is unchanged.
-	if rc := req.GetRuntimeContext(); rc != nil && rc.Kind == resources.RuntimeContextNix {
-		w.Debug("using nix runtime for postgres", wool.Field("port", instance.Port))
+	// Native runtime: this service's database on its run's one postgres
+	// server (nixpg.go), published at this service's own endpoint
+	// (forward.go). Same connection strings and database as the Docker path,
+	// so the rest of the agent is unchanged.
+	if native {
+		w.Debug("using the run's native postgres server", wool.Field("port", instance.Port))
 		// An interrupted native run leaves System V resources the postmaster
 		// never got to remove, and a leaked semaphore run poisons every later
-		// start on this host. Collect them before the cluster is initialized,
-		// while nothing this invocation owns is attached to them yet.
+		// start on this host. Collect them before a server is started, while
+		// nothing this invocation owns is attached to them yet.
 		s.reapHostResources(ctx)
-		nixpg, errNix := newNixPostgres(ctx, nixPostgresStateKey(s.Location, s.Environment.NamingScope), uint16(instance.Port),
-			s.postgresUser, s.postgresPassword, s.DatabaseName, s.LogLevel, newPGLogWriter(s.Wool))
-		if errNix != nil {
-			return s.Runtime.InitError(errNix)
-		}
-		if errNix = nixpg.Init(ctx); errNix != nil {
-			return s.Runtime.InitError(errNix)
-		}
-		s.nixRuntime = nixpg
-		s.retainedDataPath = nixpg.dataDir
-		s.released = false
-		s.Wool.Debug("nix postgres init successful")
-		if errNix = s.migrateOnInit(ctx); errNix != nil {
-			return s.Runtime.InitError(errNix)
+		if errNative := s.initNative(ctx, instance); errNative != nil {
+			return s.Runtime.InitError(errNative)
 		}
 		return s.Runtime.InitResponse()
 	}
@@ -385,7 +391,7 @@ func (s *Runtime) applySchema(ctx context.Context, prerequisites *schemaPrerequi
 // use. The convenience defaults and declarations marked optional record a
 // structured skip instead.
 func (s *Runtime) ensureExtensions(ctx context.Context, prerequisites *schemaPrerequisites) error {
-	db, err := sql.Open("postgres", s.connection)
+	db, err := sql.Open("postgres", s.extensionConnection())
 	if err != nil {
 		return s.Wool.Wrapf(err, "cannot open database to create extensions")
 	}
@@ -679,32 +685,26 @@ func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtim
 	s.StopWatcher()
 
 	// keep-running asks for a server the NEXT invocation reattaches to, and only
-	// the container backend can reattach: GetContainer adopts an existing
-	// container by name. nixPostgres has no such path — Init always launches a
-	// new postmaster, and clearStalePostmasterPid deliberately leaves a live
-	// owner's lock file alone, so a retained nix postmaster makes the next Init
-	// start a second postmaster against the same data directory and port, which
-	// postgres refuses. Honouring the setting there would trade a cold start for
-	// a broken one, so nix stops and keeps the half of the contract it can: the
-	// data.
+	// the container backend has one per service: GetContainer adopts an
+	// existing container by name. The native server belongs to the run, not to
+	// this service, and stops when the run's last service releases it, so one
+	// service cannot keep it up for itself. Native releases and keeps the half
+	// of the contract it can: the data.
 	if s.Settings.KeepRunning {
 		if s.nixRuntime == nil && !s.Runtime.IsNixRuntime() {
 			s.Wool.Debug("keep-running is set: leaving postgres up for reuse")
 			return s.stopResponse("kept postgres running for reuse")
 		}
-		s.Wool.Warn("keep-running is not available on the nix runtime: stopping postgres, its data is retained")
+		s.Wool.Warn("keep-running is not available on the nix runtime: releasing postgres, its data is retained")
 	}
 
 	if s.nixRuntime != nil {
-		if err := s.nixRuntime.Stop(ctx); err != nil {
+		action, err := s.releaseNative(ctx)
+		if err != nil {
 			return s.Runtime.StopError(err)
 		}
-		// Stop removes the handle's socket directory, so it can never serve a
-		// second run — drop it instead of leaving a dead handle behind.
-		s.nixRuntime = nil
-		s.released = true
 		s.reapHostResources(ctx)
-		return s.stopResponse("stopped native postgres")
+		return s.stopResponse(action)
 	}
 
 	if s.runnerEnvironment != nil {
@@ -735,13 +735,12 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	s.StopWatcher()
 
 	if s.nixRuntime != nil {
-		if err := s.nixRuntime.Stop(ctx); err != nil {
+		action, err := s.releaseNative(ctx)
+		if err != nil {
 			return s.Runtime.DestroyError(err)
 		}
-		s.nixRuntime = nil
-		s.released = true
 		s.reapHostResources(ctx)
-		return s.destroyResponse("stopped native postgres")
+		return s.destroyResponse(action)
 	}
 	// A nix invocation has no container to remove, and reaching for one would
 	// demand a docker daemon from a host that was very likely chosen for not

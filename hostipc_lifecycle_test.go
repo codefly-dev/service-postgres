@@ -64,7 +64,12 @@ func TestNativeLifecycleRecoversHostResources(t *testing.T) {
 
 	// Stop and Destroy release a postmaster, which is the moment its System V
 	// resources become collectable. A bare handle stands in for a started
-	// cluster so the teardown wiring is covered on hosts without nix too.
+	// cluster so the teardown wiring is covered on hosts without nix too; on a
+	// host with nix, the server Init really started is released first.
+	if runtime.nixRuntime != nil {
+		_, err = runtime.releaseNative(ctx)
+		require.NoError(t, err)
+	}
 	runtime.nixRuntime = &nixPostgres{}
 	_, err = runtime.Stop(ctx, &runtimev0.StopRequest{})
 	require.NoError(t, err)

@@ -80,7 +80,7 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	require.Error(t, reader.CreateRelation(ctx, "reader_escape"), "reader must not create schema objects")
 	require.Error(t, writer.CreateRelation(ctx, "writer_escape"), "writer must not create schema objects")
 	require.Error(t, writer.CreateLoginRole(ctx, "writer_escape_role"), "writer must not create roles")
-	require.Error(t, writer.AssumeRole(ctx, "postgres"), "writer must not assume the migration owner")
+	require.Error(t, writer.AssumeRole(ctx, runtime.postgresUser), "writer must not assume the migration owner")
 
 	owner, err := openPostgresCapabilityProbe(ctx, runtime.connection)
 	require.NoError(t, err)
@@ -289,7 +289,13 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	}
 	require.Error(t, err, "maintenance must not accept the migration owner")
 
-	assertExternalIdentityReconciliation(t, ctx, migrationControl)
+	// The external-identity reconciler is a deployment path; the local server
+	// stands in for the managed one, and its administrator for the provider's,
+	// which creates the cloud's login principals out-of-band.
+	providerControl, err := migrationtest.OpenControlPlane(ctx, runtime.extensionConnection())
+	require.NoError(t, err)
+	defer providerControl.Close()
+	assertExternalIdentityReconciliation(t, ctx, providerControl)
 	assertExternalIdentityTokenAuthentication(t, ctx, readOnlyConnection, readWriteConnection)
 	assertSchemaPrerequisitesFailClosed(t, ctx, migrationControl, runtime.connection, readWriteConnection)
 
@@ -464,10 +470,12 @@ func assertExternalIdentityReconciliation(t *testing.T, ctx context.Context, con
 	readOnlyGroup, readWriteGroup := runtimeRoleNames(isolate.Name)
 	readerPrincipal := readOnlyGroup + "_p"
 	writerPrincipal := readWriteGroup + "_p"
+	var owner string
+	require.NoError(t, isolate.DB.QueryRowContext(ctx, `SELECT current_user`).Scan(&owner))
 
 	base := pgcontrol.RuntimeAccess{
 		Database:                          isolate.Name,
-		OwnerRole:                         "postgres",
+		OwnerRole:                         owner,
 		ReadOnlyRole:                      readOnlyGroup,
 		ReadWriteRole:                     readWriteGroup,
 		Schemas:                           []string{"public"},

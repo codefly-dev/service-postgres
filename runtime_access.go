@@ -233,6 +233,12 @@ func (s *Service) runtimeAccess() (readOnlyRole, readWriteRole string, err error
 }
 
 func runtimeRoleNames(database string) (readOnly, readWrite string) {
+	prefix := runtimeRolePrefix(database)
+	return prefix + "_ro", prefix + "_rw"
+}
+
+// runtimeRolePrefix is the server-wide name stem of a database's roles.
+func runtimeRolePrefix(database string) string {
 	var slug strings.Builder
 	for _, r := range strings.ToLower(database) {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
@@ -254,8 +260,7 @@ func runtimeRoleNames(database string) (readOnly, readWrite string) {
 	}
 	sum := sha256.Sum256([]byte(database))
 	digest := hex.EncodeToString(sum[:4])
-	prefix := "codefly_" + base + "_" + digest
-	return prefix + "_ro", prefix + "_rw"
+	return "codefly_" + base + "_" + digest
 }
 
 func normalizedRuntimeSchemas(configured []string) ([]string, error) {
@@ -480,8 +485,26 @@ func ensureLoginRole(ctx context.Context, tx *sql.Tx, role, password string, rea
 			return err
 		}
 	}
-	attributes := ` WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD ` + pq.QuoteLiteral(password)
-	if _, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+attributes); err != nil {
+	// Only a superuser may even restate SUPERUSER, REPLICATION or BYPASSRLS, so
+	// a migration owner that is not one — the run's shared native server, a
+	// managed server — clears only the elevated attributes the role actually
+	// holds. A role holding one it cannot clear still fails, as it must.
+	var superuser, createDB, createRole, replication, bypassRLS bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+		FROM pg_roles WHERE rolname = $1`, role).Scan(&superuser, &createDB, &createRole, &replication, &bypassRLS); err != nil {
+		return err
+	}
+	attributes := []string{"LOGIN", "NOINHERIT"}
+	for _, attribute := range []struct {
+		set   bool
+		clear string
+	}{{superuser, "NOSUPERUSER"}, {createDB, "NOCREATEDB"}, {createRole, "NOCREATEROLE"}, {replication, "NOREPLICATION"}, {bypassRLS, "NOBYPASSRLS"}} {
+		if attribute.set {
+			attributes = append(attributes, attribute.clear)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` WITH `+strings.Join(attributes, " ")+` PASSWORD `+pq.QuoteLiteral(password)); err != nil {
 		return err
 	}
 	if readOnly {
