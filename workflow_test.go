@@ -245,6 +245,7 @@ func TestRuntimeDockerfilePinsReproducibleBuildInputs(t *testing.T) {
 	require.Contains(t, dockerfile, "libcrypto3=3.5.9-r0")
 	require.Contains(t, dockerfile, "libssl3=3.5.9-r0")
 	require.Contains(t, dockerfile, "libuuid=2.42.3-r1")
+	require.Contains(t, dockerfile, "musl=1.2.6-r3")
 	require.Contains(t, dockerfile, "su-exec=0.3-r0")
 	require.Contains(t, dockerfile, "RUN rm /usr/local/bin/gosu")
 	require.Contains(t, dockerfile, "ln -s /sbin/su-exec /usr/local/bin/gosu")

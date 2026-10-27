@@ -33,6 +33,16 @@ write a digest CI then rejects.
    postgres patch release, a new pgvector version, a new alpine branch — update
    the `tag` string too. It is descriptive (`postgres-<pg>-pgvector-<ver>-<base>`)
    and a wrong one silently mislabels every release that consumes it.
+   An `apk add` line pins the **whole transaction**, not just the packages
+   you meant to change: `--upgrade` upgrades their dependencies too, and an
+   unnamed one floats with the Alpine index (musl moved the digest that way on
+   2026-10-26 with no Dockerfile change). List what the line would change
+   against the pinned base and name every package it prints:
+
+   ```bash
+   docker run --rm "$(sed -n 's/^ARG POSTGRES_IMAGE=//p' Dockerfile)" sh -c \
+     'apk add --simulate --no-cache --upgrade <the packages on the line>'
+   ```
 2. Push the branch. The `image` job builds the candidate and, on a mismatch,
    fails "Verify runtime image candidate" printing both digests.
 3. Copy the **built** digest into `runtime-image.json` and push again.

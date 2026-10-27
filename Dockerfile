@@ -23,10 +23,14 @@ RUN mkdir /tmp/pgvector /tmp/pgvector-install && \
 FROM ${POSTGRES_IMAGE} AS runtime
 
 RUN rm /usr/local/bin/gosu
+# --upgrade also upgrades each named package's dependencies, so every package
+# this transaction changes is named at its exact version. An unnamed one floats
+# with the Alpine index: musl did on 2026-10-26 and moved the image digest.
 RUN apk add --no-cache --upgrade \
     libcrypto3=3.5.9-r0 \
     libssl3=3.5.9-r0 \
     libuuid=2.42.3-r1 \
+    musl=1.2.6-r3 \
     su-exec=0.3-r0 && \
     ln -s /sbin/su-exec /usr/local/bin/gosu && \
     rm /var/log/apk.log
