@@ -122,7 +122,8 @@ variables only the qualify script supplies.
 | `migrations.go` | one golang-migrate lineage per source, budgets, fail-closed |
 | `schema.go`, `schemaplan.go` | prerequisite resolution into `bootstrap/plan.json` |
 | `runtime_access.go` | roles, grants, RLS, password vs `external-identity` |
-| `nixpg.go` | the docker-free backend, from the embedded `nix/flake.*` |
+| `nixpg.go` | the docker-free backend, from the embedded `nix/flake.*`: one server per run |
+| `forward.go`, `runtime_native.go` | a service's endpoint and database on its run's native server |
 | `hotreload.go` | forward-only migration reload |
 | `templates/` | everything embedded into the binary; `factory/` is what `Create` scaffolds |
 | `libs/go` | **separate module**: the Go client library, no core, no parent |
@@ -165,6 +166,8 @@ Loaded on demand rather than carried here — `.claude/skills/`:
 ## Workflow
 
 - Branch and PR; never commit to `main`. Conventional Commits for the title.
+- Release flow: `docs/releases.md`. Keep dev tags publishing when repinning
+  core; only normal releases use its default-branch reachability gate.
 - The PR body carries the fix-or-hack classification and what you did not
   verify. Both are rules above; answer them there rather than omitting them.
 - `agentcontext_test.go` holds this file's length budget and each skill's

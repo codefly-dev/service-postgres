@@ -7,10 +7,13 @@ import (
 	"testing"
 )
 
-// TestClearStalePostmasterPid verifies the pg_ctl-style stale-lock cleanup:
-// a postmaster.pid owned by a dead/empty/corrupt entry is removed, but one
-// owned by a live process is preserved (never stomp a concurrent postmaster).
-func TestClearStalePostmasterPid(t *testing.T) {
+// TestClearDisownedPostmasterPid verifies the pg_ctl-style stale-lock
+// cleanup: a postmaster.pid that is empty, corrupt, or names a process that
+// is gone is removed, and so is one whose live PID is provably not a postgres
+// server, because the number was reused and the run would otherwise wait on a
+// stranger. A lock file a real postmaster holds is refused instead, which
+// TestLockFileHeldByARealPostmasterIsRefused covers.
+func TestClearDisownedPostmasterPid(t *testing.T) {
 	write := func(dir, content string) string {
 		t.Helper()
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -28,8 +31,7 @@ func TestClearStalePostmasterPid(t *testing.T) {
 	}
 
 	t.Run("missing file is a no-op", func(t *testing.T) {
-		n := &nixPostgres{dataDir: t.TempDir()}
-		if err := n.clearStalePostmasterPid(); err != nil {
+		if err := clearDisownedPostmasterPid(t.TempDir(), postmasterRecord{}, false); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 	})
@@ -37,8 +39,7 @@ func TestClearStalePostmasterPid(t *testing.T) {
 	t.Run("empty file is removed", func(t *testing.T) {
 		dir := t.TempDir()
 		p := write(dir, "")
-		n := &nixPostgres{dataDir: dir}
-		if err := n.clearStalePostmasterPid(); err != nil {
+		if err := clearDisownedPostmasterPid(dir, postmasterRecord{}, false); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 		if exists(p) {
@@ -50,8 +51,7 @@ func TestClearStalePostmasterPid(t *testing.T) {
 		dir := t.TempDir()
 		// PID 2^31-1 is not a live process on any sane host.
 		p := write(dir, "2147483646\n/data\n1700000000\n5432\n")
-		n := &nixPostgres{dataDir: dir}
-		if err := n.clearStalePostmasterPid(); err != nil {
+		if err := clearDisownedPostmasterPid(dir, postmasterRecord{}, false); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 		if exists(p) {
@@ -59,19 +59,16 @@ func TestClearStalePostmasterPid(t *testing.T) {
 		}
 	})
 
-	t.Run("live pid is preserved", func(t *testing.T) {
+	t.Run("live pid that is not a postmaster is removed", func(t *testing.T) {
 		dir := t.TempDir()
-		// Our own PID is definitely alive — must NOT be removed.
-		p := write(dir, "")
-		if err := os.WriteFile(p, []byte(strconv.Itoa(os.Getpid())+"\n/data\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		n := &nixPostgres{dataDir: dir}
-		if err := n.clearStalePostmasterPid(); err != nil {
+		// This test binary is alive and is certainly not a postgres server,
+		// so the lock file naming it is a leftover with a reused number.
+		p := write(dir, strconv.Itoa(os.Getpid())+"\n/data\n")
+		if err := clearDisownedPostmasterPid(dir, postmasterRecord{}, false); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
-		if !exists(p) {
-			t.Fatal("postmaster.pid owned by a LIVE process must be preserved")
+		if exists(p) {
+			t.Fatal("postmaster.pid naming a live non-postgres process should have been removed")
 		}
 	})
 }

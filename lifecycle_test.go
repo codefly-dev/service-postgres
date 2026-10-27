@@ -36,19 +36,25 @@ type postgresFixture struct {
 
 func newPostgresFixture(t *testing.T, ctx context.Context, runtimeContext *basev0.RuntimeContext) *postgresFixture {
 	t.Helper()
+	return newPostgresFixtureAt(t, ctx, t.TempDir(), "mod", fmt.Sprintf("svc-%v", time.Now().UnixMilli()), runtimeContext)
+}
+
+// newPostgresFixtureAt scaffolds module/serviceName in workspaceDir, so
+// several fixtures can be services of one run. The scaffold's database is
+// named after the module.
+func newPostgresFixtureAt(t *testing.T, ctx context.Context, workspaceDir, module, serviceName string, runtimeContext *basev0.RuntimeContext) *postgresFixture {
+	t.Helper()
 
 	workspace := &resources.Workspace{Name: "test"}
-	workspaceDir := t.TempDir()
-	serviceName := fmt.Sprintf("svc-%v", time.Now().UnixMilli())
 	service := resources.Service{Name: serviceName, Version: "test-me"}
-	require.NoError(t, service.SaveAtDir(ctx, path.Join(workspaceDir, "mod", service.Name)))
+	require.NoError(t, service.SaveAtDir(ctx, path.Join(workspaceDir, module, service.Name)))
 
 	identity := &basev0.ServiceIdentity{
 		Name:                service.Name,
-		Module:              "mod",
+		Module:              module,
 		Workspace:           workspace.Name,
 		WorkspacePath:       workspaceDir,
-		RelativeToWorkspace: fmt.Sprintf("mod/%s", service.Name),
+		RelativeToWorkspace: fmt.Sprintf("%s/%s", module, service.Name),
 	}
 
 	builder := NewBuilder()
@@ -105,7 +111,7 @@ func newPostgresFixture(t *testing.T, ctx context.Context, runtimeContext *basev
 		identity:     identity,
 		environment:  environment,
 		configuration: &basev0.Configuration{
-			Origin:         fmt.Sprintf("mod/%s", service.Name),
+			Origin:         fmt.Sprintf("%s/%s", module, service.Name),
 			RuntimeContext: resources.NewRuntimeContextFree(),
 			Infos: []*basev0.ConfigurationInformation{
 				{Name: "postgres",

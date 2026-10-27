@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/codefly-dev/core/runners/dockerrun"
@@ -27,7 +28,22 @@ func TestMain(m *testing.M) {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
+		// Native run servers started by this suite live under the suite's own
+		// directory, never beside a developer's real runs, and none outlives it.
+		servers := filepath.Join(dir, "run-servers")
+		runServersDir = func() (string, error) { return servers, nil }
+		defer stopEveryRunServer(servers)
 		return m.Run()
 	}()
 	os.Exit(code)
+}
+
+func stopEveryRunServer(servers string) {
+	entries, _ := os.ReadDir(servers)
+	for _, entry := range entries {
+		root := filepath.Join(servers, entry.Name())
+		if stopped, err := stopServer(root, filepath.Join(root, "pgdata")); err != nil || stopped {
+			fmt.Fprintf(os.Stderr, "run server %s outlived its test (stopped=%v err=%v)\n", entry.Name(), stopped, err)
+		}
+	}
 }
