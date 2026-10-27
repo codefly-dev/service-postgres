@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"net/url"
 	"os"
+	"path/filepath"
 	"testing"
 
 	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
 	"github.com/codefly-dev/core/resources"
 	runners "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/shared"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -64,8 +66,10 @@ func TestRunServerIsSharedAndIsolated(t *testing.T) {
 
 	// One server for the run.
 	require.Equal(t, runAlpha.nixRuntime.dataDir, runBeta.nixRuntime.dataDir)
-	postmaster, _, running := runningPostmaster(runAlpha.nixRuntime.dataDir)
+	attached, running, err := attachedPostmaster(runAlpha.nixRuntime.root, runAlpha.nixRuntime.dataDir)
+	require.NoError(t, err)
 	require.True(t, running)
+	postmaster := attached.Postmaster.PID
 
 	// Each service at its own endpoint, with its own data.
 	requireListener(t, alpha.address)
@@ -153,8 +157,10 @@ func TestAbandonedRunServerIsCollected(t *testing.T) {
 	abandoned := newPostgresFixtureAt(t, ctx, t.TempDir(), "gone", "store", resources.NewRuntimeContextNix())
 	run, _ := abandoned.start(t, ctx)
 	dataDir := run.nixRuntime.dataDir
-	postmaster, _, running := runningPostmaster(dataDir)
+	attached, running, err := attachedPostmaster(run.nixRuntime.root, dataDir)
+	require.NoError(t, err)
 	require.True(t, running)
+	postmaster := attached.Postmaster.PID
 
 	// The run dies: its agent's record names a process that no longer exists,
 	// and its endpoint went with it.
@@ -167,4 +173,83 @@ func TestAbandonedRunServerIsCollected(t *testing.T) {
 	next := newPostgresFixtureAt(t, ctx, t.TempDir(), "next", "store", resources.NewRuntimeContextNix())
 	next.start(t, ctx)
 	require.False(t, processAlive(postmaster), "an abandoned run's server must be stopped by the next run")
+}
+
+// TestLockFileHeldByARealPostmasterIsRefused is the case where the lock file
+// must be left exactly as it is. A record this agent cannot read — lost, or
+// written by a version that did not keep one — does not make the postmaster
+// holding the cluster disposable: removing its lock file would let a second
+// postmaster start on the same data directory, which is how a cluster is
+// corrupted. The run refuses and names the process instead, and signals
+// nothing.
+func TestLockFileHeldByARealPostmasterIsRefused(t *testing.T) {
+	requireNix(t)
+	ctx := context.Background()
+	fixture := newPostgresFixtureAt(t, ctx, t.TempDir(), "held", "store", resources.NewRuntimeContextNix())
+	run, _ := fixture.start(t, ctx)
+	root := run.nixRuntime.root
+	pidPath := filepath.Join(run.nixRuntime.dataDir, "postmaster.pid")
+	postmaster, running := postmasterPidFileOwner(pidPath)
+	require.True(t, running)
+
+	// The record goes missing while its postmaster keeps serving.
+	recorded, err := os.ReadFile(postmasterRecordPath(root))
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(postmasterRecordPath(root)))
+	t.Cleanup(func() { _ = os.WriteFile(postmasterRecordPath(root), recorded, 0o600) })
+
+	_, attached, err := attachedPostmaster(root, run.nixRuntime.dataDir)
+	require.False(t, attached)
+	require.ErrorContains(t, err, "stop it before running again")
+	require.FileExists(t, pidPath, "a live postmaster's lock file is never removed")
+	require.True(t, processAlive(postmaster), "and its postmaster is never signalled")
+
+	// Unreadable record, same answer: nothing of this run's may be stopped on
+	// a PID alone, so the server is still there for the restored record.
+	require.NoError(t, os.WriteFile(postmasterRecordPath(root), []byte("{"), 0o600))
+	_, attached, err = attachedPostmaster(root, run.nixRuntime.dataDir)
+	require.False(t, attached)
+	require.ErrorContains(t, err, "stop it before running again")
+	require.True(t, processAlive(postmaster))
+}
+
+// TestRunServerRefusesAnOwnerRoleAnotherServiceCreated closes the one way a
+// service could reach another's data on the shared server. A migration owner
+// may create roles, because migrations create the application's own roles,
+// and PostgreSQL 16 and later grant a role created that way back to its
+// creator WITH ADMIN OPTION. A service that creates a role named after
+// ANOTHER service's database, before that service has ever run, would have
+// been adopted as that database's owner while keeping the admin grant — which
+// is enough to take the role and read the data.
+func TestRunServerRefusesAnOwnerRoleAnotherServiceCreated(t *testing.T) {
+	requireNix(t)
+	ctx := context.Background()
+	workspace := t.TempDir()
+	squatter := newPostgresFixtureAt(t, ctx, workspace, "squatter", "store", resources.NewRuntimeContextNix())
+	victim := newPostgresFixtureAt(t, ctx, workspace, "victim", "store", resources.NewRuntimeContextNix())
+
+	run, _ := squatter.start(t, ctx)
+	// The squatter's migrations create the victim's owner role before the
+	// victim first runs. This is exactly what a migration is allowed to do.
+	db, err := sql.Open("postgres", run.connection)
+	require.NoError(t, err)
+	defer db.Close()
+	stolen := nativeOwnerRole("victim")
+	_, err = db.ExecContext(ctx, `CREATE ROLE `+pq.QuoteIdentifier(stolen)+` LOGIN`)
+	require.NoError(t, err, "a migration owner may create roles")
+
+	refused := NewRuntime()
+	_, err = refused.Load(ctx, &runtimev0.LoadRequest{
+		Identity: victim.identity, Environment: shared.Must(victim.environment.Proto()), DisableCatch: true,
+	})
+	require.NoError(t, err)
+	init, err := refused.Init(ctx, &runtimev0.InitRequest{
+		RuntimeContext:          victim.runtimeContext,
+		Configuration:           victim.configuration,
+		ProposedNetworkMappings: victim.networkMappings,
+	})
+	require.NoError(t, err)
+	require.Equal(t, runtimev0.InitStatus_ERROR, init.GetStatus().GetState())
+	require.Contains(t, init.GetStatus().GetMessage(), "was not created for victim/store")
+	require.Nil(t, refused.nixRuntime, "a refused service holds no server")
 }

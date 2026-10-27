@@ -38,7 +38,6 @@ package main
 // this agent deletes data, codefly-dev/core#424).
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -167,6 +166,16 @@ func (m processMark) alive() bool {
 	return identity.StartID == m.StartID && identity.BootID == m.BootID
 }
 
+// confirmed is alive's opposite default, and it is the only question a signal
+// may be sent on. A PID says nothing on its own: the number is reused, so a
+// process that merely answers to it can be anything this user happens to be
+// running. An inspection that does not positively re-establish the recorded
+// birth therefore means "do not signal", where alive means "keep holding".
+func (m processMark) confirmed() bool {
+	identity, err := runners.InspectProcess(m.PID)
+	return err == nil && identity.StartID == m.StartID && identity.BootID == m.BootID
+}
+
 // serverHolder records one agent using a run server: the agent and the
 // codefly run that launched it. An agent whose run is gone is orphaned, and
 // its run's server is no longer anybody's.
@@ -207,39 +216,34 @@ func acquireRunServer(ctx context.Context, key, service, logLevel string, out io
 	if err != nil {
 		return nil, err
 	}
-	pid, socketDir, running := runningPostmaster(n.dataDir)
+	record, running, err := attachedPostmaster(n.root, n.dataDir)
+	if err != nil {
+		return nil, err
+	}
 	if !running {
 		// A server this call starts and then cannot hand out is nobody's: stop
 		// it rather than leave it for the next run's collection.
 		defer func() {
 			if acquireErr != nil && live == 0 {
-				_, _ = stopServer(n.dataDir)
+				_, _ = stopServer(n.root, n.dataDir)
 			}
 		}()
-		if err := n.start(ctx, logLevel, out); err != nil {
+		if record, err = n.start(ctx, logLevel, out); err != nil {
 			return nil, err
 		}
-		if pid, socketDir, running = runningPostmaster(n.dataDir); !running {
-			return nil, fmt.Errorf("postgres reported started but %s names no live postmaster; see %s",
-				filepath.Join(n.dataDir, "postmaster.pid"), n.logPath())
-		}
 	}
-	n.socketDir = socketDir
+	n.socketDir = record.SocketDir
 	if n.adminPassword, err = n.readAdminPassword(); err != nil {
 		return nil, err
 	}
-	postmaster, err := markProcess(pid)
-	if err != nil {
-		return nil, fmt.Errorf("inspect the run's postmaster (pid %d): %w", pid, err)
-	}
 	if err := n.ping(ctx); err != nil {
 		return nil, fmt.Errorf("the run's postgres server (pid %d) does not answer on %s: %w; see %s",
-			pid, n.socketDir, err, n.logPath())
+			record.Postmaster.PID, n.socketDir, err, n.logPath())
 	}
 	if err := n.register(service); err != nil {
 		return nil, err
 	}
-	n.watch(postmaster)
+	n.watch(record.Postmaster)
 	return n, nil
 }
 
@@ -259,52 +263,49 @@ func lockRunServer(ctx context.Context, root string) (func(), error) {
 
 func (n *nixPostgres) logPath() string { return filepath.Join(n.root, "server.log") }
 
-// start initializes the cluster on first use and launches it detached. The
-// caller holds the run server's lock.
-func (n *nixPostgres) start(ctx context.Context, logLevel string, out io.Writer) error {
+// start initializes the cluster on first use, launches it detached, and
+// records the postmaster it started. The caller holds the run server's lock.
+func (n *nixPostgres) start(ctx context.Context, logLevel string, out io.Writer) (postmasterRecord, error) {
 	flakeDir := filepath.Join(n.root, "nix")
 	if err := os.MkdirAll(flakeDir, 0o700); err != nil {
-		return fmt.Errorf("create nix flake dir: %w", err)
+		return postmasterRecord{}, fmt.Errorf("create nix flake dir: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(flakeDir, "flake.nix"), []byte(pgFlakeNix), 0o644); err != nil {
-		return fmt.Errorf("write flake.nix: %w", err)
+		return postmasterRecord{}, fmt.Errorf("write flake.nix: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(flakeDir, "flake.lock"), []byte(pgFlakeLock), 0o644); err != nil {
-		return fmt.Errorf("write flake.lock: %w", err)
+		return postmasterRecord{}, fmt.Errorf("write flake.lock: %w", err)
 	}
 	env, err := runners.NewNixEnvironment(ctx, flakeDir)
 	if err != nil {
-		return fmt.Errorf("nix environment (is nix installed?): %w", err)
+		return postmasterRecord{}, fmt.Errorf("nix environment (is nix installed?): %w", err)
 	}
 	env.WithCacheDir(filepath.Join(n.root, ".nix-cache"))
 	if err := env.Init(ctx); err != nil {
-		return fmt.Errorf("materialize nix postgres env: %w", err)
+		return postmasterRecord{}, fmt.Errorf("materialize nix postgres env: %w", err)
 	}
 	binDir, err := resolveBinDir()
 	if err != nil {
-		return err
+		return postmasterRecord{}, err
 	}
 	if err := n.initdbIfNeeded(ctx, env, binDir, out); err != nil {
-		return err
-	}
-	if err := n.clearStalePostmasterPid(); err != nil {
-		return err
+		return postmasterRecord{}, err
 	}
 	// The socket path is limited to ~104 bytes, so it cannot live under a deep
 	// cache path. An unpredictable, owner-only temporary directory: a stable
 	// name can be pre-created or symlinked by another local user.
 	socketDir, err := os.MkdirTemp("", "cfpg-"+filepath.Base(n.root)[:8]+"-")
 	if err != nil {
-		return fmt.Errorf("create postgres socket dir: %w", err)
+		return postmasterRecord{}, fmt.Errorf("create postgres socket dir: %w", err)
 	}
 	if err := os.Chmod(socketDir, 0o700); err != nil {
 		_ = os.RemoveAll(socketDir)
-		return fmt.Errorf("secure postgres socket dir: %w", err)
+		return postmasterRecord{}, fmt.Errorf("secure postgres socket dir: %w", err)
 	}
 	options, err := serverOptions(socketDir, logLevel)
 	if err != nil {
 		_ = os.RemoveAll(socketDir)
-		return err
+		return postmasterRecord{}, err
 	}
 	// pg_ctl detaches the postmaster into its own session and waits until it
 	// accepts connections; the server outlives the agent that started it.
@@ -312,16 +313,38 @@ func (n *nixPostgres) start(ctx context.Context, logLevel string, out io.Writer)
 		"start", "-D", n.dataDir, "-w", "-t", strconv.Itoa(serverStartSeconds), "-l", n.logPath(), "-o", options)
 	if err != nil {
 		_ = os.RemoveAll(socketDir)
-		return err
+		return postmasterRecord{}, err
 	}
 	if out != nil {
 		proc.WithOutput(out)
 	}
 	if err := proc.Run(ctx); err != nil {
 		_ = os.RemoveAll(socketDir)
-		return fmt.Errorf("start the run's postgres server: %w%s", err, n.logTail())
+		return postmasterRecord{}, fmt.Errorf("start the run's postgres server: %w%s", err, n.logTail())
 	}
-	return n.restrictMaintenanceDatabases(ctx, socketDir)
+	// The one moment postmaster.pid is authoritative: pg_ctl -w has just
+	// reported the server it started is accepting connections, this call holds
+	// the run lock, and any pid file that was not this postmaster's was
+	// already cleared. Its birth is recorded here so that every later decision
+	// — attach, release, collection — rests on the identity rather than on the
+	// number in a file that outlives the process.
+	pid, ok := postmasterPidFileOwner(filepath.Join(n.dataDir, "postmaster.pid"))
+	if !ok {
+		return postmasterRecord{}, fmt.Errorf("postgres reported started but %s names no live postmaster; see %s",
+			filepath.Join(n.dataDir, "postmaster.pid"), n.logPath())
+	}
+	postmaster, err := markProcess(pid)
+	if err != nil {
+		return postmasterRecord{}, fmt.Errorf("inspect the run's postmaster (pid %d): %w", pid, err)
+	}
+	record := postmasterRecord{Postmaster: postmaster, SocketDir: socketDir}
+	if err := writePostmasterRecord(n.root, record); err != nil {
+		return postmasterRecord{}, fmt.Errorf("record the run's postmaster: %w", err)
+	}
+	if err := n.restrictMaintenanceDatabases(ctx, socketDir); err != nil {
+		return postmasterRecord{}, err
+	}
+	return record, nil
 }
 
 // serverOptions are the postmaster's options, passed through pg_ctl's shell.
@@ -392,52 +415,131 @@ func (n *nixPostgres) restrictMaintenanceDatabases(ctx context.Context, socketDi
 	return nil
 }
 
-// runningPostmaster reads the cluster's postmaster.pid: the live postmaster's
-// PID and the socket directory it listens in.
-func runningPostmaster(dataDir string) (int, string, bool) {
-	file, err := os.Open(filepath.Join(dataDir, "postmaster.pid"))
-	if err != nil {
-		return 0, "", false
-	}
-	defer file.Close()
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() && len(lines) < 5 {
-		lines = append(lines, strings.TrimSpace(scanner.Text()))
-	}
-	if len(lines) < 5 {
-		return 0, "", false
-	}
-	pid, err := strconv.Atoi(lines[0])
-	if err != nil || pid <= 0 || !processAlive(pid) {
-		return 0, "", false
-	}
-	return pid, lines[4], lines[4] != ""
+// postmasterRecord is what the run knows about its own server: the birth of
+// the postmaster it started, and where that postmaster listens. It is written
+// when the server starts, under the run's own 0700 root.
+//
+// The record — never postmaster.pid — is what authorizes a signal. A pid file
+// outlives the process that wrote it (SIGKILL, OOM, a machine that lost
+// power), PIDs are reused, and this agent collects the servers of OTHER runs
+// on every native start. Trusting the number in that file would make an
+// unrelated process of this user, which merely inherited the number, the
+// target of the collection.
+type postmasterRecord struct {
+	Postmaster processMark `json:"postmaster"`
+	SocketDir  string      `json:"socket"`
 }
 
-// clearStalePostmasterPid removes a leftover postmaster.pid when no live
-// postmaster owns it. A crashed or SIGKILL'd server leaves a pid file that
-// aborts the next boot (`FATAL: lock file "postmaster.pid" is empty` / "is the
-// remnant of a previous server startup crash"). A pid file owned by a LIVE
-// process is left untouched so a concurrent postmaster is never stomped.
-func (n *nixPostgres) clearStalePostmasterPid() error {
-	pidPath := filepath.Join(n.dataDir, "postmaster.pid")
-	data, err := os.ReadFile(pidPath)
-	if errors.Is(err, os.ErrNotExist) {
+func postmasterRecordPath(root string) string { return filepath.Join(root, "postmaster.json") }
+
+// readPostmasterRecord returns the recorded postmaster, if one was recorded.
+// An unreadable or unparseable record is no record: nothing may be signalled
+// on it, and the cluster is treated as having no server of ours.
+func readPostmasterRecord(root string) (postmasterRecord, bool) {
+	data, err := os.ReadFile(postmasterRecordPath(root))
+	if err != nil {
+		return postmasterRecord{}, false
+	}
+	var record postmasterRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.Postmaster.PID <= 0 {
+		return postmasterRecord{}, false
+	}
+	return record, true
+}
+
+func writePostmasterRecord(root string, record postmasterRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return writeOwnerOnly(postmasterRecordPath(root), string(data))
+}
+
+// attachedPostmaster returns the run's live server, when there is one this
+// run recorded and that is still the same process. Otherwise it reports no
+// server, having first made sure the cluster can actually be started: see
+// clearDisownedPostmasterPid.
+func attachedPostmaster(root, dataDir string) (postmasterRecord, bool, error) {
+	record, recorded := readPostmasterRecord(root)
+	if recorded && record.Postmaster.alive() && record.SocketDir != "" {
+		return record, true, nil
+	}
+	if err := clearDisownedPostmasterPid(dataDir, record, recorded); err != nil {
+		return postmasterRecord{}, false, err
+	}
+	return postmasterRecord{}, false, nil
+}
+
+// clearDisownedPostmasterPid removes a postmaster.pid this run's server no
+// longer owns, and refuses when it cannot prove that.
+//
+// A crashed or SIGKILL'd server leaves a pid file that aborts the next boot
+// (`FATAL: lock file "postmaster.pid" is empty` / "is the remnant of a
+// previous server startup crash"), so a stale one has to go. But a pid file
+// whose PID is alive is two completely different situations:
+//
+//   - the number was reused by an unrelated process of this user. The file is
+//     stale, and leaving it would wedge every later start of this run behind a
+//     process that has nothing to do with postgres.
+//   - a postmaster really does hold this cluster. Removing its lock file would
+//     let a second postmaster start on the same data directory, which is how a
+//     cluster is corrupted. It is refused, by name, rather than worked around.
+//
+// The two are told apart by inspecting the process, never by signalling it.
+func clearDisownedPostmasterPid(dataDir string, record postmasterRecord, recorded bool) error {
+	pidPath := filepath.Join(dataDir, "postmaster.pid")
+	pid, ok := postmasterPidFileOwner(pidPath)
+	if !ok {
+		// Absent, unreadable, corrupt, or naming a process that is gone.
+		if err := os.Remove(pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove the stale postgres lock file %s: %w", pidPath, err)
+		}
 		return nil
 	}
+	identity, err := runners.InspectProcess(pid)
 	if err != nil {
-		return nil // best-effort; let postgres surface any real error
-	}
-	// Line 1 of postmaster.pid is the postmaster PID. An empty/corrupt file is
-	// stale by definition.
-	fields := strings.Fields(string(data))
-	if len(fields) > 0 {
-		if pid, perr := strconv.Atoi(fields[0]); perr == nil && pid > 0 && processAlive(pid) {
-			return nil // a live process owns the lock — do NOT remove it
+		if errors.Is(err, runners.ErrProcessNotFound) {
+			return os.Remove(pidPath)
 		}
+		return fmt.Errorf("inspect the process holding %s (pid %d): %w", pidPath, pid, err)
 	}
+	if isPostmasterExecutable(identity.Executable) {
+		if recorded {
+			return fmt.Errorf("the postgres server at %s is held by pid %d, which is not the postmaster this run started (pid %d): stop it before running again",
+				dataDir, pid, record.Postmaster.PID)
+		}
+		return fmt.Errorf("the postgres server at %s is held by pid %d, which this run did not start: stop it before running again",
+			dataDir, pid)
+	}
+	// Provably not a postmaster, so the number was reused and the file is a
+	// leftover. Nothing is signalled: the lock file is simply dropped.
 	return os.Remove(pidPath)
+}
+
+// postmasterPidFileOwner reads line 1 of a postmaster.pid and reports the PID
+// when the file names a live process. Everything else — absent, unreadable,
+// empty, corrupt, a process that is gone — reads as no owner.
+func postmasterPidFileOwner(pidPath string) (int, bool) {
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 || !processAlive(pid) {
+		return 0, false
+	}
+	return pid, true
+}
+
+// isPostmasterExecutable reports whether an inspected process is a postgres
+// server. core reports the executable's base name, and both the nix build and
+// the historical name are accepted.
+func isPostmasterExecutable(executable string) bool {
+	return executable == "postgres" || executable == "postmaster"
 }
 
 // processAlive reports whether a PID names a live process (signal 0 probe).
@@ -577,9 +679,25 @@ func (n *nixPostgres) provisionDatabase(ctx context.Context, service, database, 
 	}
 	defer db.Close()
 
-	var exists bool
-	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, owner).Scan(&exists); err != nil {
+	// A migration owner may create roles, because its migrations create the
+	// application's own NOLOGIN roles. On PostgreSQL 16 and later a role
+	// created that way is granted back to its creator WITH ADMIN OPTION, so a
+	// service that creates a role named after ANOTHER service's database —
+	// before that service first runs — would be adopted here as that
+	// database's owner and keep the admin grant, which is enough to take the
+	// role and read the data. An owner role is this server's to create: one
+	// that already carries a membership was not created by this agent.
+	var exists, granted bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),
+		       EXISTS (SELECT 1 FROM pg_auth_members m
+		               JOIN pg_roles r ON r.oid = m.roleid
+		               WHERE r.rolname = $1)`, owner).Scan(&exists, &granted); err != nil {
 		return fmt.Errorf("look up the migration owner: %w", err)
+	}
+	if granted {
+		return fmt.Errorf("migration owner %q on this run's postgres server is granted to another role, so it was not created for %s: remove it, or give this service its own database-name",
+			owner, service)
 	}
 	quotedOwner := pq.QuoteIdentifier(owner)
 	if !exists {
@@ -592,10 +710,20 @@ func (n *nixPostgres) provisionDatabase(ctx context.Context, service, database, 
 		return fmt.Errorf("configure the migration owner: %w", err)
 	}
 
+	// The database records the service it belongs to, and that record is a
+	// comment any role with CREATEDB could have written on a database of its
+	// own. Its current owner is the half that cannot be forged: a service
+	// creating a database owns it, and it cannot hand ownership to an owner
+	// role it is not a member of — which the membership check above is what
+	// keeps true. A database owned by this service's own owner with no comment
+	// yet is the one legitimate gap, between CREATE DATABASE and COMMENT, and
+	// the comment is simply written.
 	marker := databaseClaim(service)
 	var claim sql.NullString
+	var currentOwner string
 	err = db.QueryRowContext(ctx,
-		`SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1`, database).Scan(&claim)
+		`SELECT shobj_description(oid, 'pg_database'), pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1`,
+		database).Scan(&claim, &currentOwner)
 	quotedDatabase := pq.QuoteIdentifier(database)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -607,9 +735,16 @@ func (n *nixPostgres) provisionDatabase(ctx context.Context, service, database, 
 		}
 	case err != nil:
 		return fmt.Errorf("look up database %q: %w", database, err)
-	case claim.String != marker:
+	case currentOwner != owner:
+		return fmt.Errorf("database %q on this run's postgres server is owned by %q, not by %s's migration owner: give each service of a run its own database-name",
+			database, currentOwner, service)
+	case claim.Valid && claim.String != marker:
 		return fmt.Errorf("database %q on this run's postgres server belongs to %s, not %s: give each service of a run its own database-name",
 			database, strings.TrimPrefix(claim.String, databaseClaimPrefix), service)
+	case !claim.Valid:
+		if _, err := db.ExecContext(ctx, `COMMENT ON DATABASE `+quotedDatabase+` IS `+pq.QuoteLiteral(marker)); err != nil {
+			return fmt.Errorf("record database %q's service: %w", database, err)
+		}
 	}
 	for _, statement := range []string{
 		`ALTER DATABASE ` + quotedDatabase + ` OWNER TO ` + quotedOwner,
@@ -760,47 +895,95 @@ func (n *nixPostgres) release(ctx context.Context) (bool, error) {
 	if err != nil || live > 0 {
 		return false, errors.Join(forwardErr, err)
 	}
-	stopped, err := stopServer(n.dataDir)
+	stopped, err := stopServer(n.root, n.dataDir)
 	return stopped, errors.Join(forwardErr, err)
 }
 
-// stopServer shuts the cluster's postmaster down (fast shutdown: sessions are
+// stopServer shuts a run's own postmaster down (fast shutdown: sessions are
 // disconnected, the server exits cleanly and removes its shared memory) and
 // removes its socket directory. It reports whether a server was running.
-func stopServer(dataDir string) (bool, error) {
-	pid, socketDir, running := runningPostmaster(dataDir)
-	if !running {
+//
+// It signals the recorded birth and nothing else. With no record, or a record
+// whose process cannot be re-confirmed, there is no server of this run's left
+// to stop — whatever else may hold that PID by now is not this function's to
+// touch, least of all on the machine-wide collection path.
+func stopServer(root, dataDir string) (bool, error) {
+	record, recorded := readPostmasterRecord(root)
+	if !recorded || !record.Postmaster.confirmed() {
+		forgetPostmasterRecord(root, recorded)
 		return false, nil
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false, err
-	}
-	if err := process.Signal(syscall.SIGINT); err != nil && processAlive(pid) {
+	pid := record.Postmaster.PID
+	if err := signalPostmaster(record.Postmaster, syscall.SIGINT); err != nil {
+		if !record.Postmaster.confirmed() {
+			forgetPostmasterRecord(root, true)
+			return false, nil
+		}
 		return false, fmt.Errorf("stop the run's postgres server (pid %d): %w", pid, err)
 	}
-	if !waitGone(pid, serverStopTimeout) {
-		// Immediate shutdown: the server still releases its shared memory.
-		_ = process.Signal(syscall.SIGQUIT)
-		if !waitGone(pid, 10*time.Second) {
+	if !waitGone(record.Postmaster, serverStopTimeout) {
+		// Immediate shutdown: the server still releases its shared memory. The
+		// birth is re-confirmed inside signalPostmaster, because a minute is
+		// long enough for the postmaster to have exited and its number to have
+		// been handed to somebody else.
+		_ = signalPostmaster(record.Postmaster, syscall.SIGQUIT)
+		if !waitGone(record.Postmaster, 10*time.Second) {
 			return false, fmt.Errorf("the run's postgres server (pid %d) did not stop", pid)
 		}
 	}
-	if strings.HasPrefix(filepath.Base(socketDir), "cfpg-") {
-		_ = os.RemoveAll(socketDir)
+	if strings.HasPrefix(filepath.Base(record.SocketDir), "cfpg-") {
+		_ = os.RemoveAll(record.SocketDir)
 	}
+	forgetPostmasterRecord(root, true)
+	// The postmaster removes its own lock file on an orderly exit; a SIGQUIT
+	// leaves it, and the next start would then have to tell that leftover
+	// apart from a live server all over again.
+	_ = os.Remove(filepath.Join(dataDir, "postmaster.pid"))
 	return true, nil
 }
 
-func waitGone(pid int, budget time.Duration) bool {
+// signalPostmaster delivers a signal to a recorded postmaster, and only while
+// that exact birth is still the process behind the number.
+//
+// The confirmation and the delivery are two system calls, so a process that
+// exits between them cannot be signalled by this call at all (the signal is
+// then rejected, as the PID no longer resolves) unless the number is reused in
+// that same window. Narrowing it to those microseconds is the most a caller
+// can do for a process that is not its child; what this removes is the real
+// exposure, which is a file on disk naming a PID whose process died minutes,
+// hours or a reboot ago.
+func signalPostmaster(postmaster processMark, signal syscall.Signal) error {
+	if !postmaster.confirmed() {
+		return fmt.Errorf("postgres server %d is no longer the process this run started", postmaster.PID)
+	}
+	process, err := os.FindProcess(postmaster.PID)
+	if err != nil {
+		return err
+	}
+	return process.Signal(signal)
+}
+
+// forgetPostmasterRecord drops a record no server answers to any more, so a
+// later start is not told about a postmaster that is gone.
+func forgetPostmasterRecord(root string, recorded bool) {
+	if !recorded {
+		return
+	}
+	_ = os.Remove(postmasterRecordPath(root))
+}
+
+// waitGone waits for a recorded birth to end. A PID that is answered by some
+// other process already counts as gone: the postmaster this run started is
+// what has to stop, not whatever inherits its number.
+func waitGone(postmaster processMark, budget time.Duration) bool {
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
-		if !processAlive(pid) {
+		if !postmaster.confirmed() {
 			return true
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return !processAlive(pid)
+	return !postmaster.confirmed()
 }
 
 // collectAbandonedServers stops every other run server on this machine whose
@@ -823,7 +1006,7 @@ func collectAbandonedServers(ctx context.Context, servers, self string) {
 			continue
 		}
 		if live, err := pruneHolders(root); err == nil && live == 0 {
-			_, _ = stopServer(filepath.Join(root, "pgdata"))
+			_, _ = stopServer(root, filepath.Join(root, "pgdata"))
 		}
 		_ = lock.Unlock()
 	}

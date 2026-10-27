@@ -41,7 +41,8 @@ func TestMain(m *testing.M) {
 func stopEveryRunServer(servers string) {
 	entries, _ := os.ReadDir(servers)
 	for _, entry := range entries {
-		if stopped, err := stopServer(filepath.Join(servers, entry.Name(), "pgdata")); err != nil || stopped {
+		root := filepath.Join(servers, entry.Name())
+		if stopped, err := stopServer(root, filepath.Join(root, "pgdata")); err != nil || stopped {
 			fmt.Fprintf(os.Stderr, "run server %s outlived its test (stopped=%v err=%v)\n", entry.Name(), stopped, err)
 		}
 	}
