@@ -1,7 +1,7 @@
 {
   "name": "ghcr.io/codefly-dev/service-postgres",
   "tag": "postgres-17.10-pgvector-0.8.5-alpine3.24",
-  "digest": "sha256:202950121004ef53cc303edc8728eda9381d05a7c0dae6faddfd68c139f0b759",
+  "digest": "sha256:1d7680adb926a17a378b4f56e4b33ed98b64c8dabf39f2301b6d5d71ff5c75e3",
   "platforms": [
     "linux/amd64",
     "linux/arm64"
