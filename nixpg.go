@@ -203,11 +203,19 @@ func acquireRunServer(ctx context.Context, key, service, logLevel string, out io
 	defer unlock()
 
 	n := &nixPostgres{root: root, dataDir: filepath.Join(root, "pgdata")}
-	if _, err := pruneHolders(root); err != nil {
+	live, err := pruneHolders(root)
+	if err != nil {
 		return nil, err
 	}
 	pid, socketDir, running := runningPostmaster(n.dataDir)
 	if !running {
+		// A server this call starts and then cannot hand out is nobody's: stop
+		// it rather than leave it for the next run's collection.
+		defer func() {
+			if acquireErr != nil && live == 0 {
+				_, _ = stopServer(n.dataDir)
+			}
+		}()
 		if err := n.start(ctx, logLevel, out); err != nil {
 			return nil, err
 		}
