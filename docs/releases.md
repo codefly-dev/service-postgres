@@ -73,3 +73,17 @@ and a dev tag on an off-main commit containing this workflow: both runs must
 succeed, with seven assets each, and only the dev release marked prerelease
 (and never Latest). Existing historical tags still contain their old workflow;
 rerunning those runs does not exercise this change.
+
+## Native shared-server qualification
+
+Before releasing a change to native shared servers, run the real Nix lifecycle
+suite, including `TestRunServerRefusesTwoServicesClaimingOneDatabase` with distinct
+owner passwords and `TestRunServerSerializesInitialDatabaseClaims`. A refused
+claim must leave the accepted service's credentials intact. Provisioning reuses
+the run-server lock and checks claims before mutating roles. `TestMain` isolates
+these servers from the operator's run-server directory.
+
+Detached postmaster shutdown re-establishes the recorded boot/start identity and
+uses Core's `runners/base.SignalProcess` for kernel-bound delivery. PostgreSQL
+owns the shutdown signals and wait policy; it never signals a bare PID after
+inspection. A stale birth is refused without signaling its replacement.
