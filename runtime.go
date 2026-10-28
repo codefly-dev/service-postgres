@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codefly-dev/core/agents/contract"
 	"github.com/codefly-dev/core/agents/helpers/code"
 
 	"github.com/codefly-dev/core/agents/services"
@@ -167,6 +168,19 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 	s.Runtime.WithContext(req.GetRuntimeContext())
 
 	w := s.Wool.In("runtime::init")
+
+	// A supplied runtime image is a host claim about which image the postmaster
+	// runs, and this agent does not implement runtime-init-image/v1: it resolves
+	// its own image (docker-image, else the checked-in managed digest), so the
+	// handoff has no absent-image case to serve here, and the one image its
+	// builder emits is the migration bootstrap image — not a postmaster. Ignoring
+	// the field would leave the host believing the database runs an image it does
+	// not, so refuse while the advertisement does not promise the behaviour.
+	if image := req.GetRuntimeImage(); image != "" && !implementsCapability(contract.RuntimeInitImage) {
+		return s.Runtime.InitError(fmt.Errorf(
+			"host supplied runtime image %q but this agent does not implement %q: it resolves its own postgres image, and its only build recipe is the migration bootstrap image",
+			image, contract.RuntimeInitImage))
+	}
 
 	s.NetworkMappings = req.ProposedNetworkMappings
 	if s.SharedLocalServer && s.LocalServer != "" {

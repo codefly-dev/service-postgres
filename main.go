@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/codefly-dev/core/agents"
@@ -412,18 +413,34 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 		},
 	}.Build()
 
-	// The shared server fills the contract in only when a handler leaves it
-	// absent, and that shared value carries the capabilities its own
-	// implementation promises — not one this agent adds. Declaring explicitly
-	// means carrying those promises forward rather than replacing them.
-	advertisement.Contract = contract.Current()
+	advertisement.Contract = agentContract()
+
+	return advertisement, nil
+}
+
+// agentContract is the one place this agent states what it implements. The
+// runtime reads it too, so a host-supplied behaviour is accepted exactly when
+// the advertisement promises it — adopting a capability lifts its refusal
+// instead of leaving a second copy of the claim behind to go stale.
+//
+// The shared server fills the contract in only when a handler leaves it absent,
+// and that shared value carries the capabilities its own implementation
+// promises — not one this agent adds. Declaring explicitly means carrying those
+// promises forward rather than replacing them.
+func agentContract() *agentv0.AgentContract {
+	declaration := contract.Current()
 	// The deployment path is core's DeployKustomize, which judges dependency
 	// edges with the request's composition provenance on this core; the host
 	// requires the live advertisement, not the linked core version.
-	advertisement.Contract.Capabilities = append(advertisement.Contract.Capabilities, contract.DeploymentCompositionProvenance)
-	advertisement.Contract.Capabilities = append(advertisement.Contract.Capabilities, hostResourceRecoveryCapability)
+	declaration.Capabilities = append(declaration.Capabilities, contract.DeploymentCompositionProvenance)
+	declaration.Capabilities = append(declaration.Capabilities, hostResourceRecoveryCapability)
+	return declaration
+}
 
-	return advertisement, nil
+// implementsCapability reports whether the live advertisement promises one
+// named behaviour.
+func implementsCapability(capability string) bool {
+	return slices.Contains(agentContract().GetCapabilities(), capability)
 }
 
 func NewService() *Service {

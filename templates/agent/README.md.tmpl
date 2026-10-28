@@ -41,6 +41,12 @@ External instances currently require password authentication. `auth-mode: extern
 
 Local database state survives ordinary stop/start and container recreation. In Docker mode, the agent mounts the official image's data directory from a Codefly-owned persistent runtime directory scoped by workspace, service, and naming scope. Stable and development scopes therefore keep independent databases even when they run from the same checkout.
 
+## Which image the server runs
+
+The agent resolves the postmaster image itself: `docker-image` when you set it, otherwise the managed pgvector-on-Postgres digest checked into the agent. It is never absent, so this agent does **not** implement the `runtime-init-image/v1` handoff, by which a host builds an agent's recipe for a local container run and supplies the result as the image to run. The capability is therefore absent from the agent's advertised contract, and a host that supplies `InitRequest.runtime_image` anyway is refused at `Init` rather than ignored — ignoring it would leave the host believing the database runs the image it built while the postmaster runs the resolved one.
+
+This matters because the one image this agent's builder emits is **not** a server image. Its single build recipe is named `bootstrap`: the migration runner that applies lineages and reconciles roles, whose `CMD` is `bootstrap.sh`. A host that infers "this service's only recipe must be its runtime image" would hand back a container that migrates and exits, with no postmaster. To change the server image, set `docker-image`.
+
 ## Lifecycle: stop, keep-running, destroy
 
 Stop and destroy have one state-ownership contract, and it is the same on Docker and Nix:
