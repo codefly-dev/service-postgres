@@ -475,6 +475,9 @@ func (s *Builder) stageBootstrapContext(
 	if err = s.Templates(ctx, docker, services.WithTemplate(bootstrapFS, "bootstrap", "").WithDestination("%s", staging)); err != nil {
 		return err
 	}
+	if err = stageBootstrapMigrate(staging); err != nil {
+		return err
+	}
 	// Every resolved lineage is staged, including one that carries no migration
 	// yet, so the plan artifact's staged paths always describe real directories.
 	for _, lineage := range plan.lineages {

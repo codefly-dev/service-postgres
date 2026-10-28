@@ -569,6 +569,10 @@ func TestBuildRecipeLocksBootstrapInputs(t *testing.T) {
 	recipe := response.GetResult().GetDockerBuildPlan().GetRecipes()[0]
 	require.Equal(t, bootstrapLock.RecipeBuildArgs(), recipe.GetBuildArgs())
 	require.Equal(t, bootstrapLock.LockDigest, recipe.GetBuildArgs()["CODEFLY_BOOTSTRAP_LOCK_DIGEST"])
+	require.Equal(t, bootstrapMigrateGoMod, mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "migrate", "go.mod")))
+	require.Equal(t, bootstrapMigrateGoSum, mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "migrate", "go.sum")))
+	require.Equal(t, "sha256:"+recipe.GetBuildArgs()["CODEFLY_BOOTSTRAP_MIGRATE_GO_MOD"], mustFileDigest(t, filepath.Join(outputDirectory, "bootstrap", "migrate", "go.mod")))
+	require.Equal(t, "sha256:"+recipe.GetBuildArgs()["CODEFLY_BOOTSTRAP_MIGRATE_GO_SUM"], mustFileDigest(t, filepath.Join(outputDirectory, "bootstrap", "migrate", "go.sum")))
 
 	dockerfile, err := os.ReadFile(filepath.Join(outputDirectory, "builder", "Dockerfile"))
 	require.NoError(t, err)

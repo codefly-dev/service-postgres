@@ -5,23 +5,18 @@
 #   .github/scripts/update-bootstrap-lock.sh                 # re-resolve what the lock already targets
 #   .github/scripts/update-bootstrap-lock.sh --check         # report drift, write nothing, exit 1 if stale
 #   ALPINE_BRANCH=v3.22 .github/scripts/update-bootstrap-lock.sh
-#   MIGRATE_VERSION=v4.20.0 .github/scripts/update-bootstrap-lock.sh
+#   MIGRATE_GO_IMAGE=golang:1.27.3-alpine3.24 .github/scripts/update-bootstrap-lock.sh
 #   BOOTSTRAP_PACKAGES="postgresql17-client" .github/scripts/update-bootstrap-lock.sh
 #
 # Every value is resolved from upstream, never authored here: the base digest comes
 # from the registry, package versions from inside the digest-pinned base on both
-# architectures, and the migrate archive checksums from the release's published
-# sha256sum.txt. What the run targets — Alpine branch, migrate version, package set
+# architectures, and the Go toolchain manifest digest from the registry.
+# Migrate's version comes from go.mod. What the run targets — Alpine branch, package set
 # — is read out of the current lock, so a plain rerun re-resolves the lock's own
 # intent instead of a default that could silently revert someone's bump. The
 # environment variables are the only way to change what is targeted, the package
 # set (BOOTSTRAP_PACKAGES, space-separated) included. Run
 # `go test ./...` afterwards and commit the diff.
-#
-# The checksum file ships in the same GitHub release as the archives it covers, so
-# it pins identity — the bytes cannot change under a fixed version, and a mirror or
-# CDN cannot substitute them — but it shares a trust root with the artifact and is
-# therefore not proof of authorship. Locking the version is what bounds that trust.
 #
 # Why pinning packages this way, and what it costs:
 #
@@ -52,13 +47,14 @@ LOCK="$(git rev-parse --show-toplevel)/bootstrap-image.json"
 # overrides it deliberately.
 lock_branch=$(jq -er '.packages.repositories[0] | capture("/(?<branch>v[0-9]+\\.[0-9]+)/").branch' "$LOCK")
 ALPINE_BRANCH=${ALPINE_BRANCH:-$lock_branch}
-MIGRATE_VERSION=${MIGRATE_VERSION:-$(jq -er '.migrate.version' "$LOCK")}
+migrate=$(python3 "$(dirname "$0")/update-bootstrap-migrate.py" --resolve)
+MIGRATE_VERSION=$(jq -er '.version' <<<"$migrate")
 if [[ -n "${BOOTSTRAP_PACKAGES:-}" ]]; then
   read -r -a PACKAGES <<<"$BOOTSTRAP_PACKAGES"
 else
   mapfile -t PACKAGES < <(jq -er '.packages.pinned[].name' "$LOCK")
 fi
-mapfile -t ARCHITECTURES < <(jq -er '.migrate.archives[].architecture' "$LOCK")
+ARCHITECTURES=(amd64 arm64)
 # A package name reaches a shell inside the resolver container, so it is held to
 # apk's own name shape here rather than trusted as typed.
 for package in "${PACKAGES[@]}"; do
@@ -128,28 +124,8 @@ resolve_package_versions() {
   printf '%s\n' "$resolved"
 }
 
-resolve_archive_checksums() {
-  local checksums
-  checksums=$(curl -fsSL \
-    "https://github.com/golang-migrate/migrate/releases/download/${MIGRATE_VERSION}/sha256sum.txt") || {
-    echo "could not fetch published checksums for ${MIGRATE_VERSION}" >&2
-    return 1
-  }
-  local architecture
-  for architecture in "${ARCHITECTURES[@]}"; do
-    local checksum
-    checksum=$(awk -v archive="migrate.linux-${architecture}.tar.gz" \
-      '$2 == archive { print $1; exit }' <<<"$checksums")
-    if [[ ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
-      echo "${MIGRATE_VERSION} publishes no checksum for linux-${architecture}" >&2
-      return 1
-    fi
-    printf '%s\n' "$checksum"
-  done
-}
-
 # Reports a newer upstream migrate release. Nothing else signals it: the pinned
-# archive keeps verifying and installing forever, so staleness here is invisible
+# source version keeps compiling forever, so staleness here is invisible
 # until someone looks.
 report_migrate_staleness() {
   local latest
@@ -160,7 +136,7 @@ report_migrate_staleness() {
   fi
   if [[ "$latest" != "$MIGRATE_VERSION" ]]; then
     echo "migrate ${MIGRATE_VERSION} is behind upstream ${latest}"
-    echo "  to take it: MIGRATE_VERSION=${latest} ${0##*/}"
+    echo "  to take it: update the migrate dependency in go.mod, then run ${0##*/}"
     return 1
   fi
   echo "migrate ${MIGRATE_VERSION} is the current upstream release"
@@ -181,17 +157,8 @@ if ! versions_output=$(resolve_package_versions "$base"); then
   exit 1
 fi
 mapfile -t versions <<<"$versions_output"
-if ! checksums_output=$(resolve_archive_checksums); then
-  exit 1
-fi
-mapfile -t checksums <<<"$checksums_output"
-
 if [[ "${#versions[@]}" -ne "${#PACKAGES[@]}" ]]; then
   echo "could not resolve every package version from ${REPOSITORIES[*]}" >&2
-  exit 1
-fi
-if [[ "${#checksums[@]}" -ne "${#ARCHITECTURES[@]}" ]]; then
-  echo "could not resolve every migrate archive checksum for ${MIGRATE_VERSION}" >&2
   exit 1
 fi
 
@@ -201,23 +168,16 @@ for index in "${!PACKAGES[@]}"; do
     '. + [{name: $name, version: $version}]' <<<"$pinned")
 done
 
-archives=$(jq -n '[]')
-for index in "${!ARCHITECTURES[@]}"; do
-  archives=$(jq --arg architecture "${ARCHITECTURES[$index]}" --arg sha256 "${checksums[$index]}" \
-    '. + [{architecture: $architecture, sha256: $sha256}]' <<<"$archives")
-done
-
 resolved=$(jq -n \
   --arg version "$release" \
   --arg digest "$digest" \
-  --arg migrate "$MIGRATE_VERSION" \
+  --argjson migrate "$migrate" \
   --argjson repositories "$(jq -n --args '$ARGS.positional' "${REPOSITORIES[@]}")" \
   --argjson pinned "$pinned" \
-  --argjson archives "$archives" \
   '{
     base: {image: "alpine", version: $version, digest: $digest},
     packages: {repositories: $repositories, pinned: $pinned},
-    migrate: {version: $migrate, archives: $archives}
+    migrate: $migrate
   }')
 
 stale=false

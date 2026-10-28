@@ -286,7 +286,7 @@ func TestBootstrapImageCopiesOnlyTheStagedArtifact(t *testing.T) {
 		t.Fatal("bootstrap image copies the whole service directory, including local secrets")
 	}
 	for _, required := range []string{
-		"COPY bootstrap /app/bootstrap",
+		"COPY --from=migrate-builder /bootstrap /app/bootstrap",
 		"COPY runtime-access.sql /app/runtime-access.sql",
 		`CMD ["/bin/sh", "/app/bootstrap/bootstrap.sh"]`,
 	} {
@@ -299,15 +299,13 @@ func TestBootstrapImageCopiesOnlyTheStagedArtifact(t *testing.T) {
 func TestBootstrapImageIsTargetArchitecturePortable(t *testing.T) {
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", testBootstrapTemplating())
 	for _, required := range []string{
+		"FROM --platform=$BUILDPLATFORM " + bootstrapLock.Migrate.Toolchain,
 		"ARG TARGETARCH",
-		`architecture="${TARGETARCH:-$(apk --print-arch)}"`,
-		"x86_64) architecture=amd64",
-		"aarch64) architecture=arm64",
-		`case "${architecture}" in`,
-		"amd64) checksum=",
-		"arm64) checksum=",
-		`*) echo "unsupported target architecture: ${architecture}" >&2; exit 1 ;;`,
-		"/releases/download/" + bootstrapLock.Migrate.Version + "/migrate.linux-${architecture}.tar.gz",
+		`architecture="${TARGETARCH:-$(go env GOARCH)}"`,
+		`case "$architecture" in amd64|arm64)`,
+		`GOARCH="$architecture"`,
+		"CGO_ENABLED=0 GOOS=linux",
+		`*) echo "unsupported target architecture: $architecture" >&2; exit 1 ;;`,
 	} {
 		if !strings.Contains(dockerfile, required) {
 			t.Fatalf("bootstrap image is not target-architecture portable: missing %q", required)
@@ -336,6 +334,9 @@ func TestBootstrapImageBuildsWhenDockerOmitsTargetArchitecture(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, "bootstrap"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageBootstrapMigrate(filepath.Join(root, "bootstrap")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "bootstrap", "bootstrap.sh"), []byte("set -eu\n"), 0o644); err != nil {

@@ -1,74 +1,56 @@
 ---
 name: bootstrap-image-lock
-description: Move bootstrap-image.json forward — the lock the bootstrap image builds from (alpine base digest, pinned apk package versions, golang-migrate archive checksums). Use when a bootstrap image build fails "unable to select packages", when the weekly bootstrap-lock-freshness check reports drift, when bumping the alpine branch or the migrate version, or when a bootstrap_image_test.go checksum assertion fails. Explains why a failing build is the intended signal and why values are never authored by hand.
+description: Resolve bootstrap-image.json from upstream — Alpine base/package pins and the source-built migrate Go toolchain. Use for bootstrap package drift, migrate/module or compiler updates, and bootstrap freshness failures. Never guess lock values.
 ---
 
 # Moving the bootstrap image lock
 
-`bootstrap-image.json` pins what the bootstrap image installs: the alpine base
-by digest, exact apk package versions, and the golang-migrate archive sha256 per
-architecture. `templates/builder/Dockerfile.tmpl` renders entirely from it.
+`bootstrap-image.json` pins the Alpine base, apk packages, migrate source version
+and Go builder image. The binary is built from the agent's embedded `go.mod` and
+`go.sum`, with only the PostgreSQL and file drivers. The module files' hashes,
+compiler image, source version and drivers are exposed in recipe/image provenance.
+See `docs/bootstrap-migrate.md` for the dependency and image verification contract.
 
-**Never edit this file by hand.** Every value is resolved from upstream by
-`.github/scripts/update-bootstrap-lock.sh` — the base digest from the registry,
-package versions from inside the digest-pinned base on *both* architectures, and
-the migrate checksums from the release's published `sha256sum.txt`.
+**Never edit lock values by hand.** The resolver verifies the registry manifest
+bytes against its digest and requires both linux/amd64 and linux/arm64 support.
 
 ```bash
-.github/scripts/update-bootstrap-lock.sh            # re-resolve what the lock targets
-.github/scripts/update-bootstrap-lock.sh --check    # report drift, write nothing, exit 1 if stale
+# Source/toolchain-only update: no engine. Keep the base and apk pins unchanged.
+python3 .github/scripts/update-bootstrap-migrate.py
+MIGRATE_GO_IMAGE=golang:1.27.3-alpine3.24 python3 .github/scripts/update-bootstrap-migrate.py
+
+# Full refresh: requires Docker and both architectures.
+.github/scripts/update-bootstrap-lock.sh
+.github/scripts/update-bootstrap-lock.sh --check
 ALPINE_BRANCH=v3.22 .github/scripts/update-bootstrap-lock.sh
-MIGRATE_VERSION=v4.20.0 .github/scripts/update-bootstrap-lock.sh
-BOOTSTRAP_PACKAGES="postgresql17-client" .github/scripts/update-bootstrap-lock.sh
-go test ./... && git commit bootstrap-image.json
 ```
 
-A plain rerun re-resolves the lock's *own* intent: the branch, migrate version
-and package set are read back out of the current file, so it cannot silently
-revert someone's deliberate bump. The environment variables are the only way to
-change what is targeted, the package set included (`BOOTSTRAP_PACKAGES`).
+To upgrade migrate or its dependencies, update the parent module through normal
+Go dependency maintenance first, then resolve the lock. Do not use `go install
+...@version` in the image: that ignores the maintained parent graph. The recipe
+uses `go build -mod=readonly`, `GOTOOLCHAIN=local` and the exact builder digest.
+The Go builder must be at least the module's Go version. Updating the parent
+module changes the embedded inputs and their provenance hashes automatically.
 
-Pin only what the image runs. The migrate archive is fetched with the base's
-busybox `wget` and verified against the lock's sha256, so no download tool is
-pinned: every pin is one more package a rolling repository can withdraw, and
-Alpine's per-architecture builders publish a replacement at different times, so
-for that lag no lock is satisfiable on both architectures (#189).
+## Package drift
 
-## "unable to select packages" is the feature
+Alpine's rolling repository replaces `-rN` packages. A missing pinned package
+must fail the build; resolve the lock rather than loosening a constraint. The
+full resolver checks package versions on both architectures. The freshness
+workflow checks for registry/package drift and a newer migrate source release.
+An exact Go patch pin requires an explicit compiler update when a new patch ships.
 
-Alpine publishes no immutable package snapshot — a release branch keeps only the
-newest `-rN` of each package. Pinning exact versions trades availability for
-integrity: once upstream replaces a pinned package (`postgresql17-client`), the build
-fails loudly instead of quietly installing different bytes.
+## Verification
 
-That failure is the signal to rerun the script, and it is also how a security
-fix reaches the image. Do not respond to it by loosening a version constraint or
-dropping a pin — that converts a build failure into an unrecorded change of
-what ships.
+- `TestBootstrapMigrateSourceBuildGraph` cross-compiles the rendered build command
+  for both target architectures and inspects the actual binary's module graph.
+- `TestBootstrapMigrateRejectsTamperedModuleInputs` refuses changed module files
+  before compiling, so provenance cannot describe different input bytes.
+- `TestBuildRecipeLocksBootstrapInputs` checks the staged source files and recipe
+  hashes; the existing deterministic-emission tests cover the aggregate digest.
+- `TestBootstrapImageBuildsLockedInputsPerArchitecture` builds and runs both
+  images; the existing bootstrap parity tests exercise database migrations.
 
-The signal covers pinned packages only. A base digest the branch has moved past,
-and a newer migrate release, fail nothing on their own, which is why
-`.github/workflows/bootstrap-lock-freshness.yml` runs `--check` on a schedule
-instead of gating pull requests on unrelated upstream releases.
-
-## What the checksums do and do not prove
-
-The `sha256sum.txt` ships in the same GitHub release as the archives it covers.
-It pins **identity** — the bytes cannot change under a fixed version, and a
-mirror or CDN cannot substitute them — but it shares a trust root with the
-artifact, so it is not proof of authorship. Locking the version is what bounds
-that trust. Say so if a PR changes `MIGRATE_VERSION`.
-
-## Tests that hold the lock honest
-
-Under `go test ./...`, and several need docker with arm64 emulation:
-
-- `TestBootstrapImageLockMatchesCommittedDocument` — the parsed lock equals the file.
-- `TestBootstrapImageLockChecksumsMatchPublishedArchives` — the recorded sha256
-  is what the release actually publishes.
-- `TestBootstrapImageBuildsLockedInputsPerArchitecture` — the locked inputs
-  install on both architectures.
-- `TestBootstrapImageRejectsTamperedMigrateArchive` — a wrong checksum fails the build.
-
-Without an arm64 emulator these skip locally and fail under `CI`. If you ran
-them only on amd64, the arm64 archive checksum is unverified — say that.
+Host cross-compilation does not verify the container build or image scan. If no
+engine slot is allocated, run host tests only and state that the Docker checks,
+registry freshness and actual image vulnerability scan remain unverified.
