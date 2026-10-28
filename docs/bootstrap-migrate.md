@@ -31,6 +31,16 @@ provenance. Normal context hashing includes the staged source files. The build
 copies only the compiled executable and cleaned bootstrap artifacts into the
 runtime, so an SBOM describes shipped code rather than unused parent manifests.
 
+The bootstrap OS is maintained separately from the migrate executable and the
+PostgreSQL server image in `runtime-image.json`. The Alpine 3.21.9 bootstrap base
+updates libcrypto3/libssl3 to 3.3.7-r2, musl/musl-utils to 1.2.5-r12 and zlib to
+1.3.2-r1 on both architectures, addressing the fixable OS findings in the prior
+3.21.8 base. This stays on the same Alpine branch and PostgreSQL 17 client. Resolve
+the base with the full lock updater; do not add an unpinned `apk upgrade` to
+consumer Dockerfiles. Rebuilding with an older agent retains its embedded lock,
+so consumers must select the corrected source artifact or subsequent release.
+Package inspection of the base is not a scan of the final migration images.
+
 Use `.github/scripts/update-bootstrap-migrate.py` to resolve the migrate portion
 of the lock without Docker. It reads migrate's version from `go.mod`, retains the
 existing exact compiler tag, verifies the registry manifest digest and checks
