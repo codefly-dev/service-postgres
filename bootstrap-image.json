@@ -17,15 +17,6 @@
   },
   "migrate": {
     "version": "v4.19.1",
-    "archives": [
-      {
-        "architecture": "amd64",
-        "sha256": "2ac648fbd1b127b69ab5a7b33cf96212178f71e22379fc50573630c6f4c7ce18"
-      },
-      {
-        "architecture": "arm64",
-        "sha256": "2fea2455c0f3f07cc3f4b98471c951ad1a716059574b20b6416bd1e9058751c5"
-      }
-    ]
+    "toolchain": "golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb"
   }
 }

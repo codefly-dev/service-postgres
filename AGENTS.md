@@ -142,6 +142,8 @@ variables only the qualify script supplies.
   reported, never re-applied.
 - **`libs/go` is consumed by published version, never `replace`.** The qualify
   script fails on a `replace` directive or any core/parent import.
+- Bootstrap migrate is source-built from the maintained parent module; see
+  `docs/bootstrap-migrate.md`. Inspect the binary graph, not just `go.mod`.
 - **The two image locks move by different mechanisms.** `bootstrap-image.json`
   is written by a script; `runtime-image.json` is hand-edited and only verified.
   Neither is a value to guess — see the skills below.

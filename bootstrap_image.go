@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"slices"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/codefly-dev/core/shared"
@@ -16,14 +18,20 @@ import (
 //go:embed bootstrap-image.json
 var bootstrapImageLockJSON []byte
 
+//go:embed go.mod
+var bootstrapMigrateGoMod []byte
+
+//go:embed go.sum
+var bootstrapMigrateGoSum []byte
+
 // bootstrapArchitectures are the architectures the bootstrap image is built for,
 // matching the recipe's linux/amd64 + linux/arm64 platform list. The lock must
-// resolve a migrate archive for each of them, and the image rejects any other.
+// build a migrate binary for each of them, and the image rejects any other.
 var bootstrapArchitectures = []string{"amd64", "arm64"}
 
 // bootstrapRecipePlatforms are the buildx platforms the emitted recipe targets,
 // derived from the architectures the lock resolves inputs for so a platform can
-// never be advertised without a verified migrate archive behind it.
+// never be advertised without a source-built migrate binary behind it.
 func bootstrapRecipePlatforms() []string {
 	platforms := make([]string, 0, len(bootstrapArchitectures))
 	for _, architecture := range bootstrapArchitectures {
@@ -37,25 +45,18 @@ func bootstrapRecipePlatforms() []string {
 // its own source of truth.
 var bootstrapLock = shared.Must(parseBootstrapImageLock(bootstrapImageLockJSON))
 
-// bootstrapImageLock is the checked-in identity of every input the bootstrap
-// image consumes: the base image by digest, the apk repository with exact package
-// versions, and the migrate release archive by checksum per architecture. Nothing
-// the image builds from resolves against a mutable tag, and the migrate archive is
-// verified before any of its bytes are extracted or executed.
-//
-// .github/scripts/update-bootstrap-lock.sh is the supported way to change it; it
-// resolves each value from upstream (including migrate's published checksums)
-// rather than accepting hand-written digests.
+// bootstrapImageLock pins the base, apk packages and source-build toolchain.
+// The maintained module files are embedded separately; their hashes travel in
+// provenance and are verified before compilation, so callers cannot substitute
+// a different module graph behind the image labels.
 type bootstrapImageLock struct {
 	Base     bootstrapBaseImage     `json:"base"`
 	Packages bootstrapPackages      `json:"packages"`
 	Migrate  bootstrapMigrateBinary `json:"migrate"`
 
-	// LockDigest is the sha256 of the lock's canonical encoding, derived when it is
-	// parsed. It is the single value two builds compare to prove they resolved the
-	// same inputs, and it travels with the image as a label. Canonical, not the
-	// document's own bytes: reindenting or reordering keys in the file changes no
-	// input, so it must not change the identity the provenance reports.
+	// LockDigest identifies the JSON inputs; the embedded module-file hashes are
+	// separate provenance entries. Together they enter the aggregate recipe digest.
+	// Canonical encoding ignores JSON whitespace and key order.
 	LockDigest string `json:"-"`
 }
 
@@ -76,13 +77,30 @@ type bootstrapPackage struct {
 }
 
 type bootstrapMigrateBinary struct {
-	Version  string                    `json:"version"`
-	Archives []bootstrapMigrateArchive `json:"archives"`
+	Version   string `json:"version"`
+	Toolchain string `json:"toolchain"`
 }
 
-type bootstrapMigrateArchive struct {
-	Architecture string `json:"architecture"`
-	SHA256       string `json:"sha256"`
+func (bootstrapMigrateBinary) GoModSHA256() string {
+	return fmt.Sprintf("%x", sha256.Sum256(bootstrapMigrateGoMod))
+}
+
+func (bootstrapMigrateBinary) GoSumSHA256() string {
+	return fmt.Sprintf("%x", sha256.Sum256(bootstrapMigrateGoSum))
+}
+
+// Stage only agent-owned module inputs, never a consumer's module or credentials.
+func stageBootstrapMigrate(root string) error {
+	dir := filepath.Join(root, "migrate")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for name, data := range map[string][]byte{"go.mod": bootstrapMigrateGoMod, "go.sum": bootstrapMigrateGoSum} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Reference is the base image the Dockerfile builds FROM. The locked digest is the
@@ -124,10 +142,6 @@ type bootstrapProvenance struct {
 // record, so a consumer can read what a built artifact was assembled from without
 // re-resolving anything.
 func (l *bootstrapImageLock) Provenance() []bootstrapProvenance {
-	archives := make([]string, 0, len(l.Migrate.Archives))
-	for _, archive := range l.Migrate.Archives {
-		archives = append(archives, archive.Architecture+"="+archive.SHA256)
-	}
 	return []bootstrapProvenance{
 		{Arg: "CODEFLY_BOOTSTRAP_LOCK_DIGEST", Label: "dev.codefly.bootstrap.lock-digest", Value: l.LockDigest},
 		{Arg: "CODEFLY_BOOTSTRAP_BASE", Label: "dev.codefly.bootstrap.base", Value: l.Base.Reference()},
@@ -135,7 +149,10 @@ func (l *bootstrapImageLock) Provenance() []bootstrapProvenance {
 		{Arg: "CODEFLY_BOOTSTRAP_APK_REPOSITORIES", Label: "dev.codefly.bootstrap.apk-repositories", Value: strings.Join(l.Packages.Repositories, " ")},
 		{Arg: "CODEFLY_BOOTSTRAP_APK_PACKAGES", Label: "dev.codefly.bootstrap.apk-packages", Value: l.Packages.Specs()},
 		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_VERSION", Label: "dev.codefly.bootstrap.migrate-version", Value: l.Migrate.Version},
-		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_ARCHIVES", Label: "dev.codefly.bootstrap.migrate-archives", Value: strings.Join(archives, ",")},
+		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_TOOLCHAIN", Label: "dev.codefly.bootstrap.migrate-toolchain", Value: l.Migrate.Toolchain},
+		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_GO_MOD", Label: "dev.codefly.bootstrap.migrate-go-mod", Value: l.Migrate.GoModSHA256()},
+		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_GO_SUM", Label: "dev.codefly.bootstrap.migrate-go-sum", Value: l.Migrate.GoSumSHA256()},
+		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_DRIVERS", Label: "dev.codefly.bootstrap.migrate-drivers", Value: "postgres,file"},
 	}
 }
 
@@ -225,33 +242,11 @@ func (l *bootstrapImageLock) validatePackages() error {
 }
 
 func (l *bootstrapImageLock) validateMigrate() error {
-	if !strings.HasPrefix(l.Migrate.Version, "v") {
+	if !regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(l.Migrate.Version) {
 		return fmt.Errorf("bootstrap migrate version must be a release tag, got %q", l.Migrate.Version)
 	}
-	locked := make(map[string]bool, len(l.Migrate.Archives))
-	for _, archive := range l.Migrate.Archives {
-		if !slices.Contains(bootstrapArchitectures, archive.Architecture) {
-			return fmt.Errorf(
-				"bootstrap migrate archive architecture %q is not one of %s",
-				archive.Architecture,
-				strings.Join(bootstrapArchitectures, ", "),
-			)
-		}
-		if locked[archive.Architecture] {
-			return fmt.Errorf("bootstrap migrate archive for %s is locked twice", archive.Architecture)
-		}
-		locked[archive.Architecture] = true
-		if err := validateSHA256Checksum(
-			fmt.Sprintf("bootstrap migrate %s archive checksum", archive.Architecture),
-			archive.SHA256,
-		); err != nil {
-			return err
-		}
-	}
-	for _, architecture := range bootstrapArchitectures {
-		if !locked[architecture] {
-			return fmt.Errorf("bootstrap migrate archive for %s is required", architecture)
-		}
+	if !regexp.MustCompile(`^golang:[0-9]+\.[0-9]+\.[0-9]+-alpine[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$`).MatchString(l.Migrate.Toolchain) {
+		return fmt.Errorf("bootstrap migrate toolchain must pin an exact Go/Alpine tag and sha256 digest")
 	}
 	return nil
 }

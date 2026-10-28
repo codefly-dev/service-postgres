@@ -1,14 +1,11 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,46 +50,15 @@ func TestBootstrapImageLockDigestIgnoresDocumentFormatting(t *testing.T) {
 	require.Equal(t, bootstrapLock.LockDigest, fromIndented.LockDigest)
 }
 
-// TestBootstrapImageLockChecksumsMatchPublishedArchives is the check that makes a
-// locked checksum falsifiable: it downloads each archive the lock pins and hashes
-// it. Nothing else in the suite can tell a correct checksum from a plausible one —
-// the template test only asserts the value is present, and the per-architecture
-// build test needs emulation the host may not have.
-func TestBootstrapImageLockChecksumsMatchPublishedArchives(t *testing.T) {
-	for _, archive := range bootstrapLock.Migrate.Archives {
-		t.Run(archive.Architecture, func(t *testing.T) {
-			url := fmt.Sprintf(
-				"https://github.com/golang-migrate/migrate/releases/download/%s/migrate.linux-%s.tar.gz",
-				bootstrapLock.Migrate.Version, archive.Architecture,
-			)
-			response, err := http.Get(url)
-			require.NoError(t, err, "cannot reach %s to verify the locked checksum", url)
-			defer func() { require.NoError(t, response.Body.Close()) }()
-			require.Equal(t, http.StatusOK, response.StatusCode, url)
-
-			hasher := sha256.New()
-			_, err = io.Copy(hasher, response.Body)
-			require.NoError(t, err)
-			require.Equal(t, archive.SHA256, hex.EncodeToString(hasher.Sum(nil)),
-				"locked checksum does not match the archive published at %s", url)
-		})
-	}
-}
-
-// The bootstrap command reconciles runtime access with psql, so the client stays
-// pinned in the lock rather than pulled from whatever the repository serves. No
-// download tool is: the migrate archive is fetched with the base's busybox wget
-// and verified against the lock's sha256, so a package installed only to download
-// it would add one more pin a rolling repository can withdraw (#189) and one more
-// binary in a production Job image, for no integrity it does not already have.
+// The runtime needs psql, but no download or compiler package.
 func TestBootstrapImageLockPinsBuildAndCommandTooling(t *testing.T) {
 	pinned := map[string]string{}
 	for _, entry := range bootstrapLock.Packages.Pinned {
 		pinned[entry.Name] = entry.Version
 	}
 	require.Contains(t, pinned, "postgresql17-client")
-	require.NotContains(t, pinned, "curl", "the archive download needs no installed tool")
-	require.NotContains(t, pinned, "wget", "the archive download needs no installed tool")
+	require.NotContains(t, pinned, "curl", "source build needs no runtime download tool")
+	require.NotContains(t, pinned, "wget", "source build needs no runtime download tool")
 }
 
 func TestBootstrapProvenanceExposesEveryResolvedInput(t *testing.T) {
@@ -119,8 +85,10 @@ func TestBootstrapProvenanceExposesEveryResolvedInput(t *testing.T) {
 	require.Equal(t, bootstrapLock.Base.Reference(), values["dev.codefly.bootstrap.base"])
 	require.Equal(t, bootstrapLock.Packages.Specs(), values["dev.codefly.bootstrap.apk-packages"])
 	require.Equal(t, strings.Join(bootstrapLock.Packages.Repositories, " "), values["dev.codefly.bootstrap.apk-repositories"])
-	require.Contains(t, values["dev.codefly.bootstrap.migrate-archives"], "amd64=")
-	require.Contains(t, values["dev.codefly.bootstrap.migrate-archives"], "arm64=")
+	require.Equal(t, bootstrapLock.Migrate.Toolchain, values["dev.codefly.bootstrap.migrate-toolchain"])
+	require.Equal(t, bootstrapLock.Migrate.GoModSHA256(), values["dev.codefly.bootstrap.migrate-go-mod"])
+	require.Equal(t, bootstrapLock.Migrate.GoSumSHA256(), values["dev.codefly.bootstrap.migrate-go-sum"])
+	require.Equal(t, "postgres,file", values["dev.codefly.bootstrap.migrate-drivers"])
 
 	buildArgs := bootstrapLock.RecipeBuildArgs()
 	require.Len(t, buildArgs, len(provenance))
@@ -190,32 +158,16 @@ func TestParseBootstrapImageLockRejectsUnverifiableInput(t *testing.T) {
 			error: `bootstrap migrate version must be a release tag, got "latest"`,
 		},
 		{
-			name: "archive without a checksum",
-			amend: func(document map[string]any) {
-				lockArchives(document)[0].(map[string]any)["sha256"] = ""
-			},
-			error: "bootstrap migrate amd64 archive checksum must be a sha256 checksum",
+			name:  "toolchain without digest",
+			amend: func(document map[string]any) { lockMigrate(document)["toolchain"] = "golang:1.27.3-alpine3.24" },
+			error: "bootstrap migrate toolchain must pin an exact Go/Alpine tag and sha256 digest",
 		},
 		{
-			name: "architecture locked twice",
+			name: "toolchain shell injection",
 			amend: func(document map[string]any) {
-				lockArchives(document)[1].(map[string]any)["architecture"] = "amd64"
+				lockMigrate(document)["toolchain"] = "golang:1.27.3-alpine3.24@sha256:$(id)"
 			},
-			error: "bootstrap migrate archive for amd64 is locked twice",
-		},
-		{
-			name: "unsupported architecture",
-			amend: func(document map[string]any) {
-				lockArchives(document)[1].(map[string]any)["architecture"] = "riscv64"
-			},
-			error: `bootstrap migrate archive architecture "riscv64" is not one of amd64, arm64`,
-		},
-		{
-			name: "architecture missing from the lock",
-			amend: func(document map[string]any) {
-				lockMigrate(document)["archives"] = lockArchives(document)[:1]
-			},
-			error: "bootstrap migrate archive for arm64 is required",
+			error: "bootstrap migrate toolchain must pin an exact Go/Alpine tag and sha256 digest",
 		},
 		{
 			name: "unknown field",
@@ -259,10 +211,6 @@ func lockMigrate(document map[string]any) map[string]any {
 	return document["migrate"].(map[string]any)
 }
 
-func lockArchives(document map[string]any) []any {
-	return lockMigrate(document)["archives"].([]any)
-}
-
 func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
 		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
@@ -279,25 +227,16 @@ func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 	// appended to it would ship whatever the repository serves that day.
 	require.Regexp(t, `(?m)apk add --no-cache `+regexp.QuoteMeta(bootstrapLock.Packages.Specs())+`$`, dockerfile)
 
-	script := bootstrapMigrateInstallScript(t, dockerfile)
-	for _, archive := range bootstrapLock.Migrate.Archives {
-		require.Contains(t, script, archive.Architecture+") checksum="+archive.SHA256)
-	}
-	require.Contains(t, script, "/releases/download/"+bootstrapLock.Migrate.Version+"/migrate.linux-${architecture}.tar.gz")
-
-	// The archive lands in a file that is checksum-verified before anything reads
-	// it, so unverified bytes never reach tar — the shape a download-into-tar pipe
-	// cannot have.
-	require.NotContains(t, script, "| tar")
-	require.NotContains(t, script, "curl", "the download uses the base's busybox wget")
-	download := strings.Index(script, "wget -q -O /tmp/migrate.tar.gz")
-	verification := strings.Index(script, "sha256sum -c -")
-	extraction := strings.Index(script, "tar -xzf")
-	installation := strings.Index(script, "install -m 0755")
-	require.Positive(t, download)
-	require.Greater(t, verification, download)
-	require.Greater(t, extraction, verification)
-	require.Greater(t, installation, extraction)
+	require.Contains(t, dockerfile, "FROM --platform=$BUILDPLATFORM "+bootstrapLock.Migrate.Toolchain+" AS migrate-builder")
+	require.NotContains(t, dockerfile, "releases/download")
+	require.Contains(t, dockerfile, "COPY --from=migrate-builder /migrate /usr/local/bin/migrate")
+	require.Contains(t, dockerfile, "COPY --from=migrate-builder /bootstrap /app/bootstrap")
+	require.Contains(t, dockerfile, "RUN rm -rf /bootstrap/migrate")
+	script := bootstrapMigrateBuildScript(t, dockerfile)
+	require.Contains(t, script, "GOTOOLCHAIN=local")
+	require.Contains(t, script, "CGO_ENABLED=0 GOOS=linux GOARCH=\"$architecture\"")
+	require.Contains(t, script, "go build -mod=readonly -trimpath -tags postgres,file")
+	require.Less(t, strings.Index(script, "sha256sum -c -"), strings.Index(script, "go build"))
 
 	// Literal label values, and no ARG behind them: a label that resolves a build
 	// argument reports whatever the caller passed, not what built the image.
@@ -393,33 +332,60 @@ func TestBootstrapImageLabelsCannotBeOverriddenAtBuildTime(t *testing.T) {
 	}
 }
 
-// TestBootstrapImageRejectsTamperedMigrateArchive runs the Dockerfile's own install
-// step against a substituted archive: only the download is replaced, so the
-// verification under test is the template's. The archive carries a payload that
-// records its own execution, so the test can prove the tampered bytes were never
-// extracted or run.
-func TestBootstrapImageRejectsTamperedMigrateArchive(t *testing.T) {
-	requireDocker(t)
-	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
-	})
-	script := bootstrapMigrateInstallScript(t, dockerfile)
+// Verify the rendered recipe's commands on the host, with no Docker prerequisite.
+// The output graph is the evidence: unrelated DB/cloud drivers must not sneak
+// back into the bootstrap binary even when the parent go.mod needs them.
+func TestBootstrapMigrateSourceBuildGraph(t *testing.T) {
+	for _, arch := range bootstrapArchitectures {
+		t.Run(arch, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, stageBootstrapMigrate(dir))
+			output := filepath.Join(dir, "migrate-"+arch)
+			script := bootstrapMigrateBuildScript(t, renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{}))
+			script = strings.ReplaceAll(script, "-o /migrate", "-o "+output)
+			command := exec.Command("sh", "-c", script)
+			command.Dir = filepath.Join(dir, "migrate")
+			command.Env = append(os.Environ(), "TARGETARCH="+arch)
+			log, err := command.CombinedOutput()
+			require.NoError(t, err, string(log))
+			info, err := buildinfo.ReadFile(output)
+			require.NoError(t, err)
+			require.Equal(t, "github.com/golang-migrate/migrate/v4", info.Main.Path)
+			require.Equal(t, bootstrapLock.Migrate.Version, info.Main.Version)
+			require.NotEmpty(t, info.Main.Sum, "upstream source must be checksum pinned")
+			require.Len(t, info.Deps, 1, "only the PostgreSQL driver dependency belongs in this binary: %+v", info.Deps)
+			require.Equal(t, "github.com/lib/pq", info.Deps[0].Path)
+			require.Equal(t, "v1.12.3", info.Deps[0].Version)
+			settings := map[string]string{}
+			for _, setting := range info.Settings {
+				settings[setting.Key] = setting.Value
+			}
+			require.Equal(t, "linux", settings["GOOS"])
+			require.Equal(t, arch, settings["GOARCH"])
+			require.Equal(t, "0", settings["CGO_ENABLED"])
+			require.Equal(t, "postgres,file", settings["-tags"])
+		})
+	}
+}
 
-	download := regexp.MustCompile(`wget -q -O /tmp/migrate\.tar\.gz "[^"]+"`)
-	require.Len(t, download.FindAllString(script, -1), 1, "install step no longer downloads the archive to a file")
-	script = download.ReplaceAllString(script, "cp /fixture/migrate.tar.gz /tmp/migrate.tar.gz")
-
-	fixture := t.TempDir()
-	writeTamperedMigrateArchive(t, filepath.Join(fixture, "migrate.tar.gz"))
-
-	output, err := exec.Command("docker", "run", "--rm",
-		"--volume", fixture+":/fixture",
-		bootstrapLock.Base.Reference(), "sh", "-c", script,
-	).CombinedOutput()
-	require.Error(t, err, "tampered archive was accepted: %s", output)
-	require.Contains(t, string(output), "FAILED")
-	require.NoFileExists(t, filepath.Join(fixture, "executed"),
-		"tampered archive was extracted and executed")
+func TestBootstrapMigrateRejectsTamperedModuleInputs(t *testing.T) {
+	for _, name := range []string{"go.mod", "go.sum"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, stageBootstrapMigrate(dir))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "migrate", name), []byte("tampered"), 0o644))
+			script := bootstrapMigrateBuildScript(t, renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{}))
+			output := filepath.Join(dir, "output")
+			script = strings.ReplaceAll(script, "-o /migrate", "-o "+output)
+			command := exec.Command("sh", "-c", script)
+			command.Dir = filepath.Join(dir, "migrate")
+			command.Env = append(os.Environ(), "TARGETARCH=amd64")
+			log, err := command.CombinedOutput()
+			require.Error(t, err, string(log))
+			require.Contains(t, string(log), name+": FAILED")
+			require.NoFileExists(t, output)
+		})
+	}
 }
 
 // bootstrapBuildContext stages a build context for the bootstrap Dockerfile: the
@@ -439,15 +405,16 @@ func bootstrapBuildContext(t *testing.T) string {
 		[]byte(renderBootstrapTemplate(t, parameters)), 0o644))
 	staged := filepath.Join(context, bootstrapDirectory)
 	require.NoError(t, os.MkdirAll(staged, 0o755))
+	require.NoError(t, stageBootstrapMigrate(staged))
 	require.NoError(t, os.WriteFile(filepath.Join(staged, "bootstrap.sh"),
 		[]byte(renderStagedTemplate(t, "templates/bootstrap/bootstrap.sh.tmpl", parameters)), 0o644))
 	return context
 }
 
-// bootstrapMigrateInstallScript lifts the migrate install step out of the rendered
+// bootstrapMigrateBuildScript lifts the migrate build step out of the rendered
 // Dockerfile as a runnable shell script, so a test exercises the template's own
 // commands instead of a re-typed copy of them.
-func bootstrapMigrateInstallScript(t *testing.T, dockerfile string) string {
+func bootstrapMigrateBuildScript(t *testing.T, dockerfile string) string {
 	t.Helper()
 	var scripts []string
 	lines := strings.Split(dockerfile, "\n")
@@ -464,30 +431,8 @@ func bootstrapMigrateInstallScript(t *testing.T, dockerfile string) string {
 			scripts = append(scripts, script)
 		}
 	}
-	require.Len(t, scripts, 1, "exactly one build step must verify the migrate archive")
+	require.Len(t, scripts, 1, "exactly one build step must verify the maintained module inputs")
 	return scripts[0]
-}
-
-// writeTamperedMigrateArchive writes an archive shaped like the migrate release but
-// carrying a payload that records being run, so an accepted archive is observable.
-func writeTamperedMigrateArchive(t *testing.T, path string) {
-	t.Helper()
-	payload := []byte("#!/bin/sh\ntouch /fixture/executed\n")
-
-	file, err := os.Create(path)
-	require.NoError(t, err)
-	compressor := gzip.NewWriter(file)
-	archive := tar.NewWriter(compressor)
-	require.NoError(t, archive.WriteHeader(&tar.Header{
-		Name: "migrate",
-		Mode: 0o755,
-		Size: int64(len(payload)),
-	}))
-	_, err = archive.Write(payload)
-	require.NoError(t, err)
-	require.NoError(t, archive.Close())
-	require.NoError(t, compressor.Close())
-	require.NoError(t, file.Close())
 }
 
 func bootstrapPinnedVersion(t *testing.T, name string) string {
