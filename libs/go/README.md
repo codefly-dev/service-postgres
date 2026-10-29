@@ -257,6 +257,32 @@ one login has not said which is authoritative. `WithAccessTokenProvider` remains
 for a service that mints its own credential — a projected token file rewritten
 by a sidecar, say — and carries no cloud knowledge into this library.
 
+## The server's trust anchor arrives as a value, not a file
+
+A managed instance often presents a certificate signed by an authority private
+to it: Cloud SQL's default `serverCaMode` signs with a per-instance, self-signed
+CA whose root is in no system trust store, so `sslmode=verify-full` against
+system trust cannot verify it at all. pgx reads an anchor from `sslrootcert`, a
+file — and a file has to be mounted, which is a seam a service agent may not
+have.
+
+`ConnectionProfile.ServerTrustAnchorPEM` takes the authority as a configured
+value and the library builds the trust pool itself, so the configuration plane
+delivers a value and nothing delivers a file. A certificate authority is public
+information: this is ordinary configuration, not a secret. Pinning it is
+stronger than system trust rather than weaker — verification then means "this
+instance's own authority" instead of "any authority a public trust store
+carries" — and it narrows the authority only: hostname verification stays on and
+`InsecureSkipVerify` stays false.
+
+It is `VerifiedTLS` only, since no other transport verifies a certificate.
+Declaring it beside `sslrootcert` in the URL is refused: two answers to one
+question, one of which is the file the deployment could not deliver. An anchor
+that parses to no certificate — including the empty string — is refused rather
+than falling through to system trust, as are a private-key block, a server's own
+leaf certificate and an expired authority, each of which a lenient parse accepts
+and turns into an unverifiable connection far from its cause.
+
 `VerifiedTLS` requires an explicit PostgreSQL URL, login, database, a single TCP
 host and `sslmode=verify-full`; every effective endpoint is checked and driver
 fallbacks are rejected. Explicit CA/client-certificate files and reviewed pool

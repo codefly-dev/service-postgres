@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -58,14 +59,27 @@ type ConnectionProfile struct {
 	Port            uint16
 	Database        string
 	User            string
+	// ServerTrustAnchorPEM pins the certificate authority this capability's
+	// server must chain to, as a configured value rather than a mounted file
+	// (trustanchor.go says why). Empty keeps system trust, which is correct for
+	// a server signed by a public authority and cannot verify one signed by a
+	// private per-instance authority. VerifiedTLS only: the other transports
+	// present no certificate to verify.
+	ServerTrustAnchorPEM string
 }
 
 // WithConnectionProfiles validates both request capabilities before either pool
 // is created. Each capability retains its independent transport and role policy.
 func WithConnectionProfiles(reader, writer ConnectionProfile) Option {
 	return func(c *config) error {
-		if reader.validate() != nil || writer.validate() != nil {
-			return ErrConnectionProfile
+		// Propagated rather than collapsed: every existing reason is already
+		// ErrConnectionProfile, so errors.Is is unchanged, and a trust anchor's
+		// reason is something the operator who supplied it can act on.
+		if err := reader.validate(); err != nil {
+			return err
+		}
+		if err := writer.validate(); err != nil {
+			return err
 		}
 		c.readerProfile, c.writerProfile = reader, writer
 		return nil
@@ -76,8 +90,8 @@ func WithConnectionProfiles(reader, writer ConnectionProfile) Option {
 // capability before its pool is created. It does not change request profiles.
 func WithMaintenanceConnectionProfile(profile ConnectionProfile) Option {
 	return func(c *config) error {
-		if profile.validate() != nil {
-			return ErrConnectionProfile
+		if err := profile.validate(); err != nil {
+			return err
 		}
 		c.maintenanceProfile = profile
 		return nil
@@ -100,6 +114,14 @@ func (p ConnectionProfile) validate() error {
 	case VerifiedTLS, LocalIdentityProxy, MeshProtected, LocalLoopback:
 	default:
 		return ErrConnectionProfile
+	}
+	if p.ServerTrustAnchorPEM != "" {
+		if p.Transport != VerifiedTLS {
+			return fmt.Errorf("%w: transport %q verifies no server certificate", ErrServerTrustAnchor, p.Transport)
+		}
+		if _, err := serverTrustAnchor(p.ServerTrustAnchorPEM); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -152,7 +174,13 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 			if profile.Transport != LocalIdentityProxy {
 				return nil, ErrConnectionProfile
 			}
-		case "sslrootcert", "sslcert", "sslkey", "connect_timeout", "pool_max_conns", "pool_min_conns", "pool_min_idle_conns", "pool_max_conn_lifetime", "pool_max_conn_idle_time", "pool_health_check_period", "pool_max_conn_lifetime_jitter", "application_name":
+		case "sslrootcert":
+			// A declared anchor and a named file are two answers to one
+			// question, and the file is the one this deployment cannot deliver.
+			if profile.Transport != VerifiedTLS || profile.ServerTrustAnchorPEM != "" {
+				return nil, ErrConnectionProfile
+			}
+		case "sslcert", "sslkey", "connect_timeout", "pool_max_conns", "pool_min_conns", "pool_min_idle_conns", "pool_max_conn_lifetime", "pool_max_conn_idle_time", "pool_health_check_period", "pool_max_conn_lifetime_jitter", "application_name":
 			if profile.Transport != VerifiedTLS {
 				return nil, ErrConnectionProfile
 			}
@@ -248,6 +276,16 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 		}
 	} else if c.TLSConfig == nil || c.TLSConfig.InsecureSkipVerify || c.TLSConfig.ServerName != host || c.TLSConfig.VerifyPeerCertificate != nil || c.TLSConfig.VerifyConnection != nil {
 		return nil, ErrConnectionProfile
+	}
+	if profile.ServerTrustAnchorPEM != "" {
+		pool, err := serverTrustAnchor(profile.ServerTrustAnchorPEM)
+		if err != nil {
+			return nil, err
+		}
+		// Pinned IN ADDITION to the checks above, never instead of them: the
+		// anchor narrows which authority may have signed the certificate and
+		// changes nothing about hostname verification, which stays on.
+		c.TLSConfig.RootCAs = pool
 	}
 	return pc, nil
 }
