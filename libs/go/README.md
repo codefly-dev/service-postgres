@@ -216,6 +216,28 @@ factory, close, err := postgres.Open(ctx, readerURL, writerURL, authenticator,
     postgres.WithExternalIdentity(declaredIssuer))
 ```
 
+## One authenticated pool, for a service that owns its own tenancy
+
+`OpenPool(ctx, connection, profile, options...)` opens one pool for one
+capability and nothing else: the profile decides the transport and the pinned
+authority, the options decide the credential, and the caller gets a pool whose
+first connection has already succeeded. It grants no role, installs no session
+policy and judges no privilege.
+
+It exists because every other constructor here is opinionated. `Open` splits a
+service across a reader and a writer and installs the scoped RLS factory;
+`OpenMaintenance` selects an application role and refuses a privileged login. A
+service with one runtime principal and its own authority over whose tenant a
+call concerns fits neither, and so called `pgxpool.New` itself — which means it
+also re-decided the transport, the trust anchor and the credential, each of
+which this package already decides. This is the primitive underneath the other
+two, exposed, so adopting the library is one call rather than a redesign.
+
+`pgxpool` connects lazily, so `OpenPool` pings before returning: a wrong
+credential, an unverifiable server or an unreachable address fails at boot,
+where it is a deployment fault, rather than at the first query, where it reads
+as a runtime one.
+
 ## External identity: the consuming service names no cloud
 
 `WithExternalIdentity(declaration)` authenticates every pooled connection as the
