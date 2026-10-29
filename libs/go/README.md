@@ -213,8 +213,75 @@ writer := postgres.ConnectionProfile{
 // contain no role. Memberships and SQL grants remain separately provisioned.
 factory, close, err := postgres.Open(ctx, readerURL, writerURL, authenticator,
     postgres.WithConnectionProfiles(reader, writer),
-    postgres.WithAccessTokenProvider(tokenProvider))
+    postgres.WithExternalIdentity(declaredIssuer))
 ```
+
+## External identity: the consuming service names no cloud
+
+`WithExternalIdentity(declaration)` authenticates every pooled connection as the
+workload's own cloud identity: the login is a cloud principal, the password is a
+short-lived token minted per physical connection, and no password exists to be
+seeded, projected or rotated. A capability URL must then carry its login and no
+password — one beside a credential provider is refused, because the token
+replaces it on every backend and the URL's would be dead config reading as the
+live credential.
+
+`declaration` is the deployment's statement of where the workload runs. The
+consuming service forwards the value it was configured with and does not
+interpret it: no application names a cloud, a cloud SDK or an identity endpoint,
+and adding a cloud changes this library alone. Declarable values are
+`azure-entra` (Entra ID on Azure Database for PostgreSQL) and `gcp-cloud-sql`
+(IAM database authentication on Cloud SQL, which the instance must have on
+through the `cloudsql.iam_authentication` flag). There is no default: an empty
+or unrecognized declaration is refused at startup, naming the set it could have
+been, because the absence of a declaration and a declaration of absence are
+different states.
+
+`gcp-cloud-sql` authenticates several distinct logins from one pod. A pod holds
+one Kubernetes ServiceAccount and therefore one primary cloud identity, while
+this library deliberately keeps its capabilities on separate logins. The login
+each connection names decides the path: the pod's own service account uses its
+ambient credential directly, and any other login is exchanged for that
+principal's token through the IAM Credentials API, which requires
+`roles/iam.serviceAccountTokenCreator` on exactly that account. The cloud
+principal is derived from the login rather than declared twice — Cloud SQL
+registers a service-account login as the email with `.gserviceaccount.com`
+stripped, so appending it reverses that exactly. A login that is not a
+service-account login never reaches the API. Tokens are cached per login and
+retired before expiry; distinct logins never share one, which is the whole point
+of keeping them distinct.
+
+`WithExternalIdentity` and `WithAccessTokenProvider` are mutually exclusive:
+both authenticate the same pools, and a deployment declaring two credentials for
+one login has not said which is authoritative. `WithAccessTokenProvider` remains
+for a service that mints its own credential — a projected token file rewritten
+by a sidecar, say — and carries no cloud knowledge into this library.
+
+## The server's trust anchor arrives as a value, not a file
+
+A managed instance often presents a certificate signed by an authority private
+to it: Cloud SQL's default `serverCaMode` signs with a per-instance, self-signed
+CA whose root is in no system trust store, so `sslmode=verify-full` against
+system trust cannot verify it at all. pgx reads an anchor from `sslrootcert`, a
+file — and a file has to be mounted, which is a seam a service agent may not
+have.
+
+`ConnectionProfile.ServerTrustAnchorPEM` takes the authority as a configured
+value and the library builds the trust pool itself, so the configuration plane
+delivers a value and nothing delivers a file. A certificate authority is public
+information: this is ordinary configuration, not a secret. Pinning it is
+stronger than system trust rather than weaker — verification then means "this
+instance's own authority" instead of "any authority a public trust store
+carries" — and it narrows the authority only: hostname verification stays on and
+`InsecureSkipVerify` stays false.
+
+It is `VerifiedTLS` only, since no other transport verifies a certificate.
+Declaring it beside `sslrootcert` in the URL is refused: two answers to one
+question, one of which is the file the deployment could not deliver. An anchor
+that parses to no certificate — including the empty string — is refused rather
+than falling through to system trust, as are a private-key block, a server's own
+leaf certificate and an expired authority, each of which a lenient parse accepts
+and turns into an unverifiable connection far from its cause.
 
 `VerifiedTLS` requires an explicit PostgreSQL URL, login, database, a single TCP
 host and `sslmode=verify-full`; every effective endpoint is checked and driver

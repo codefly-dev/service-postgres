@@ -154,6 +154,7 @@ type config struct {
 	operationTimeout     time.Duration
 	readIsolation        pgx.TxIsoLevel
 	accessTokenProvider  AccessTokenProvider
+	externalIdentity     string
 	restrictedSession    bool
 	deniedRoles          []string
 	readerProfile        ConnectionProfile

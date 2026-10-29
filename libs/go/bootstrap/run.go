@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	postgres "github.com/codefly-dev/service-postgres/libs/go"
 	"github.com/codefly-dev/service-postgres/libs/go/controlplane"
 	"github.com/codefly-dev/service-postgres/libs/go/schemaplan"
 	"github.com/jackc/pgx/v5"
@@ -32,6 +33,19 @@ type Options struct {
 	Timeout           time.Duration
 	LockTimeout       time.Duration
 	StatementTimeout  time.Duration
+	// ExternalIdentity names the cloud credential issuer, exactly as a served
+	// process declares it (postgres.WithExternalIdentity). Empty keeps the
+	// password-authenticated behaviour every existing caller has. The migration
+	// owner is a cloud principal like any other login: it needs the same
+	// credential by the same declaration, resolved through the same table, or the
+	// job that creates the schema becomes the one place a password still has to
+	// exist.
+	ExternalIdentity string
+	// ServerTrustAnchorPEM pins the authority the managed server must chain to.
+	// It reaches two consumers with different needs: this process, which takes a
+	// pool, and the migrate subprocess, which takes a file — so it is declared
+	// once as a value here and materialized for the child.
+	ServerTrustAnchorPEM string
 }
 
 type Result struct {
@@ -67,13 +81,56 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 	if e != nil {
 		return result, e
 	}
+	// The anchor is written beside the staged migrations, which are already
+	// removed on every exit path: the migrate subprocess reads a file, and this
+	// is the one directory whose lifetime already matches the run's.
+	anchorFile := ""
+	if o.ServerTrustAnchorPEM != "" {
+		anchorFile = filepath.Join(staged, "server-authority.pem")
+		if e = os.WriteFile(anchorFile, []byte(o.ServerTrustAnchorPEM), 0o600); e != nil {
+			return result, errors.New("managed server authority could not be staged")
+		}
+		dsn, e = withAnchorFile(dsn, anchorFile)
+		if e != nil {
+			return result, e
+		}
+	}
+	var credential postgres.AccessTokenProvider
+	if o.ExternalIdentity != "" {
+		if credential, e = postgres.ExternalIdentityProvider(ctx, o.ExternalIdentity); e != nil {
+			return result, fmt.Errorf("managed bootstrap identity: %w", e)
+		}
+	}
 	cfg, e := managedConfig(dsn, o)
 	if e != nil {
 		return result, e
 	}
+	if o.ServerTrustAnchorPEM != "" {
+		pool, anchorErr := postgres.ServerTrustAnchor(o.ServerTrustAnchorPEM)
+		if anchorErr != nil {
+			return result, anchorErr
+		}
+		if cfg.TLSConfig == nil {
+			// A pinned authority with TLS off is a deployment that believes it is
+			// verifying a server and is not.
+			return result, errors.New("managed server authority declared on a connection that negotiates no TLS")
+		}
+		cfg.TLSConfig.RootCAs = pool
+	}
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
-	db := stdlib.OpenDB(*cfg)
+	openOptions := []stdlib.OptionOpenDB{}
+	if credential != nil {
+		openOptions = append(openOptions, stdlib.OptionBeforeConnect(func(ctx context.Context, c *pgx.ConnConfig) error {
+			token, err := credential(ctx, c.User)
+			if err != nil {
+				return err
+			}
+			c.Password = token
+			return nil
+		}))
+	}
+	db := stdlib.OpenDB(*cfg, openOptions...)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(0)
 	defer db.Close()
@@ -117,7 +174,18 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 		command := exec.CommandContext(ctx, o.MigrateExecutable, "-path", filepath.Join(staged, l.Stage), "-database", u.String(), "up")
 		// No inherited PG service/password settings, cloud credentials or unrelated
 		// secrets. The DSN is passwordless, including in the child process arguments.
+		// Still no inherited settings, and still nothing in the arguments: a
+		// credential there would be world-readable in /proc/<pid>/cmdline for the
+		// life of the child, while its environment is readable only by its own
+		// user. A fresh token per lineage, because a long run can outlive one.
 		command.Env = []string{"PGPASSFILE=/dev/null"}
+		if credential != nil {
+			token, tokenErr := credential(ctx, o.Binding.OwnerRole)
+			if tokenErr != nil {
+				return result, errors.New("managed bootstrap could not mint the migration owner's credential")
+			}
+			command.Env = append(command.Env, "PGPASSWORD="+token)
+		}
 		command.WaitDelay = time.Second
 		runErr := command.Run()
 		// Killing a client does not prove its server-side statement has stopped.
@@ -229,6 +297,23 @@ func connection(o Options, p schemaplan.Plan) (string, error) {
 	q.Set("connect_timeout", "5")
 	q.Set("lock_timeout", fmt.Sprint(o.LockTimeout.Milliseconds()))
 	q.Set("statement_timeout", fmt.Sprint(o.StatementTimeout.Milliseconds()))
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+// withAnchorFile names the staged authority in the DSN both consumers share.
+// It refuses to displace one the caller already named: two anchors is no
+// anchor, and the caller's is the one this process cannot have validated.
+func withAnchorFile(dsn, path string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", errors.New("invalid managed connection")
+	}
+	q := u.Query()
+	if existing := q.Get("sslrootcert"); existing != "" && existing != path {
+		return "", errors.New("managed connection names a server authority file and a declared authority")
+	}
+	q.Set("sslrootcert", path)
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

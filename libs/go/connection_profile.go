@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -28,6 +29,22 @@ const (
 	// password travels only inside the mesh tunnel. This is the transport the
 	// Postgres agent renders for an in-cluster store.
 	MeshProtected ConnectionTransport = "mesh-protected"
+	// PinnedAuthorityTLS is a TLS connection whose chain is verified against a
+	// PINNED authority and whose hostname is deliberately not matched. It exists
+	// because a managed instance can have no verifiable name: Cloud SQL issues its
+	// server certificate to an instance connection name and publishes no DNS
+	// record for it, so `verify-full` has nothing to match and refuses every
+	// connection — which is why the fleet's own jobs fall back to `verify-ca`
+	// against the system bundle, trusting every public authority on earth.
+	//
+	// Pinning inverts that. When the only trusted root is the instance's own
+	// per-instance authority, verifying the chain IS establishing which instance
+	// answered: no other server can present a certificate that authority signed.
+	// The hostname adds nothing, because the name was never the identity — the
+	// authority is. So this transport REQUIRES ServerTrustAnchorPEM; without a
+	// pinned root, chain-only verification would accept any public authority and
+	// be strictly weaker than the mode it replaces.
+	PinnedAuthorityTLS ConnectionTransport = "pinned-authority-tls"
 	// LocalLoopback is a plaintext TCP connection to a database on the same
 	// machine: the host is literal loopback (127.0.0.0/8, ::1) or "localhost",
 	// and sslmode is the literal "disable". It is what a local development run
@@ -58,14 +75,27 @@ type ConnectionProfile struct {
 	Port            uint16
 	Database        string
 	User            string
+	// ServerTrustAnchorPEM pins the certificate authority this capability's
+	// server must chain to, as a configured value rather than a mounted file
+	// (trustanchor.go says why). Empty keeps system trust, which is correct for
+	// a server signed by a public authority and cannot verify one signed by a
+	// private per-instance authority. VerifiedTLS only: the other transports
+	// present no certificate to verify.
+	ServerTrustAnchorPEM string
 }
 
 // WithConnectionProfiles validates both request capabilities before either pool
 // is created. Each capability retains its independent transport and role policy.
 func WithConnectionProfiles(reader, writer ConnectionProfile) Option {
 	return func(c *config) error {
-		if reader.validate() != nil || writer.validate() != nil {
-			return ErrConnectionProfile
+		// Propagated rather than collapsed: every existing reason is already
+		// ErrConnectionProfile, so errors.Is is unchanged, and a trust anchor's
+		// reason is something the operator who supplied it can act on.
+		if err := reader.validate(); err != nil {
+			return err
+		}
+		if err := writer.validate(); err != nil {
+			return err
 		}
 		c.readerProfile, c.writerProfile = reader, writer
 		return nil
@@ -76,8 +106,8 @@ func WithConnectionProfiles(reader, writer ConnectionProfile) Option {
 // capability before its pool is created. It does not change request profiles.
 func WithMaintenanceConnectionProfile(profile ConnectionProfile) Option {
 	return func(c *config) error {
-		if profile.validate() != nil {
-			return ErrConnectionProfile
+		if err := profile.validate(); err != nil {
+			return err
 		}
 		c.maintenanceProfile = profile
 		return nil
@@ -97,9 +127,21 @@ func (p ConnectionProfile) validate() error {
 		if p != (ConnectionProfile{}) {
 			return ErrConnectionProfile
 		}
-	case VerifiedTLS, LocalIdentityProxy, MeshProtected, LocalLoopback:
+	case VerifiedTLS, PinnedAuthorityTLS, LocalIdentityProxy, MeshProtected, LocalLoopback:
 	default:
 		return ErrConnectionProfile
+	}
+	if p.ServerTrustAnchorPEM == "" {
+		if p.Transport == PinnedAuthorityTLS {
+			return fmt.Errorf("%w: transport %q verifies the chain and not the hostname, so the pinned authority IS the server's identity and cannot be omitted", ErrServerTrustAnchor, p.Transport)
+		}
+		return nil
+	}
+	if p.Transport != VerifiedTLS && p.Transport != PinnedAuthorityTLS {
+		return fmt.Errorf("%w: transport %q verifies no server certificate", ErrServerTrustAnchor, p.Transport)
+	}
+	if _, err := serverTrustAnchor(p.ServerTrustAnchorPEM); err != nil {
+		return err
 	}
 	return nil
 }
@@ -152,8 +194,14 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 			if profile.Transport != LocalIdentityProxy {
 				return nil, ErrConnectionProfile
 			}
-		case "sslrootcert", "sslcert", "sslkey", "connect_timeout", "pool_max_conns", "pool_min_conns", "pool_min_idle_conns", "pool_max_conn_lifetime", "pool_max_conn_idle_time", "pool_health_check_period", "pool_max_conn_lifetime_jitter", "application_name":
-			if profile.Transport != VerifiedTLS {
+		case "sslrootcert":
+			// A declared anchor and a named file are two answers to one
+			// question, and the file is the one this deployment cannot deliver.
+			if profile.Transport != VerifiedTLS || profile.ServerTrustAnchorPEM != "" {
+				return nil, ErrConnectionProfile
+			}
+		case "sslcert", "sslkey", "connect_timeout", "pool_max_conns", "pool_min_conns", "pool_min_idle_conns", "pool_max_conn_lifetime", "pool_max_conn_idle_time", "pool_health_check_period", "pool_max_conn_lifetime_jitter", "application_name":
+			if profile.Transport != VerifiedTLS && profile.Transport != PinnedAuthorityTLS {
 				return nil, ErrConnectionProfile
 			}
 		default:
@@ -169,6 +217,14 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 	if strings.ContainsAny(password, "\x00\r\n") {
 		return nil, ErrConnectionProfile
 	}
+	// A credential provider replaces the password on every new backend, so a
+	// password in the URL is never the one that authenticates. Accepting both
+	// leaves a dead secret in the deployment that reads as the live one, and
+	// hides the case this is really guarding: an external-identity DSN that
+	// still carries the seeded password it was supposed to stop carrying.
+	if tokenHook && hasPassword {
+		return nil, ErrConnectionProfile
+	}
 	if profile.Transport == LocalIdentityProxy {
 		host = q.Get("host")
 		if u.Host != "" || hasPassword || tokenHook || q.Get("sslmode") != "disable" || q.Get("passfile") != "/dev/null" || !filepath.IsAbs(host) || filepath.Clean(host) != host || host == "/" || strings.ContainsAny(host, ",\x00\r\n") || strings.Contains(host, ".s.PGSQL.") {
@@ -180,8 +236,14 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 		}
 	} else {
 		sslmode := "verify-full"
-		if profile.plaintext() {
+		switch {
+		case profile.plaintext():
 			sslmode = "disable"
+		case profile.Transport == PinnedAuthorityTLS:
+			// Stated, not derived: this is the mode whose driver shape skips
+			// hostname verification, and a URL saying anything else is asking for a
+			// guarantee this transport does not give.
+			sslmode = "verify-ca"
 		}
 		if host == "" || strings.ContainsAny(host, ",/\x00\r\n") || q.Get("sslmode") != sslmode {
 			return nil, ErrConnectionProfile
@@ -238,8 +300,27 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 		if c.TLSConfig != nil {
 			return nil, ErrConnectionProfile
 		}
+	} else if profile.Transport == PinnedAuthorityTLS {
+		// pgx's verify-ca shape, asserted rather than assumed: Go's own
+		// verification is off and a chain-only verifier is installed that reads
+		// RootCAs through this config at handshake time — which is what makes the
+		// pool installed below the one actually consulted. No ServerName, so
+		// nothing compares a hostname anywhere.
+		if c.TLSConfig == nil || !c.TLSConfig.InsecureSkipVerify || c.TLSConfig.VerifyPeerCertificate == nil || c.TLSConfig.ServerName != "" || c.TLSConfig.VerifyConnection != nil {
+			return nil, ErrConnectionProfile
+		}
 	} else if c.TLSConfig == nil || c.TLSConfig.InsecureSkipVerify || c.TLSConfig.ServerName != host || c.TLSConfig.VerifyPeerCertificate != nil || c.TLSConfig.VerifyConnection != nil {
 		return nil, ErrConnectionProfile
+	}
+	if profile.ServerTrustAnchorPEM != "" {
+		pool, err := serverTrustAnchor(profile.ServerTrustAnchorPEM)
+		if err != nil {
+			return nil, err
+		}
+		// Pinned IN ADDITION to the checks above, never instead of them: the
+		// anchor narrows which authority may have signed the certificate and
+		// changes nothing about hostname verification, which stays on.
+		c.TLSConfig.RootCAs = pool
 	}
 	return pc, nil
 }

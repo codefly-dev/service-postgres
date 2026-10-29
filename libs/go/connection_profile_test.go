@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -136,5 +137,34 @@ func TestConnectionProfilesValidateBothBeforePoolOrToken(t *testing.T) {
 	c.distinctProxySockets = false
 	if _, _, err := capabilityConfigsWithProfiles(reader, writer, c); err != nil {
 		t.Fatal("service opt-in scope changed", err)
+	}
+}
+
+// A provider-authenticated capability carries its login and no password: the
+// token replaces it per connection, so a password in the URL is dead config
+// that reads as the live credential.
+func TestParseConnectionRefusesAPasswordBesideACredentialProvider(t *testing.T) {
+	for _, transport := range []ConnectionTransport{VerifiedTLS, MeshProtected, LocalLoopback} {
+		host := "store.identity.internal.example.com"
+		sslmode := "verify-full"
+		if transport == MeshProtected || transport == LocalLoopback {
+			sslmode = "disable"
+		}
+		if transport == LocalLoopback {
+			host = "localhost"
+		}
+		profile := ConnectionProfile{Transport: transport}
+		passwordless := fmt.Sprintf("postgresql://writer@%s/saas?sslmode=%s", host, sslmode)
+		withPassword := fmt.Sprintf("postgresql://writer:seeded@%s/saas?sslmode=%s", host, sslmode)
+		if _, err := ParseConnection(passwordless, profile, true); err != nil {
+			t.Fatalf("%s: a passwordless provider connection was refused: %v", transport, err)
+		}
+		if _, err := ParseConnection(withPassword, profile, true); !errors.Is(err, ErrConnectionProfile) {
+			t.Fatalf("%s: a password beside a credential provider was accepted: %v", transport, err)
+		}
+		// Without a provider the password is the credential and still stands.
+		if _, err := ParseConnection(withPassword, profile, false); err != nil {
+			t.Fatalf("%s: a password-authenticated connection was refused: %v", transport, err)
+		}
 	}
 }

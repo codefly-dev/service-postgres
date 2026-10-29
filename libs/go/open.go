@@ -27,6 +27,9 @@ func Open(
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := resolveExternalIdentity(ctx, &configuration); err != nil {
+		return nil, nil, err
+	}
 	if configuration.operationTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, configuration.operationTimeout)

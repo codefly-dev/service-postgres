@@ -3,10 +3,12 @@ module github.com/codefly-dev/service-postgres/libs/go
 go 1.27.2
 
 require (
+	cloud.google.com/go/compute/metadata v0.10.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/lib/pq v1.12.3
+	golang.org/x/oauth2 v0.37.0
 )
 
 require (
