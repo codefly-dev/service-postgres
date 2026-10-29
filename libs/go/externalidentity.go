@@ -114,3 +114,22 @@ func elide(value string) string {
 	}
 	return value[:limit] + "…"
 }
+
+// ExternalIdentityProvider resolves a declaration to the provider that mints
+// its credential, for a caller that opens its own connection rather than going
+// through Open — the managed bootstrap, which runs migrations as a subprocess
+// and so cannot use a pool's connect hook for them.
+//
+// It is the same table WithExternalIdentity uses, exported so there is one
+// vocabulary and one resolution for every path to the database rather than a
+// second copy wherever a connection happens to be opened.
+func ExternalIdentityProvider(ctx context.Context, declaration string) (AccessTokenProvider, error) {
+	configuration := config{}
+	if err := WithExternalIdentity(declaration)(&configuration); err != nil {
+		return nil, err
+	}
+	if err := resolveExternalIdentity(ctx, &configuration); err != nil {
+		return nil, err
+	}
+	return configuration.accessTokenProvider, nil
+}

@@ -29,6 +29,22 @@ const (
 	// password travels only inside the mesh tunnel. This is the transport the
 	// Postgres agent renders for an in-cluster store.
 	MeshProtected ConnectionTransport = "mesh-protected"
+	// PinnedAuthorityTLS is a TLS connection whose chain is verified against a
+	// PINNED authority and whose hostname is deliberately not matched. It exists
+	// because a managed instance can have no verifiable name: Cloud SQL issues its
+	// server certificate to an instance connection name and publishes no DNS
+	// record for it, so `verify-full` has nothing to match and refuses every
+	// connection — which is why the fleet's own jobs fall back to `verify-ca`
+	// against the system bundle, trusting every public authority on earth.
+	//
+	// Pinning inverts that. When the only trusted root is the instance's own
+	// per-instance authority, verifying the chain IS establishing which instance
+	// answered: no other server can present a certificate that authority signed.
+	// The hostname adds nothing, because the name was never the identity — the
+	// authority is. So this transport REQUIRES ServerTrustAnchorPEM; without a
+	// pinned root, chain-only verification would accept any public authority and
+	// be strictly weaker than the mode it replaces.
+	PinnedAuthorityTLS ConnectionTransport = "pinned-authority-tls"
 	// LocalLoopback is a plaintext TCP connection to a database on the same
 	// machine: the host is literal loopback (127.0.0.0/8, ::1) or "localhost",
 	// and sslmode is the literal "disable". It is what a local development run
@@ -111,17 +127,21 @@ func (p ConnectionProfile) validate() error {
 		if p != (ConnectionProfile{}) {
 			return ErrConnectionProfile
 		}
-	case VerifiedTLS, LocalIdentityProxy, MeshProtected, LocalLoopback:
+	case VerifiedTLS, PinnedAuthorityTLS, LocalIdentityProxy, MeshProtected, LocalLoopback:
 	default:
 		return ErrConnectionProfile
 	}
-	if p.ServerTrustAnchorPEM != "" {
-		if p.Transport != VerifiedTLS {
-			return fmt.Errorf("%w: transport %q verifies no server certificate", ErrServerTrustAnchor, p.Transport)
+	if p.ServerTrustAnchorPEM == "" {
+		if p.Transport == PinnedAuthorityTLS {
+			return fmt.Errorf("%w: transport %q verifies the chain and not the hostname, so the pinned authority IS the server's identity and cannot be omitted", ErrServerTrustAnchor, p.Transport)
 		}
-		if _, err := serverTrustAnchor(p.ServerTrustAnchorPEM); err != nil {
-			return err
-		}
+		return nil
+	}
+	if p.Transport != VerifiedTLS && p.Transport != PinnedAuthorityTLS {
+		return fmt.Errorf("%w: transport %q verifies no server certificate", ErrServerTrustAnchor, p.Transport)
+	}
+	if _, err := serverTrustAnchor(p.ServerTrustAnchorPEM); err != nil {
+		return err
 	}
 	return nil
 }
@@ -181,7 +201,7 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 				return nil, ErrConnectionProfile
 			}
 		case "sslcert", "sslkey", "connect_timeout", "pool_max_conns", "pool_min_conns", "pool_min_idle_conns", "pool_max_conn_lifetime", "pool_max_conn_idle_time", "pool_health_check_period", "pool_max_conn_lifetime_jitter", "application_name":
-			if profile.Transport != VerifiedTLS {
+			if profile.Transport != VerifiedTLS && profile.Transport != PinnedAuthorityTLS {
 				return nil, ErrConnectionProfile
 			}
 		default:
@@ -216,8 +236,14 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 		}
 	} else {
 		sslmode := "verify-full"
-		if profile.plaintext() {
+		switch {
+		case profile.plaintext():
 			sslmode = "disable"
+		case profile.Transport == PinnedAuthorityTLS:
+			// Stated, not derived: this is the mode whose driver shape skips
+			// hostname verification, and a URL saying anything else is asking for a
+			// guarantee this transport does not give.
+			sslmode = "verify-ca"
 		}
 		if host == "" || strings.ContainsAny(host, ",/\x00\r\n") || q.Get("sslmode") != sslmode {
 			return nil, ErrConnectionProfile
@@ -272,6 +298,15 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 		}
 	} else if profile.plaintext() {
 		if c.TLSConfig != nil {
+			return nil, ErrConnectionProfile
+		}
+	} else if profile.Transport == PinnedAuthorityTLS {
+		// pgx's verify-ca shape, asserted rather than assumed: Go's own
+		// verification is off and a chain-only verifier is installed that reads
+		// RootCAs through this config at handshake time — which is what makes the
+		// pool installed below the one actually consulted. No ServerName, so
+		// nothing compares a hostname anywhere.
+		if c.TLSConfig == nil || !c.TLSConfig.InsecureSkipVerify || c.TLSConfig.VerifyPeerCertificate == nil || c.TLSConfig.ServerName != "" || c.TLSConfig.VerifyConnection != nil {
 			return nil, ErrConnectionProfile
 		}
 	} else if c.TLSConfig == nil || c.TLSConfig.InsecureSkipVerify || c.TLSConfig.ServerName != host || c.TLSConfig.VerifyPeerCertificate != nil || c.TLSConfig.VerifyConnection != nil {

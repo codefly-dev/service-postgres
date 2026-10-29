@@ -77,3 +77,9 @@ func serverTrustAnchor(anchor string) (*x509.CertPool, error) {
 	}
 	return pool, nil
 }
+
+// ServerTrustAnchor parses a declared authority into a trust pool, for a caller
+// that builds its own driver configuration rather than going through a
+// ConnectionProfile. Same parse, same refusals: one anchor vocabulary for every
+// path to the database.
+func ServerTrustAnchor(anchor string) (*x509.CertPool, error) { return serverTrustAnchor(anchor) }

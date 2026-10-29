@@ -224,3 +224,66 @@ func TestWithConnectionProfilesReportsWhyAnAnchorWasRefused(t *testing.T) {
 		t.Fatalf("err = %v, want ErrConnectionProfile", err)
 	}
 }
+
+// The transport exists for an instance with no verifiable name, so the pinned
+// authority is the whole of the server's identity and may not be omitted.
+func TestPinnedAuthorityRequiresItsAnchor(t *testing.T) {
+	if err := (ConnectionProfile{Transport: PinnedAuthorityTLS}).validate(); !errors.Is(err, ErrServerTrustAnchor) {
+		t.Fatalf("err = %v, want ErrServerTrustAnchor", err)
+	}
+	anchorPEM, _, _ := authority(t, "Cloud SQL Server CA", time.Now().Add(time.Hour))
+	if err := (ConnectionProfile{Transport: PinnedAuthorityTLS, ServerTrustAnchorPEM: anchorPEM}).validate(); err != nil {
+		t.Fatalf("a pinned profile with an anchor was refused: %v", err)
+	}
+}
+
+func TestPinnedAuthorityProducesTheChainOnlyDriverShape(t *testing.T) {
+	cleanProfileEnvironment(t)
+	anchorPEM, own, ownKey := authority(t, "Cloud SQL Server CA", time.Now().Add(10*365*24*time.Hour))
+	// A Cloud SQL leaf is issued to the instance connection name, which is not
+	// the address anything dials and resolves nowhere.
+	server := serverCertificate(t, "acme-example-data:us-east1:shared", own, ownKey)
+	host := "10.0.0.7"
+	profile := ConnectionProfile{Transport: PinnedAuthorityTLS, ServerTrustAnchorPEM: anchorPEM}
+
+	// verify-full is refused: there is no name for it to match.
+	if _, err := ParseConnection("postgresql://writer@"+host+"/postgres?sslmode=verify-full", profile, true); !errors.Is(err, ErrConnectionProfile) {
+		t.Fatal("a pinned profile accepted verify-full, which cannot be satisfied by an instance with no DNS name")
+	}
+	parsed, err := ParseConnection("postgresql://writer@"+host+"/postgres?sslmode=verify-ca", profile, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tls := parsed.ConnConfig.TLSConfig
+	if tls == nil || tls.RootCAs == nil || !tls.InsecureSkipVerify || tls.VerifyPeerCertificate == nil || tls.ServerName != "" {
+		t.Fatalf("unexpected driver shape: %+v", tls)
+	}
+
+	// The property that matters: pgx's verifier reads RootCAs through the config
+	// at handshake time, so the pool installed above is the one consulted. Drive
+	// it exactly as the driver would — a leaf whose name matches nothing, which
+	// must still verify, and a leaf from another authority, which must not.
+	if err := tls.VerifyPeerCertificate([][]byte{server.Raw}, nil); err != nil {
+		t.Fatalf("the pinned authority did not verify its own instance: %v", err)
+	}
+	_, other, otherKey := authority(t, "Cloud SQL Server CA elsewhere", time.Now().Add(time.Hour))
+	impostor := serverCertificate(t, "acme-example-data:us-east1:shared", other, otherKey)
+	if err := tls.VerifyPeerCertificate([][]byte{impostor.Raw}, nil); err == nil {
+		t.Fatal("a server from an unpinned authority verified: the pin is not being consulted")
+	}
+}
+
+// Without the anchor the same chain-only shape would accept any public
+// authority, which is why the transport refuses to exist without one. This
+// pins the reasoning: an empty pool must verify nothing.
+func TestPinnedAuthorityWithoutItsPoolVerifiesNothing(t *testing.T) {
+	_, own, ownKey := authority(t, "Cloud SQL Server CA", time.Now().Add(time.Hour))
+	server := serverCertificate(t, "acme-example-data:us-east1:shared", own, ownKey)
+	empty, err := serverTrustAnchor("")
+	if !errors.Is(err, ErrServerTrustAnchor) || empty != nil {
+		t.Fatalf("an empty anchor produced a pool: %v", err)
+	}
+	if _, err := server.Verify(x509.VerifyOptions{Roots: x509.NewCertPool()}); err == nil {
+		t.Fatal("an empty pool verified a certificate")
+	}
+}
