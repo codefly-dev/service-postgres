@@ -6,7 +6,6 @@ cel.dev/cel-go v0.32.0 h1:irvpFKr5EuGPyxeME03ERh0rii1TX+BDAnB9eL3IvNk=
 cel.dev/cel-go v0.32.0/go.mod h1:DnVip7tpJSsgZymwfT+m1tnEVy3ivAjSMXPx12YrMkU=
 cel.dev/expr v0.25.3 h1:A2jO8jwOugrrovveCWfj0KEZOfqiLgAcwjpHPhzIGw0=
 cel.dev/expr v0.25.3/go.mod h1:hrXvqGP6G6gyx8UAHSHJ5RGk//1Oj5nXQ2NI02Nrsg4=
-cloud.google.com/go v0.121.6 h1:waZiuajrI28iAf40cWgycWNgaXPO06dupuS+sgibK6c=
 cloud.google.com/go/compute/metadata v0.10.0 h1:pyKMUQSwchgkIBBJGdILqQbs/BNJXqwSA7Ej6LAvvtY=
 cloud.google.com/go/compute/metadata v0.10.0/go.mod h1:rGFHRrIif570kSibjFTMbt6/4/tzgJWFGI/HVol4GIk=
 dario.cat/mergo v1.0.2 h1:85+piFYR1tMbRrLcDwR18y4UKJ3aH1Tbzi24VRW1TK8=
@@ -57,8 +56,6 @@ github.com/codefly-dev/core v0.19.8 h1:7ZFXXo51P4H0r22QUbTPzs1j9d6iyftvoeqPGKDFA
 github.com/codefly-dev/core v0.19.8/go.mod h1:NB7x1UZ01rYTfEZEl4vUFD1A+fgOXhsWbgA3M8x4ThA=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
-github.com/codefly-dev/service-postgres/libs/go v0.0.0-20260915032422-272301033aed h1:P4H/FvViECu25UB7OEyCgyyDVsj6/Ql5rRPKCtcUklA=
-github.com/codefly-dev/service-postgres/libs/go v0.0.0-20260915032422-272301033aed/go.mod h1:5mwz8oM8INcukJLc6C84zdRnmDQ/gkMNI8GxWMwgk+8=
 github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261029025008-7fd6614ea9b6 h1:siiBUk1ChXxpCFt+KGqAOaa+y+x3GDniLyoJ2/5azIM=
 github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261029025008-7fd6614ea9b6/go.mod h1:uZ62/aYNXE4EykSKJg3CRggwxPVpb3YdZIVt/NPj1R0=
 github.com/containerd/errdefs v1.0.0 h1:tg5yIfIlQIrxYtu9ajqY42W3lpS19XqdxRQeEwYG8PI=
