@@ -169,6 +169,14 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 	if strings.ContainsAny(password, "\x00\r\n") {
 		return nil, ErrConnectionProfile
 	}
+	// A credential provider replaces the password on every new backend, so a
+	// password in the URL is never the one that authenticates. Accepting both
+	// leaves a dead secret in the deployment that reads as the live one, and
+	// hides the case this is really guarding: an external-identity DSN that
+	// still carries the seeded password it was supposed to stop carrying.
+	if tokenHook && hasPassword {
+		return nil, ErrConnectionProfile
+	}
 	if profile.Transport == LocalIdentityProxy {
 		host = q.Get("host")
 		if u.Host != "" || hasPassword || tokenHook || q.Get("sslmode") != "disable" || q.Get("passfile") != "/dev/null" || !filepath.IsAbs(host) || filepath.Clean(host) != host || host == "/" || strings.ContainsAny(host, ",\x00\r\n") || strings.Contains(host, ".s.PGSQL.") {

@@ -59,6 +59,9 @@ func OpenMaintenance(ctx context.Context, connection, applicationRole string, op
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := resolveExternalIdentity(ctx, &c); err != nil {
+		return nil, nil, err
+	}
 	if c.operationTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.operationTimeout)
