@@ -33,6 +33,15 @@ func main() {
 		os.Exit(2)
 	}
 	o.Connection = os.Getenv("CODEFLY_POSTGRES_MIGRATION_CONNECTION")
+	// Delivered as configuration beside the connection they describe, never as
+	// flags: a Job's command line is readable by anything in its pod, and these
+	// two are the deployment's statement about where this database is. Neither is
+	// a secret — an issuer names who mints the credential, and a certificate
+	// authority is public — but a credential minted FROM the issuer is, so it
+	// never appears here at all. Absent means the password-authenticated
+	// behaviour every existing deployment has.
+	o.ExternalIdentity = os.Getenv("CODEFLY_POSTGRES_EXTERNAL_IDENTITY")
+	o.ServerTrustAnchorPEM = os.Getenv("CODEFLY_POSTGRES_SERVER_AUTHORITY_PEM")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	result, err := bootstrap.Run(ctx, o)
