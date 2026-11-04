@@ -313,10 +313,6 @@ func bootstrapExtensions(plan *schemaPlan) []BootstrapExtension {
 	return extensions
 }
 
-func (*Builder) BuildCapabilities(context.Context, *builderv0.BuildCapabilitiesRequest) (*builderv0.BuildCapabilitiesResponse, error) {
-	return &builderv0.BuildCapabilitiesResponse{BuildxSelection: true}, nil
-}
-
 func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*builderv0.BuildResponse, error) {
 	defer s.Wool.Catch()
 
@@ -930,22 +926,18 @@ func (s *Builder) selectPromotableSecretReferences(
 		"POSTGRES_READ_ONLY_PASSWORD",
 		"POSTGRES_READ_WRITE_PASSWORD",
 	}
-	// The four managed primitives are authored outside this agent — the factory
+	// The managed primitives are authored outside this agent — the factory
 	// scaffolds them into the service's own secret configuration — so a render
 	// that reaches here without one is a misconfigured service, and saying so
-	// is the point.
-	primitives := []string{
-		"POSTGRES_USER",
-		"POSTGRES_PASSWORD",
-		"POSTGRES_READ_ONLY_PASSWORD",
-		"POSTGRES_READ_WRITE_PASSWORD",
-	}
+	// is the point. They are taken from the set BuildCapabilities declares, so
+	// a host that asked before building was told exactly what this refuses on.
+	primitives := s.requiredSecretConfigurationKeys(false)
 	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(primitives)+len(logins)+2)
 	secretName := ""
 	for _, environmentVariable := range primitives {
 		configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(
 			s.Unique(),
-			"postgres",
+			postgresSecretConfiguration,
 			environmentVariable,
 		)
 		reference := configured[configurationKey]
@@ -1024,7 +1016,7 @@ func (s *Builder) loginPasswordSecretReference(
 ) (*builderv0.KubernetesSecretKeyReference, error) {
 	configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(
 		s.Unique(),
-		"postgres",
+		postgresSecretConfiguration,
 		login.passwordKey,
 	)
 	reference := configured[configurationKey]
@@ -1043,22 +1035,27 @@ func (s *Builder) loginPasswordSecretReference(
 func (s *Builder) selectExternalSecretReferences(
 	configured map[string]*builderv0.KubernetesSecretKeyReference,
 ) (*promotableWorkloadSecretReferences, error) {
-	required := []struct {
-		environmentVariable string
-		configurationKey    string
-	}{
-		{environmentVariable: "POSTGRES_USER", configurationKey: "POSTGRES_USER"},
-		{environmentVariable: "PGUSER", configurationKey: "POSTGRES_USER"},
-		{environmentVariable: "PGPASSWORD", configurationKey: "POSTGRES_PASSWORD"},
-		{environmentVariable: "POSTGRES_READ_ONLY_PASSWORD", configurationKey: "POSTGRES_READ_ONLY_PASSWORD"},
-		{environmentVariable: "POSTGRES_READ_WRITE_PASSWORD", configurationKey: "POSTGRES_READ_WRITE_PASSWORD"},
-		{environmentVariable: externalReadOnlyConnectionKey, configurationKey: readOnlyConnectionKey},
-		{environmentVariable: externalReadWriteConnectionKey, configurationKey: readWriteConnectionKey},
+	// The required keys are the set BuildCapabilities declares, so a host that
+	// asked before building was told exactly what this refuses on. This maps
+	// each of them to the environment variables the bootstrap Job reads it as —
+	// the owner arrives twice, once under libpq's name.
+	variables := map[string][]string{
+		"POSTGRES_USER":                {"POSTGRES_USER", "PGUSER"},
+		"POSTGRES_PASSWORD":            {"PGPASSWORD"},
+		"POSTGRES_READ_ONLY_PASSWORD":  {"POSTGRES_READ_ONLY_PASSWORD"},
+		"POSTGRES_READ_WRITE_PASSWORD": {"POSTGRES_READ_WRITE_PASSWORD"},
+		readOnlyConnectionKey:          {externalReadOnlyConnectionKey},
+		readWriteConnectionKey:         {externalReadWriteConnectionKey},
 	}
-	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(required))
+	required := s.requiredSecretConfigurationKeys(true)
+	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(required)+1)
 	secretName := ""
-	for _, item := range required {
-		key := resources.ServiceSecretConfigurationKeyFromUnique(s.Unique(), "postgres", item.configurationKey)
+	for _, configurationKey := range required {
+		environmentVariables, mapped := variables[configurationKey]
+		if !mapped {
+			return nil, fmt.Errorf("external postgres deployment declares %s required but reads it under no environment variable", configurationKey)
+		}
+		key := resources.ServiceSecretConfigurationKeyFromUnique(s.Unique(), postgresSecretConfiguration, configurationKey)
 		reference := configured[key]
 		if reference == nil || reference.GetName() == "" || reference.GetKey() == "" {
 			return nil, fmt.Errorf("external postgres deployment requires a typed Kubernetes Secret reference for %s", key)
@@ -1071,7 +1068,9 @@ func (s *Builder) selectExternalSecretReferences(
 		} else if secretName != reference.GetName() {
 			return nil, fmt.Errorf("external postgres credential references must use one Kubernetes Secret")
 		}
-		selected[item.environmentVariable] = reference
+		for _, environmentVariable := range environmentVariables {
+			selected[environmentVariable] = reference
+		}
 	}
 	return &promotableWorkloadSecretReferences{
 		StatefulSet:  map[string]*builderv0.KubernetesSecretKeyReference{},
