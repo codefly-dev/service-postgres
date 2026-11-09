@@ -1,15 +1,14 @@
 name: controlplane
 
 on:
+  # No `paths:` filter on pull requests: main requires `restricted-postgres16`
+  # by name, and a path-filtered workflow never reports on a pull request that
+  # touches none of those paths, so such a pull request could never merge
+  # (#212, a Dockerfile-only change, sat BLOCKED on a check that never ran).
+  # The job takes about two minutes and runs beside `image`, so it costs no
+  # wall-clock time.
   pull_request:
     branches: [main]
-    paths:
-      - "libs/go/**"
-      - "cmd/managed-bootstrap/**"
-      - "go.mod"
-      - "go.sum"
-      - "scripts/qualify-controlplane.py"
-      - ".github/workflows/controlplane.yml"
   push:
     branches: [main]
     paths:

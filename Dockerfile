@@ -26,12 +26,17 @@ RUN rm /usr/local/bin/gosu
 # --upgrade also upgrades each named package's dependencies, so every package
 # this transaction changes is named at its exact version. An unnamed one floats
 # with the Alpine index: musl did on 2026-10-26 and moved the image digest.
+# musl-utils and zlib are named for the same reason and for their HIGH fixes
+# (CVE-2026-107891 in musl-utils 1.2.6-r2, CVE-2026-85091 in zlib 1.3.2-r0):
+# the pinned base ships the vulnerable revisions and nothing else upgrades them.
 RUN apk add --no-cache --upgrade \
     libcrypto3=3.5.9-r0 \
     libssl3=3.5.9-r0 \
     libuuid=2.42.3-r1 \
     musl=1.2.6-r3 \
-    su-exec=0.3-r0 && \
+    musl-utils=1.2.6-r3 \
+    su-exec=0.3-r0 \
+    zlib=1.4-r0 && \
     ln -s /sbin/su-exec /usr/local/bin/gosu && \
     rm /var/log/apk.log
 COPY --from=pgvector-builder /tmp/pgvector-install/ /
