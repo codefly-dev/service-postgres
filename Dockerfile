@@ -26,15 +26,17 @@ RUN rm /usr/local/bin/gosu
 # --upgrade also upgrades each named package's dependencies, so every package
 # this transaction changes is named at its exact version. An unnamed one floats
 # with the Alpine index: musl did on 2026-10-26 and moved the image digest.
-# musl-utils, zlib and krb5-libs are named for the same reason and for their
-# HIGH fixes (CVE-2026-107891 in musl-utils 1.2.6-r2, CVE-2026-85091 in zlib
-# 1.3.2-r0, and eighteen HIGHs in krb5-libs 1.22.2-r1 fixed in 1.22.3-r0):
+# musl-utils, zlib, krb5-libs and libxslt are named for the same reason and for
+# their HIGH fixes (CVE-2026-107891 in musl-utils 1.2.6-r2, CVE-2026-85091 in
+# zlib 1.3.2-r0, eighteen HIGHs in krb5-libs 1.22.2-r1 fixed in 1.22.3-r0, and
+# CVE-2026-87636 + CVE-2026-9947 in libxslt 1.1.43-r3 fixed in 1.1.43-r4):
 # the pinned base ships the vulnerable revisions and nothing else upgrades them.
 RUN apk add --no-cache --upgrade \
     krb5-libs=1.22.3-r0 \
     libcrypto3=3.5.9-r0 \
     libssl3=3.5.9-r0 \
     libuuid=2.42.3-r1 \
+    libxslt=1.1.43-r4 \
     musl=1.2.6-r3 \
     musl-utils=1.2.6-r3 \
     su-exec=0.3-r0 \
