@@ -1,8 +1,8 @@
 {
   "base": {
     "image": "alpine",
-    "version": "3.21.9",
-    "digest": "sha256:ee16d92f96db08d9d2d07da48555a27f3a69d8f0759021dbc601195ed0d2b5bd"
+    "version": "3.21.10",
+    "digest": "sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab"
   },
   "packages": {
     "repositories": [
@@ -17,6 +17,6 @@
   },
   "migrate": {
     "version": "v4.19.1",
-    "toolchain": "golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb"
+    "toolchain": "golang:1.27.4-alpine3.23@sha256:146e3b9c7c1e2ec3d3f5348c8a686151a75e1976e50efac9fc022ebe446a9a82"
   }
 }
