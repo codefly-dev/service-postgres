@@ -481,11 +481,11 @@ func (s *Builder) stageBootstrapContext(
 			return fmt.Errorf("stage migration source %q: %w", lineage.label(), err)
 		}
 	}
-	artifact, err := json.MarshalIndent(plan.artifact(), "", "  ")
+	artifact, err := planArtifactBytes(plan)
 	if err != nil {
 		return err
 	}
-	if err = os.WriteFile(filepath.Join(staging, "plan.json"), append(artifact, '\n'), 0o644); err != nil {
+	if err = os.WriteFile(filepath.Join(staging, "plan.json"), artifact, 0o644); err != nil {
 		return err
 	}
 	if err = os.WriteFile(filepath.Join(staging, stagedChecksumFile), plan.stagedChecksums(), 0o644); err != nil {
@@ -508,6 +508,16 @@ func (s *Builder) stageBootstrapContext(
 		return err
 	}
 	return os.Chmod(filepath.Join(contextRoot, runtimeAccessFile), 0o644)
+}
+
+// planArtifactBytes is plan.json exactly as the image carries it: the managed
+// Job's binding names its SHA-256, so Build and Deploy share one encoding.
+func planArtifactBytes(plan *schemaPlan) ([]byte, error) {
+	artifact, err := json.MarshalIndent(plan.artifact(), "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(artifact, '\n'), nil
 }
 
 // assertBootstrapDirectoryIsAgentOwned refuses to replace a bootstrap directory
@@ -581,6 +591,15 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 	if err := s.Settings.Timeouts.validate(); err != nil {
 		return s.Builder.DeployError(err)
 	}
+	// A managed store renders its migration and nothing else (managed.go). The
+	// branch is taken before anything of the in-cluster path exists.
+	managed, err := managedDeploymentOf(req.GetConfiguration())
+	if err != nil {
+		return s.Builder.DeployError(err)
+	}
+	if managed != nil {
+		return s.deployManaged(ctx, req, managed)
+	}
 	parameters := &DeploymentTemplateParameters{
 		WithBootstrap:               true,
 		ManagedImage:                s.dockerImage().FullName(),
@@ -597,7 +616,7 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 			if prepareErr != nil {
 				return prepareErr
 			}
-			bootstrapJobName, nameErr := s.immutableBootstrapJobName(deployment, parameters)
+			bootstrapJobName, nameErr := s.immutableJobName(deployment, deploymentFS, bootstrapJobTemplatePath, parameters)
 			if nameErr != nil {
 				return nameErr
 			}
@@ -621,20 +640,22 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 
 const bootstrapJobTemplatePath = "templates/deployment/kustomize/base/job.yaml.tmpl"
 
-func (s *Builder) immutableBootstrapJobName(
+func (s *Builder) immutableJobName(
 	deployment *services.KustomizeDeploymentContext,
-	parameters *DeploymentTemplateParameters,
+	templates fs.FS,
+	templatePath string,
+	parameters any,
 ) (string, error) {
 	service := shared.ToDNSCase(s.Identity.Name)
 	if service == "" {
 		return "", fmt.Errorf("bootstrap service name is required")
 	}
 
-	source, err := fs.ReadFile(deploymentFS, bootstrapJobTemplatePath)
+	source, err := fs.ReadFile(templates, templatePath)
 	if err != nil {
 		return "", fmt.Errorf("read bootstrap Job template: %w", err)
 	}
-	jobTemplate, err := template.New(bootstrapJobTemplatePath).Parse(string(source))
+	jobTemplate, err := template.New(templatePath).Parse(string(source))
 	if err != nil {
 		return "", fmt.Errorf("parse bootstrap Job template: %w", err)
 	}

@@ -305,6 +305,31 @@ than falling through to system trust, as are a private-key block, a server's own
 leaf certificate and an expired authority, each of which a lenient parse accepts
 and turns into an unverifiable connection far from its cause.
 
+### Cloud SQL through the connector: no anchor at all
+
+On Cloud SQL, prefer `CloudSQLConnector` to a pinned anchor. The profile names
+the instance (`Instance: "project:region:instance"`) and nothing about its
+server: the Cloud SQL connector, as the workload's own identity, fetches the
+instance's current server authority and a short-lived client certificate from
+the SQL Admin API, opens mutual TLS to the instance's private address, and checks
+the instance it reached. No certificate authority is delivered — as a file or as
+a value — none goes stale when the authority rotates, and with IAM
+authentication there is no password.
+
+```go
+profile := postgres.ConnectionProfile{Transport: postgres.CloudSQLConnector, Instance: instance}
+pool, closePool, err := postgres.OpenPool(ctx, "postgres:///records", profile,
+    postgres.WithExternalIdentity(postgres.IssuerGCPCloudSQL))
+```
+
+The URL names a database and, optionally, a login; an omitted login is the
+workload's own service account, and a login naming another principal is refused.
+Host, port, password, `sslmode` and certificate keys are refused: each is the
+connector's. The transport requires the `gcp-cloud-sql` external identity and
+refuses an access-token provider beside it. Private IP only; the connector's
+built-in metrics export is off. It is opened by `OpenPool`; `Open` and
+`OpenMaintenance` refuse it until they wire the dialer.
+
 `VerifiedTLS` requires an explicit PostgreSQL URL, login, database, a single TCP
 host and `sslmode=verify-full`; every effective endpoint is checked and driver
 fallbacks are rejected. Explicit CA/client-certificate files and reviewed pool

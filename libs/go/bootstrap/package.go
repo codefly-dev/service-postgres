@@ -46,6 +46,15 @@ func ReadJSON(path string, target any) error {
 	return decodeJSON(io.LimitReader(f, 4<<20), target)
 }
 
+// ReadJSONValue decodes a configuration delivered as a value rather than as a
+// file, with the same strictness as ReadJSON: one object, no unknown fields.
+func ReadJSONValue(value string, target any) error {
+	if len(value) > 4<<20 {
+		return errors.New("configuration value is too large")
+	}
+	return decodeJSON(strings.NewReader(value), target)
+}
+
 func decodeJSON(r io.Reader, target any) error {
 	decoder := json.NewDecoder(r)
 	decoder.DisallowUnknownFields()

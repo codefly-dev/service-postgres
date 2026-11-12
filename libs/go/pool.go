@@ -37,6 +37,11 @@ func OpenPool(ctx context.Context, connection string, profile ConnectionProfile,
 	if err != nil {
 		return nil, nil, err
 	}
+	// The connector authenticates and encrypts the connection itself, so it
+	// takes neither the token hook nor the driver TLS the paths below install.
+	if profile.Transport == CloudSQLConnector {
+		return openCloudSQLPool(ctx, connection, profile, configuration)
+	}
 	// Resolved before the configuration is parsed, because whether a credential
 	// provider is installed decides whether a password in the URL is legal.
 	if err := resolveExternalIdentity(ctx, &configuration); err != nil {
