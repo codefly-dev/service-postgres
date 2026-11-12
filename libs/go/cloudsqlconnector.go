@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -265,4 +268,101 @@ func withWorkloadLogin(ctx context.Context, connection string) (string, error) {
 		return "", fmt.Errorf("%w: the connection logs in as %q, but the workload is %q; the connector authenticates only the workload's own login", ErrExternalIdentity, elide(u.User.Username()), own)
 	}
 	return connection, nil
+}
+
+// CloudSQLSocket serves the instance on a private Unix socket for a process
+// that cannot take a dial function — the migration runner's `migrate` child,
+// which is handed a URL and opens its own connection.
+//
+// It is the connector's tunnel exposed in-process, not a proxy: the directory
+// is created 0700 inside parent (which the caller owns and removes), so only
+// this process's own user reaches it; every accepted connection is dialled
+// through the connector as the workload's own identity, over private IP, with
+// the instance's authority fetched from the cloud. What travels on the socket
+// is the driver's plaintext, which never leaves the process's own filesystem.
+// The URL to give a client is `postgres://<login>@/<database>?host=<dir>&sslmode=disable`.
+//
+// The returned closer stops accepting, closes every forwarded connection and
+// the connector, and removes the socket. It is safe to call more than once.
+func CloudSQLSocket(ctx context.Context, parent, instanceName string) (string, func() error, error) {
+	if err := (ConnectionProfile{Transport: CloudSQLConnector, Instance: instanceName}).validate(); err != nil {
+		return "", nil, err
+	}
+	dir, err := os.MkdirTemp(parent, "cloudsql-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create the connector socket directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("restrict the connector socket directory: %w", err)
+	}
+	dialer, err := newCloudSQLDialer(ctx)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("start the Cloud SQL connector: %w", err)
+	}
+	socket := filepath.Join(dir, ".s.PGSQL.5432")
+	// The limit libpq and the kernel share for a socket path; a longer parent
+	// fails as an opaque bind error otherwise.
+	if len(socket) > 103 {
+		_ = dialer.Close()
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("the connector socket path %q is longer than a Unix socket allows; use a shorter parent", socket)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		_ = dialer.Close()
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("listen on the connector socket: %w", err)
+	}
+	serving, stop := context.WithCancel(context.Background())
+	var open sync.WaitGroup
+	go func() {
+		for {
+			client, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			open.Add(1)
+			go func() {
+				defer open.Done()
+				defer client.Close()
+				server, err := dialer.Dial(serving, instanceName, cloudsqlconn.WithPrivateIP())
+				if err != nil {
+					return
+				}
+				defer server.Close()
+				// Either side closing ends both, and a stopped socket closes
+				// every connection it still forwards.
+				done := make(chan struct{})
+				defer close(done)
+				go func() {
+					select {
+					case <-serving.Done():
+						client.Close()
+						server.Close()
+					case <-done:
+					}
+				}()
+				go func() { _, _ = io.Copy(server, client); server.Close() }()
+				_, _ = io.Copy(client, server)
+			}()
+		}
+	}()
+	var once sync.Once
+	var closeErr error
+	return dir, func() error {
+		once.Do(func() {
+			stop()
+			closeErr = listener.Close()
+			open.Wait()
+			if err := dialer.Close(); closeErr == nil {
+				closeErr = err
+			}
+			if err := os.RemoveAll(dir); closeErr == nil {
+				closeErr = err
+			}
+		})
+		return closeErr
+	}, nil
 }

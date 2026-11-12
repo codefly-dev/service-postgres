@@ -46,6 +46,14 @@ type Options struct {
 	// pool, and the migrate subprocess, which takes a file — so it is declared
 	// once as a value here and materialized for the child.
 	ServerTrustAnchorPEM string
+	// CloudSQLInstance, when set, reaches the managed server through the Cloud
+	// SQL connector (`project:region:instance`) as this process's own identity:
+	// the runner serves it on a private socket in its staging directory and both
+	// it and the migrate child connect there. The connector authenticates the
+	// owner and fetches the server's authority itself, so Connection,
+	// ServerTrustAnchorPEM and any token are refused beside it, and
+	// ExternalIdentity must be the Cloud SQL issuer.
+	CloudSQLInstance string
 }
 
 type Result struct {
@@ -77,6 +85,21 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 		return result, e
 	}
 	defer os.RemoveAll(staged)
+	if o.CloudSQLInstance != "" {
+		if o.Connection != "" || o.ServerTrustAnchorPEM != "" || o.ExternalIdentity != postgres.IssuerGCPCloudSQL {
+			return result, errors.New("a Cloud SQL instance is reached by the connector alone: no connection, no server authority, and the gcp-cloud-sql identity")
+		}
+		socket, closeSocket, socketErr := postgres.CloudSQLSocket(ctx, staged, o.CloudSQLInstance)
+		if socketErr != nil {
+			return result, fmt.Errorf("managed bootstrap connector: %w", socketErr)
+		}
+		// Before the staging directory is removed: deferred calls run last-in first-out.
+		defer closeSocket()
+		o.Connection = (&url.URL{Scheme: "postgres", User: url.User(o.Binding.OwnerRole), Path: "/" + p.Database,
+			RawQuery: url.Values{"host": {socket}, "sslmode": {"disable"}}.Encode()}).String()
+		// The connector authenticates the owner; a token would be a second credential.
+		o.ExternalIdentity = ""
+	}
 	dsn, e := connection(o, p)
 	if e != nil {
 		return result, e

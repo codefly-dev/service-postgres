@@ -5,12 +5,14 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/cloudsqlconn"
+	"github.com/jackc/pgx/v5"
 )
 
 const testInstance = "obin-test-data:us-east1:obin-test-shared"
@@ -212,4 +214,79 @@ func TestCloudSQLConnectorPostgres(t *testing.T) {
 	if dialer.closed != 1 {
 		t.Fatalf("connector closed %d times", dialer.closed)
 	}
+}
+
+func TestCloudSQLSocketIsPrivateAndDialsTheInstance(t *testing.T) {
+	dialer := &fakeCloudSQLDialer{}
+	withFakeConnector(t, dialer, "svc@obin-test-data.iam")
+	parent := shortTempDir(t)
+	if _, _, err := CloudSQLSocket(context.Background(), parent, "10.87.0.7"); err == nil {
+		t.Fatal("a socket was served for an address rather than an instance")
+	}
+	dir, closeSocket, err := CloudSQLSocket(context.Background(), parent, testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || info.Mode().Perm() != 0o700 || filepath.Dir(dir) != parent {
+		t.Fatalf("socket directory %s is %v under %s, want 0700 inside the caller's directory", dir, info.Mode().Perm(), filepath.Dir(dir))
+	}
+	conn, err := net.Dial("unix", filepath.Join(dir, ".s.PGSQL.5432"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fake refuses, so the forwarded connection is closed at once.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("a refused dial left the client connected")
+	}
+	conn.Close()
+	if err := closeSocket(); err != nil {
+		t.Fatal(err)
+	}
+	_ = closeSocket()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("the socket directory outlived its closer")
+	}
+	if len(dialer.instances) != 1 || dialer.instances[0] != testInstance || dialer.options != 1 || dialer.closed != 1 {
+		t.Fatalf("dialled %v with %d options, closed %d times", dialer.instances, dialer.options, dialer.closed)
+	}
+}
+
+// Gated like TestCloudSQLConnectorPostgres: a client that takes a URL — the
+// migrate child's shape — reaches the server through the private socket.
+func TestCloudSQLSocketPostgres(t *testing.T) {
+	address := os.Getenv("CLOUD_SQL_CONNECTOR_TEST_ADDR")
+	if address == "" {
+		t.Skip("CLOUD_SQL_CONNECTOR_TEST_ADDR is required")
+	}
+	withFakeConnector(t, &fakeCloudSQLDialer{forward: address}, "svc@obin-test-data.iam")
+	dir, closeSocket, err := CloudSQLSocket(context.Background(), shortTempDir(t), testInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeSocket()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, "postgres://svc%40obin-test-data.iam@/records?sslmode=disable&host="+dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	var user string
+	if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&user); err != nil || user != "svc@obin-test-data.iam" {
+		t.Fatalf("connected as %q: %v", user, err)
+	}
+}
+
+// shortTempDir is a parent short enough for a Unix socket path on every
+// platform the suite runs on (macOS allows 104 bytes; t.TempDir is longer).
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "sq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
 }
