@@ -3,6 +3,7 @@ module github.com/codefly-dev/service-postgres
 go 1.27.3
 
 require (
+	cloud.google.com/go/cloudsqlconn v1.27.0
 	github.com/codefly-dev/core v0.19.20-0.20261109231633-701c09e0c6b4
 	github.com/codefly-dev/gortk v0.2.0
 	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261112161138-bb414858b4fc
@@ -22,7 +23,6 @@ require (
 	cel.dev/expr v0.25.3 // indirect
 	cloud.google.com/go/auth v0.24.4 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.3.1 // indirect
-	cloud.google.com/go/cloudsqlconn v1.27.0 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	cloud.google.com/go/monitoring v1.32.1 // indirect
 	cloud.google.com/go/sql v0.7.0 // indirect
