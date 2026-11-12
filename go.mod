@@ -1,6 +1,6 @@
 module github.com/codefly-dev/service-postgres
 
-go 1.27.3
+go 1.27.4
 
 require (
 	cloud.google.com/go/cloudsqlconn v1.27.0
