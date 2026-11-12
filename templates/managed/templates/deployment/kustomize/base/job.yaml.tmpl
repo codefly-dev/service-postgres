@@ -1,0 +1,74 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Deployment.Parameters.BootstrapJobName }}
+  namespace: {{ .Namespace }}
+  labels:
+    codefly.dev/bootstrap-service: {{ .Service.Name.DNSCase }}
+    codefly.dev/postgres-mode: managed
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: {{ .Deployment.Parameters.BootstrapJobDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        codefly.dev/bootstrap-service: {{ .Service.Name.DNSCase }}
+        codefly.dev/postgres-mode: managed
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      # The Job authenticates as its ServiceAccount's cloud identity through the
+      # node's metadata server, which needs no mounted Kubernetes token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Service.Name.DNSCase }}
+          image: {{ .Image }}
+          # The migration runner: migrations and runtime access, as the
+          # migration owner, through the Cloud SQL connector. No password, no
+          # server authority and no binding file: every input is a value below.
+          command:
+            - /usr/local/bin/managed-bootstrap
+            - -package
+            - /app/bootstrap
+            - -migrate
+            - /usr/local/bin/migrate
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: CODEFLY_POSTGRES_CLOUD_SQL_INSTANCE
+              value: {{ printf "%q" .Deployment.Parameters.Instance }}
+            - name: CODEFLY_POSTGRES_EXTERNAL_IDENTITY
+              value: {{ printf "%q" .Deployment.Parameters.ExternalIdentity }}
+            - name: CODEFLY_POSTGRES_MANAGED_BINDING
+              value: {{ printf "%q" .Deployment.Parameters.Binding }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # Scratch for the runner's staged migrations and the connector's
+          # private socket; the root filesystem stays read-only.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      restartPolicy: Never

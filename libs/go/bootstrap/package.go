@@ -29,6 +29,11 @@ var ledgerName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)
 // binds both SQL and group-role policy; cloud login principals are separate
 // deployment bindings and must already exist. The owner must be the connected
 // current_user so migrations and default privileges have the same owner.
+//
+// Either principal list may be empty — a store whose every consumer writes has
+// no reader, and the environment declares no login it does not mint — but not
+// both: a run that grants nobody access serves no runtime, so it is refused
+// before it connects rather than reconciled to an empty group.
 type Binding struct {
 	PlanSHA256          string   `json:"plan-sha256"`
 	PlanDigest          string   `json:"plan-digest"`
@@ -44,6 +49,15 @@ func ReadJSON(path string, target any) error {
 	}
 	defer f.Close()
 	return decodeJSON(io.LimitReader(f, 4<<20), target)
+}
+
+// ReadJSONValue decodes a configuration delivered as a value rather than as a
+// file, with the same strictness as ReadJSON: one object, no unknown fields.
+func ReadJSONValue(value string, target any) error {
+	if len(value) > 4<<20 {
+		return errors.New("configuration value is too large")
+	}
+	return decodeJSON(strings.NewReader(value), target)
 }
 
 func decodeJSON(r io.Reader, target any) error {
@@ -195,8 +209,8 @@ func validateBinding(p schemaplan.Plan, b Binding) error {
 			seen[r] = true
 		}
 	}
-	if len(b.ReadOnlyPrincipals) == 0 || len(b.ReadWritePrincipals) == 0 {
-		return errors.New("explicit reader and writer principals are required")
+	if len(b.ReadOnlyPrincipals)+len(b.ReadWritePrincipals) == 0 {
+		return errors.New("at least one runtime principal is required")
 	}
 	schemas := append([]string(nil), p.Access.Schemas...)
 	sort.Strings(schemas)

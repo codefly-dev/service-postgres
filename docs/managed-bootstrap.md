@@ -21,7 +21,9 @@ same v1 artifact and digest used by the builder. No format or existing content
 identity changes in this preview.
 
 The binding must name pre-provisioned cloud login principals and the connected
-migration owner. For example, with entirely synthetic role names:
+migration owner. Either principal list may be empty — a store whose consumers all
+write has no reader — but a binding naming no principal at all is refused before
+any connection. For example, with entirely synthetic role names:
 
 ```json
 {

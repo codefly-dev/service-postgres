@@ -343,6 +343,7 @@ func TestBootstrapMigrateSourceBuildGraph(t *testing.T) {
 			output := filepath.Join(dir, "migrate-"+arch)
 			script := bootstrapMigrateBuildScript(t, renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{}))
 			script = strings.ReplaceAll(script, "-o /migrate", "-o "+output)
+			script = strings.ReplaceAll(script, "-o /managed-bootstrap", "-o "+filepath.Join(dir, "managed-bootstrap-"+arch))
 			command := exec.Command("sh", "-c", script)
 			command.Dir = filepath.Join(dir, "migrate")
 			command.Env = append(os.Environ(), "TARGETARCH="+arch)

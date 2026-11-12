@@ -74,7 +74,7 @@ func TestPackageRejectsDriftAndAmbiguousInputs(t *testing.T) {
 			case "principal-is-group":
 				b.ReadWritePrincipals = []string{p.Access.ReadOnlyRole}
 			case "missing-principals":
-				b.ReadOnlyPrincipals = nil
+				b.ReadOnlyPrincipals, b.ReadWritePrincipals = nil, nil
 			case "wrong-pin":
 				b.PlanSHA256 = strings.Repeat("0", 64)
 			case "group-login-association":
@@ -97,6 +97,28 @@ func TestPackageRejectsDriftAndAmbiguousInputs(t *testing.T) {
 				t.Fatal("sensitive contents leaked")
 			}
 		})
+	}
+}
+
+// A binding with writers and no readers is the common managed shape: the
+// environment mints a login per consumer, and a store whose consumers all write
+// has none to put in the read-only group. Only a binding naming nobody at all is
+// refused.
+func TestPackageAcceptsABindingWithWritersOnly(t *testing.T) {
+	dir, _, b := packageFixture(t, "CREATE TABLE example(id integer);")
+	b.ReadOnlyPrincipals = nil
+	_, tmp, e := snapshot(dir, b)
+	if tmp != "" {
+		os.RemoveAll(tmp)
+	}
+	if e != nil {
+		t.Fatalf("a binding with a writer and no reader was refused: %v", e)
+	}
+	b.ReadOnlyPrincipals, b.ReadWritePrincipals = []string{"bootstrap_reader"}, nil
+	if _, tmp, e = snapshot(dir, b); e != nil {
+		t.Fatalf("a binding with a reader and no writer was refused: %v", e)
+	} else if tmp != "" {
+		os.RemoveAll(tmp)
 	}
 }
 

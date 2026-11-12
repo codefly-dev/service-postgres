@@ -50,6 +50,21 @@ const (
 	// and sslmode is the literal "disable". It is what a local development run
 	// of the Postgres agent serves, and it is refused for any other host.
 	LocalLoopback ConnectionTransport = "local-loopback"
+	// CloudSQLConnector is a connection to a Cloud SQL instance that the Cloud
+	// SQL connector dials (cloudsqlconnector.go). The connector, not the driver,
+	// owns the transport: it asks the SQL Admin API — as the workload's own
+	// identity — for an ephemeral client certificate and for the instance's
+	// server authority, and opens mutual TLS to the instance's private address
+	// with both. So nothing about the server's identity is delivered to the
+	// workload at all: no trust anchor as a file, none as a configured value,
+	// and no password. The deployment names the instance (Instance) and the
+	// connector establishes that the server answering is it.
+	//
+	// The URL names a login and a database and nothing else — no host, no port,
+	// no password and no TLS setting, because each of those is the connector's
+	// and a URL stating one would be a second, unused answer. The driver's own
+	// TLS is off: the bytes it writes travel inside the connector's tunnel.
+	CloudSQLConnector ConnectionTransport = "cloud-sql-connector"
 )
 
 var ErrConnectionProfile = errors.New("invalid Postgres connection profile")
@@ -82,6 +97,10 @@ type ConnectionProfile struct {
 	// private per-instance authority. VerifiedTLS only: the other transports
 	// present no certificate to verify.
 	ServerTrustAnchorPEM string
+	// Instance is the Cloud SQL instance a CloudSQLConnector capability dials,
+	// as its `project:region:instance` connection name. Required by that
+	// transport and refused by every other, which reaches its server by host.
+	Instance string
 }
 
 // WithConnectionProfiles validates both request capabilities before either pool
@@ -97,6 +116,9 @@ func WithConnectionProfiles(reader, writer ConnectionProfile) Option {
 		if err := writer.validate(); err != nil {
 			return err
 		}
+		if reader.Transport == CloudSQLConnector || writer.Transport == CloudSQLConnector {
+			return errConnectorOpenPoolOnly
+		}
 		c.readerProfile, c.writerProfile = reader, writer
 		return nil
 	}
@@ -108,6 +130,9 @@ func WithMaintenanceConnectionProfile(profile ConnectionProfile) Option {
 	return func(c *config) error {
 		if err := profile.validate(); err != nil {
 			return err
+		}
+		if profile.Transport == CloudSQLConnector {
+			return errConnectorOpenPoolOnly
 		}
 		c.maintenanceProfile = profile
 		return nil
@@ -127,9 +152,12 @@ func (p ConnectionProfile) validate() error {
 		if p != (ConnectionProfile{}) {
 			return ErrConnectionProfile
 		}
-	case VerifiedTLS, PinnedAuthorityTLS, LocalIdentityProxy, MeshProtected, LocalLoopback:
+	case VerifiedTLS, PinnedAuthorityTLS, LocalIdentityProxy, MeshProtected, LocalLoopback, CloudSQLConnector:
 	default:
 		return ErrConnectionProfile
+	}
+	if err := p.validateInstance(); err != nil {
+		return err
 	}
 	if p.ServerTrustAnchorPEM == "" {
 		if p.Transport == PinnedAuthorityTLS {
@@ -171,6 +199,9 @@ func ParseConnection(connection string, profile ConnectionProfile, tokenHook boo
 		if strings.HasPrefix(entry, "PG") {
 			return nil, ErrConnectionProfile
 		}
+	}
+	if profile.Transport == CloudSQLConnector {
+		return parseCloudSQLConnection(connection, profile, tokenHook)
 	}
 	u, err := url.Parse(connection)
 	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") || u.Opaque != "" || u.Fragment != "" || u.User == nil || u.User.Username() == "" || !strings.HasPrefix(u.Path, "/") || u.Path == "/" || strings.ContainsAny(strings.TrimPrefix(u.Path, "/"), "/\x00\r\n") || strings.ContainsAny(u.User.Username(), "\x00\r\n") {
