@@ -25,11 +25,14 @@ import (
 // codefly, we should have 'managed' vs non-managed, so when render a managed, we
 // ONLY render and build the migration so we are SURE we don't deploy PG in k8s".
 //
-// The mode is the ENVIRONMENT's declaration: its managed-services entry for this
-// store, which the CLI hands this agent's Deploy as the `managed-service`
-// configuration information (codefly-dev/cli#1346). It is never a service
-// setting, because the same store is a composed server on a laptop and a cloud
-// instance in a cell.
+// The mode is the ENVIRONMENT's declaration, and it is explicit in both
+// directions: the CLI hands this agent's Deploy either the `managed-service`
+// configuration information, built from the environment's managed-services
+// entry for this store (codefly-dev/cli#1346), or the `in-cluster-service`
+// information, from its in-cluster-services entry. An environment that declares
+// neither is refused by name, never answered with a server: "sure" has no
+// default. It is never a service setting, because the same store is a composed
+// server on a laptop and a cloud instance in a cell.
 //
 // It is held structurally, not by a flag inside one template set: a managed
 // Deploy renders from managedDeploymentFS, which contains the migration Job and
@@ -37,7 +40,8 @@ import (
 // on this path can emit a StatefulSet, a Service, a Secret, a volume claim or the
 // server image, because none of those templates is reachable from it.
 const (
-	managedServiceInformation = "managed-service"
+	managedServiceInformation   = "managed-service"
+	inClusterServiceInformation = "in-cluster-service"
 	// Key names are chosen so no configuration classifier reads them as
 	// credentials (none of these values is one): the entry's `auth-mode` and
 	// `instance-connection-name` arrive as `login-mode` and `instance`.
@@ -49,6 +53,12 @@ const (
 	// managedAuthMode is the one managed mode: the cloud issues every login's
 	// credential, and no password exists to seed, store or rotate.
 	managedAuthMode = authModeExternalIdentity
+
+	// workloadIdentityAnnotation binds the migration Job's ServiceAccount to the
+	// owner principal: on GKE, a pod annotated this way authenticates to the
+	// cloud as that service account through the node's metadata server, which
+	// is what IAM database login needs and why the Job mounts no token.
+	workloadIdentityAnnotation = "iam.gke.io/gcp-service-account"
 )
 
 //go:embed templates/managed/templates/deployment
@@ -66,27 +76,40 @@ var gcpServiceAccountEmail = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[
 
 // managedDeployment is the environment's statement about this store.
 type managedDeployment struct {
-	Instance      string
-	OwnerLogin    string
-	RuntimeLogins []string
+	Instance string
+	// OwnerPrincipal is the service account the migration Job runs as;
+	// OwnerLogin is its Cloud SQL login, the email without its suffix.
+	OwnerPrincipal string
+	OwnerLogin     string
+	RuntimeLogins  []string
 }
 
-// managedDeploymentOf reads the environment's managed-service declaration from
-// the Deploy request. Absent, the store is composed in the cluster; present, it
-// is managed and every value must be there — a declaration missing one is
-// refused by name rather than falling back to deploying a server.
-func managedDeploymentOf(configuration *v0.Configuration) (*managedDeployment, error) {
-	var declared *v0.ConfigurationInformation
+// storeDeploymentOf reads the environment's declaration about this store from
+// the Deploy request: managed (a managed-service information, returned) or
+// in-cluster (an in-cluster-service information, nil). An environment that
+// declares neither, or both, is refused by name: the in-cluster server is never
+// a default, so a cell whose store moved to a managed instance cannot be handed
+// one by an environment that forgot to say so. A managed declaration missing a
+// value is refused the same way rather than falling back to a server.
+func storeDeploymentOf(configuration *v0.Configuration, environment string) (*managedDeployment, error) {
+	var declared, inCluster *v0.ConfigurationInformation
 	for _, information := range configuration.GetInfos() {
-		if information.GetName() != managedServiceInformation {
-			continue
+		switch information.GetName() {
+		case managedServiceInformation:
+			if declared != nil {
+				return nil, fmt.Errorf("the environment declares %s twice for this store", managedServiceInformation)
+			}
+			declared = information
+		case inClusterServiceInformation:
+			inCluster = information
 		}
-		if declared != nil {
-			return nil, fmt.Errorf("the environment declares %s twice for this store", managedServiceInformation)
-		}
-		declared = information
 	}
-	if declared == nil {
+	switch {
+	case declared != nil && inCluster != nil:
+		return nil, fmt.Errorf("environment %q declares this store both managed (%s) and in-cluster (%s): a store is one or the other", environment, managedServiceInformation, inClusterServiceInformation)
+	case declared == nil && inCluster == nil:
+		return nil, fmt.Errorf("environment %q declares nothing about this store: declare it managed (a managed-services entry) or in-cluster (an in-cluster-services entry); a render never deploys a Postgres server by default", environment)
+	case declared == nil:
 		return nil, nil
 	}
 	values := map[string]string{}
@@ -108,7 +131,7 @@ func managedDeploymentOf(configuration *v0.Configuration) (*managedDeployment, e
 	if err != nil {
 		return nil, err
 	}
-	managed := &managedDeployment{Instance: values[managedInstanceKey], OwnerLogin: owner}
+	managed := &managedDeployment{Instance: values[managedInstanceKey], OwnerPrincipal: values[managedOwnerKey], OwnerLogin: owner}
 	for _, principal := range strings.Split(values[managedRuntimeKey], ",") {
 		login, err := cloudSQLLogin(managedRuntimeKey, strings.TrimSpace(principal))
 		if err != nil {
@@ -143,8 +166,17 @@ type ManagedDeploymentParameters struct {
 // deployManaged renders the migration Job for a managed store, and hands its
 // dependents the connection: the database, reached through the connector as
 // each dependent's own login, so there is no host, login or password to hand.
+//
+// The Job runs as the owner principal: core renders a ServiceAccount annotated
+// with it and binds the Job's pod to that account (PodOverlay), so the identity
+// the Job presents to the cloud is the one the binding names, decided here
+// rather than at connect time by whatever account the namespace defaults to.
 func (s *Builder) deployManaged(ctx context.Context, req *builderv0.DeploymentRequest, managed *managedDeployment) (*builderv0.DeploymentResponse, error) {
 	binding, err := s.managedBinding(managed)
+	if err != nil {
+		return s.Builder.DeployError(err)
+	}
+	connection, err := s.managedConnectionConfiguration()
 	if err != nil {
 		return s.Builder.DeployError(err)
 	}
@@ -159,18 +191,20 @@ func (s *Builder) deployManaged(ctx context.Context, req *builderv0.DeploymentRe
 		EnvironmentVariables: s.EnvironmentVariables,
 		Templates:            managedDeploymentFS,
 		Parameters:           parameters,
+		PodOverlay: &services.PodTemplateOverlay{ServiceAccount: &services.WorkloadServiceAccount{
+			Annotations: map[string]string{workloadIdentityAnnotation: managed.OwnerPrincipal},
+		}},
 		Prepare: func(ctx context.Context, deployment *services.KustomizeDeploymentContext) error {
 			name, nameErr := s.immutableJobName(deployment, managedDeploymentFS, managedJobTemplatePath, parameters)
 			if nameErr != nil {
 				return nameErr
 			}
 			parameters.BootstrapJobName = name
-			configuration := s.managedConnectionConfiguration()
 			if restrictedOutput(deployment.Profile) {
-				restrictedConfiguration = configuration
+				restrictedConfiguration = connection
 				return nil
 			}
-			return deployment.ExportConfiguration(ctx, configuration)
+			return deployment.ExportConfiguration(ctx, connection)
 		},
 	})
 	if err != nil || response.GetState().GetState() != builderv0.DeploymentStatus_SUCCESS || restrictedConfiguration == nil {
@@ -216,18 +250,21 @@ func (s *Builder) managedBinding(managed *managedDeployment) (string, error) {
 // managedConnectionConfiguration is what dependents are handed: the database
 // alone. The connector reaches the instance and logs in as the dependent's own
 // identity, so no host, login or password belongs in it.
-func (s *Builder) managedConnectionConfiguration() *v0.Configuration {
+func (s *Builder) managedConnectionConfiguration() (*v0.Configuration, error) {
 	connection := "postgres:///" + s.DatabaseName
 	values := []*v0.ConfigurationValue{
 		{Key: readOnlyConnectionKey, Value: connection, Secret: true},
 		{Key: readWriteConnectionKey, Value: connection, Secret: true},
 	}
-	logins, _ := s.runtimeLogins()
+	logins, err := s.runtimeLogins()
+	if err != nil {
+		return nil, err
+	}
 	for _, login := range logins {
 		values = append(values, &v0.ConfigurationValue{Key: login.connectionKey, Value: connection, Secret: true})
 	}
 	return &v0.Configuration{
 		Origin: s.Unique(),
 		Infos:  []*v0.ConfigurationInformation{{Name: "postgres", ConfigurationValues: values}},
-	}
+	}, nil
 }

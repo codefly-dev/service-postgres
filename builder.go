@@ -12,8 +12,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
-	"strconv"
 	"strings"
 	"text/template"
 
@@ -107,11 +105,6 @@ func (s *Builder) Sync(ctx context.Context, req *builderv0.SyncRequest) (*builde
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
-	for environment := range s.Settings.ExternalInstances {
-		if _, err := s.externalInstance(environment); err != nil {
-			return s.Builder.SyncError(err)
-		}
-	}
 	return s.Builder.SyncResponse()
 }
 
@@ -591,9 +584,10 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 	if err := s.Settings.Timeouts.validate(); err != nil {
 		return s.Builder.DeployError(err)
 	}
-	// A managed store renders its migration and nothing else (managed.go). The
-	// branch is taken before anything of the in-cluster path exists.
-	managed, err := managedDeploymentOf(req.GetConfiguration())
+	// The environment says what this store is here, managed or in-cluster
+	// (managed.go); a managed store renders its migration and nothing else.
+	// The branch is taken before anything of the in-cluster path exists.
+	managed, err := storeDeploymentOf(req.GetConfiguration(), req.GetEnvironment().GetName())
 	if err != nil {
 		return s.Builder.DeployError(err)
 	}
@@ -708,41 +702,23 @@ func (s *Builder) prepareDeployment(
 	if err != nil {
 		return nil, err
 	}
-	instance, binding, err := s.deploymentNetworkInstance(
+	instance, err := resources.FindNetworkInstanceInNetworkMappings(
 		ctx,
 		req.GetNetworkMappings(),
-		req.GetEnvironment().GetName(),
+		s.TcpEndpoint,
+		resources.NewPublicNetworkAccess(),
 	)
 	if err != nil {
 		return nil, err
 	}
-	if binding == nil {
-		// The Service publishes the port core allocated to the endpoint — the
-		// one every consumer dials — and targets 5432. Same mechanism as redis:
-		// the mapping the CLI hands this Deploy carries our own endpoint.
-		parameters.ServicePort = instance.GetPort()
-	}
-	if binding != nil {
-		if s.externalIdentity() {
-			return nil, fmt.Errorf("external-instance deployment does not support auth-mode %q: managed bootstrap generation requires password authentication", authModeExternalIdentity)
-		}
-		readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
-		parameters.ExternalInstance = true
-		parameters.ExternalHost = binding.Host
-		parameters.ExternalPort = binding.port()
-		parameters.ExternalSSLMode = "prefer"
-		if s.WithoutSSL {
-			parameters.ExternalSSLMode = "disable"
-		}
-		parameters.ReadOnlyRole = readOnlyRole
-		parameters.ReadWriteRole = readWriteRole
-		parameters.ExternalBindingID = externalBindingID(req.GetEnvironment().GetName(), binding)
-	}
-	withSSL := s.deploymentWithSSL(binding)
+	// The Service publishes the port core allocated to the endpoint — the one
+	// every consumer dials — and targets 5432. Same mechanism as redis: the
+	// mapping the CLI hands this Deploy carries our own endpoint.
+	parameters.ServicePort = instance.GetPort()
+	const withSSL = deployedServerNegotiatesTLS
 	if restrictedOutput(deployment.Profile) {
 		workloadReferences, referencesErr := s.selectPromotableSecretReferences(
 			deployment.Kubernetes.GetSecretReferences(),
-			binding != nil,
 			logins,
 		)
 		if referencesErr != nil {
@@ -750,7 +726,7 @@ func (s *Builder) prepareDeployment(
 		}
 		parameters.StatefulSetSecretReferences = workloadReferences.StatefulSet
 		parameters.BootstrapJobSecretReferences = workloadReferences.BootstrapJob
-		if binding == nil && !s.externalIdentity() {
+		if !s.externalIdentity() {
 			// The migration owner reaches the managed server the way it reaches
 			// an external binding: through libpq's environment, from the owner
 			// user and password the server itself is initialized with. No
@@ -788,127 +764,17 @@ func (s *Builder) prepareDeployment(
 	for _, login := range logins {
 		deployment.AddSecrets(resources.Env(login.passwordKey, s.loginPasswords[login.name]))
 	}
-	if binding != nil {
-		deployment.AddSecrets(
-			resources.Env("PGUSER", s.postgresUser),
-			resources.Env("PGPASSWORD", s.postgresPassword),
-			resources.Env(externalReadOnlyConnectionKey, configurationValueByKey(configuration, readOnlyConnectionKey)),
-			resources.Env(externalReadWriteConnectionKey, configurationValueByKey(configuration, readWriteConnectionKey)),
-		)
-	}
 	return configuration, nil
 }
 
-// deploymentWithSSL reports whether deployed connections may leave sslmode to
-// the client. The managed StatefulSet runs this agent's runtime image, which
-// configures no TLS, so a client that requires it by default — lib/pq, which
-// the bootstrap Job's migrate uses — is refused by the server this agent itself
-// deployed. Connections to it therefore pin sslmode=disable whatever without-ssl
-// says; without-ssl decides only for an external instance, whose TLS this agent
-// does not control. (Inside the cluster, transport encryption is the mesh's.)
-func (s *Builder) deploymentWithSSL(binding *ExternalInstance) bool {
-	if binding == nil {
-		return false
-	}
-	return !s.WithoutSSL
-}
-
-func (s *Builder) deploymentNetworkInstance(
-	ctx context.Context,
-	mappings []*v0.NetworkMapping,
-	environment string,
-) (*v0.NetworkInstance, *ExternalInstance, error) {
-	binding, err := s.externalInstance(environment)
-	if err != nil {
-		return nil, nil, err
-	}
-	if binding == nil {
-		instance, findErr := resources.FindNetworkInstanceInNetworkMappings(
-			ctx,
-			mappings,
-			s.TcpEndpoint,
-			resources.NewPublicNetworkAccess(),
-		)
-		return instance, nil, findErr
-	}
-	port := binding.port()
-	address := net.JoinHostPort(binding.Host, strconv.Itoa(int(port)))
-	return &v0.NetworkInstance{
-		Access:   resources.NewPublicNetworkAccess(),
-		Hostname: binding.Host,
-		Host:     address,
-		Port:     uint32(port),
-		Address:  address,
-	}, binding, nil
-}
-
-func (s *Service) externalInstance(environment string) (*ExternalInstance, error) {
-	if len(s.Settings.ExternalInstances) == 0 {
-		return nil, nil
-	}
-	if strings.TrimSpace(environment) == "" {
-		return nil, fmt.Errorf("external-instances requires a named deployment environment")
-	}
-	binding, configured := s.Settings.ExternalInstances[environment]
-	if !configured {
-		return nil, fmt.Errorf("external-instances has no binding for deployment environment %q", environment)
-	}
-	if binding.Host == "" {
-		return nil, fmt.Errorf("external-instance host is required")
-	}
-	if binding.Host != strings.TrimSpace(binding.Host) ||
-		strings.ContainsAny(binding.Host, " \t\r\n/?#") ||
-		strings.Contains(binding.Host, "://") ||
-		(strings.Contains(binding.Host, ":") && net.ParseIP(binding.Host) == nil) {
-		return nil, fmt.Errorf("external-instance host %q must be a hostname or IP address without a scheme, port, or path", binding.Host)
-	}
-	if binding.DatabaseName != s.DatabaseName {
-		return nil, fmt.Errorf("external-instance database-name %q does not match declared database-name %q", binding.DatabaseName, s.DatabaseName)
-	}
-	readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
-	declaredRoles, err := normalizedRuntimeReadWriteRoles(s.RuntimeReadWriteRoles, readOnlyRole, readWriteRole)
-	if err != nil {
-		return nil, err
-	}
-	boundRoles, err := normalizedRuntimeReadWriteRoles(binding.RuntimeReadWriteRoles, readOnlyRole, readWriteRole)
-	if err != nil {
-		return nil, fmt.Errorf("external-instance: %w", err)
-	}
-	if !slices.Equal(boundRoles, declaredRoles) {
-		return nil, fmt.Errorf("external-instance runtime-read-write-roles %v do not match declared runtime-read-write-roles %v", boundRoles, declaredRoles)
-	}
-	return &binding, nil
-}
-
-func (binding *ExternalInstance) port() uint16 {
-	if binding.Port == 0 {
-		return 5432
-	}
-	return binding.Port
-}
-
-func externalBindingID(environment string, binding *ExternalInstance) string {
-	identity := strings.Join([]string{
-		environment,
-		binding.Host,
-		strconv.Itoa(int(binding.port())),
-		binding.DatabaseName,
-		strings.Join(binding.RuntimeReadWriteRoles, "\x00"),
-	}, "\x00")
-	digest := sha256.Sum256([]byte(identity))
-	return hex.EncodeToString(digest[:])
-}
-
-func configurationValueByKey(configuration *v0.Configuration, key string) string {
-	for _, information := range configuration.GetInfos() {
-		for _, value := range information.GetConfigurationValues() {
-			if value.GetKey() == key {
-				return value.GetValue()
-			}
-		}
-	}
-	return ""
-}
+// deployedServerNegotiatesTLS is whether connections to the in-cluster server
+// may leave sslmode to the client. The StatefulSet runs this agent's runtime
+// image, which configures no TLS, so a client that requires it by default —
+// lib/pq, which the bootstrap Job's migrate uses — is refused by the server
+// this agent itself deployed. Connections to it therefore pin sslmode=disable
+// whatever without-ssl says. (Inside the cluster, transport encryption is the
+// mesh's; a managed instance is reached through its connector, managed.go.)
+const deployedServerNegotiatesTLS = false
 
 type promotableWorkloadSecretReferences struct {
 	StatefulSet  map[string]*builderv0.KubernetesSecretKeyReference
@@ -917,7 +783,6 @@ type promotableWorkloadSecretReferences struct {
 
 func (s *Builder) selectPromotableSecretReferences(
 	configured map[string]*builderv0.KubernetesSecretKeyReference,
-	external bool,
 	logins []runtimeLogin,
 ) (*promotableWorkloadSecretReferences, error) {
 	// The restricted deploy build never loads runtime credentials, so this is
@@ -935,9 +800,6 @@ func (s *Builder) selectPromotableSecretReferences(
 			BootstrapJob: map[string]*builderv0.KubernetesSecretKeyReference{},
 		}, nil
 	}
-	if external {
-		return s.selectExternalSecretReferences(configured)
-	}
 	statefulSetEnvironmentVariables := []string{
 		"POSTGRES_USER",
 		"POSTGRES_PASSWORD",
@@ -952,7 +814,7 @@ func (s *Builder) selectPromotableSecretReferences(
 	// that reaches here without one is a misconfigured service, and saying so
 	// is the point. They are taken from the set BuildCapabilities declares, so
 	// a host that asked before building was told exactly what this refuses on.
-	primitives := s.requiredSecretConfigurationKeys(false)
+	primitives := s.requiredSecretConfigurationKeys()
 	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(primitives)+len(logins)+2)
 	secretName := ""
 	for _, environmentVariable := range primitives {
@@ -1051,52 +913,6 @@ func (s *Builder) loginPasswordSecretReference(
 		return nil, fmt.Errorf("postgres credential references must use one Kubernetes Secret")
 	}
 	return reference, nil
-}
-
-func (s *Builder) selectExternalSecretReferences(
-	configured map[string]*builderv0.KubernetesSecretKeyReference,
-) (*promotableWorkloadSecretReferences, error) {
-	// The required keys are the set BuildCapabilities declares, so a host that
-	// asked before building was told exactly what this refuses on. This maps
-	// each of them to the environment variables the bootstrap Job reads it as —
-	// the owner arrives twice, once under libpq's name.
-	variables := map[string][]string{
-		"POSTGRES_USER":                {"POSTGRES_USER", "PGUSER"},
-		"POSTGRES_PASSWORD":            {"PGPASSWORD"},
-		"POSTGRES_READ_ONLY_PASSWORD":  {"POSTGRES_READ_ONLY_PASSWORD"},
-		"POSTGRES_READ_WRITE_PASSWORD": {"POSTGRES_READ_WRITE_PASSWORD"},
-		readOnlyConnectionKey:          {externalReadOnlyConnectionKey},
-		readWriteConnectionKey:         {externalReadWriteConnectionKey},
-	}
-	required := s.requiredSecretConfigurationKeys(true)
-	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(required)+1)
-	secretName := ""
-	for _, configurationKey := range required {
-		environmentVariables, mapped := variables[configurationKey]
-		if !mapped {
-			return nil, fmt.Errorf("external postgres deployment declares %s required but reads it under no environment variable", configurationKey)
-		}
-		key := resources.ServiceSecretConfigurationKeyFromUnique(s.Unique(), postgresSecretConfiguration, configurationKey)
-		reference := configured[key]
-		if reference == nil || reference.GetName() == "" || reference.GetKey() == "" {
-			return nil, fmt.Errorf("external postgres deployment requires a typed Kubernetes Secret reference for %s", key)
-		}
-		if reference.GetOptional() {
-			return nil, fmt.Errorf("%s Kubernetes Secret reference must not be optional", key)
-		}
-		if secretName == "" {
-			secretName = reference.GetName()
-		} else if secretName != reference.GetName() {
-			return nil, fmt.Errorf("external postgres credential references must use one Kubernetes Secret")
-		}
-		for _, environmentVariable := range environmentVariables {
-			selected[environmentVariable] = reference
-		}
-	}
-	return &promotableWorkloadSecretReferences{
-		StatefulSet:  map[string]*builderv0.KubernetesSecretKeyReference{},
-		BootstrapJob: selected,
-	}, nil
 }
 
 type create struct {

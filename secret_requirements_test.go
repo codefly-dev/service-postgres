@@ -99,39 +99,6 @@ func TestAnUnsupportedAuthModeIsRefusedByTheProbe(t *testing.T) {
 	require.ErrorContains(t, err, `unsupported postgres auth mode "external-idenity"`)
 }
 
-// A deployment bound to an external instance needs two more keys, and whether
-// it is bound is a per-environment fact of the service's own settings — so the
-// answer is exact only when the caller names the environment it is rendering.
-func TestAnExternalBindingIsDeclaredForTheNamedEnvironment(t *testing.T) {
-	builder, _ := newDeploymentTestBuilder(t)
-	builder.Settings.ExternalInstances = map[string]ExternalInstance{
-		"blue": {Host: "postgres.blue.example.com", DatabaseName: builder.DatabaseName},
-	}
-
-	named, err := builder.BuildCapabilities(context.Background(), &builderv0.BuildCapabilitiesRequest{Environment: "blue"})
-	require.NoError(t, err)
-	require.Len(t, named.GetRequiredSecretConfigurations(), 1)
-	require.Equal(t, []string{
-		"POSTGRES_USER",
-		"POSTGRES_PASSWORD",
-		"POSTGRES_READ_ONLY_PASSWORD",
-		"POSTGRES_READ_WRITE_PASSWORD",
-		readOnlyConnectionKey,
-		readWriteConnectionKey,
-	}, named.GetRequiredSecretConfigurations()[0].GetKeys())
-
-	// Unnamed, the probe answers what holds in every environment rather than
-	// claiming a binding it was not asked about.
-	unnamed, err := builder.BuildCapabilities(context.Background(), &builderv0.BuildCapabilitiesRequest{})
-	require.NoError(t, err)
-	require.Equal(t, managedSecretConfigurationKeys, unnamed.GetRequiredSecretConfigurations()[0].GetKeys())
-
-	// An environment the settings declare external instances for but do not
-	// bind is the refusal the render would hit, reported here instead.
-	_, err = builder.BuildCapabilities(context.Background(), &builderv0.BuildCapabilitiesRequest{Environment: "green"})
-	require.ErrorContains(t, err, `external-instances has no binding for deployment environment "green"`)
-}
-
 // The host-side comparison reads the probe's declaration and names every
 // missing key at once, in the spelling the agent's own refusal uses.
 func TestAHostReadsTheDeclarationAsTheMissingSet(t *testing.T) {

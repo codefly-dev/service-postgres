@@ -55,8 +55,6 @@ func TestRuntimeLoginsRefuseWhatARenderCannotCarry(t *testing.T) {
 		"unsafe role":            {DatabaseName: "db", RuntimeLogins: []RuntimeLogin{{Name: "worker", ReadWriteRoles: []string{"app; DROP"}}}},
 		"managed role as target": {DatabaseName: "db", RuntimeLogins: []RuntimeLogin{{Name: "worker", ReadWriteRoles: []string{managedReadWriteRole("db")}}}},
 		"external identity":      {DatabaseName: "db", AuthMode: authModeExternalIdentity, RuntimeLogins: []RuntimeLogin{{Name: "worker", ReadWriteRoles: []string{"app"}}}},
-		"external instance": {DatabaseName: "db", ExternalInstances: map[string]ExternalInstance{"prod": {Host: "db.example.com"}},
-			RuntimeLogins: []RuntimeLogin{{Name: "worker", ReadWriteRoles: []string{"app"}}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := resolveRuntimeLogins(settings)

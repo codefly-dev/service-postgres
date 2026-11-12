@@ -7,7 +7,7 @@ This service provisions Postgres as two explicit runtime capabilities:
 
   The **first** role in `runtime-read-write-roles` is set as the login's session default, so a caller that uses the secret as-is writes without issuing anything. Appending further roles does not change that default — reorder the list to change it. A caller that needs one of the other roles selects it with `SET ROLE`. Two consequences worth knowing: `RESET ROLE` returns to the default role, not to the login principal, so use `SET ROLE NONE` to drop to the unprivileged principal; and if the default role cannot be assumed (a migration has not created it yet, or reconciliation failed), the connection still opens as the principal — the server logs `WARNING: permission denied to set role` and writes fail with `42501` until the next successful reconciliation.
 
-- `postgres.<name>-connection`, once per entry in `runtime-logins`: a further read-write login for a consumer that must hold a **different** delegated role set, and must not be able to reach the managed read-write login's. Each is its own `NOINHERIT`, `NOBYPASSRLS` login with no direct table grants; its only write authority is membership of its own `read-write-roles` (created by migrations), the first of which is its session default. Its password is the `POSTGRES_<NAME>_PASSWORD` primitive (dashes become underscores); locally, when absent, it is derived from the owner secret like the reader's and writer's. In a restricted render the connection is a template over that primitive, and the bootstrap Job sets it: the agent names that key, so the agent declares its `secretKeyRef` into the service's Secret rather than requiring anyone to author the key first — a service adds a login without touching its own secret configuration, and the environment's secret store supplies (or generates) the value under that key. An explicitly configured reference for the same key still wins, and must be non-optional and in the same Secret as the other primitives. `runtime-logins` is refused with `external-instances` and with `auth-mode: external-identity`, whose principals this agent does not own.
+- `postgres.<name>-connection`, once per entry in `runtime-logins`: a further read-write login for a consumer that must hold a **different** delegated role set, and must not be able to reach the managed read-write login's. Each is its own `NOINHERIT`, `NOBYPASSRLS` login with no direct table grants; its only write authority is membership of its own `read-write-roles` (created by migrations), the first of which is its session default. Its password is the `POSTGRES_<NAME>_PASSWORD` primitive (dashes become underscores); locally, when absent, it is derived from the owner secret like the reader's and writer's. In a restricted render the connection is a template over that primitive, and the bootstrap Job sets it: the agent names that key, so the agent declares its `secretKeyRef` into the service's Secret rather than requiring anyone to author the key first — a service adds a login without touching its own secret configuration, and the environment's secret store supplies (or generates) the value under that key. An explicitly configured reference for the same key still wins, and must be non-optional and in the same Secret as the other primitives. `runtime-logins` is refused with `auth-mode: external-identity`, whose principals this agent does not own.
 
   ```yaml
   runtime-read-write-roles: [app_request]
@@ -20,24 +20,14 @@ The migration owner is private to the Postgres service and its bootstrap job. It
 
 The bootstrap job applies migrations and reconciles runtime roles and grants on every deployment. Local Docker and Nix runtimes enforce the same contract.
 
-## Externally provisioned deployments
+## Managed or in-cluster: the environment says which
 
-Add an entry to `external-instances` when a deployment environment uses a managed Postgres server instead of a server owned by this service. Bindings are keyed by environment so staging and production cannot silently share an address. The deployment emits the bootstrap Job but no Service, StatefulSet, or persistent volume. Local runs are described under "One native server per run" below.
+Where this store's server lives is the deployment environment's declaration, never a setting of the service, because the same store is a composed server on a laptop and a cloud instance in a cell. Every render is told one of two things by the environment:
 
-```yaml
-database-name: accounts
-runtime-read-write-roles: [app_tenant, app_worker]
-external-instances:
-  production:
-    host: postgres.production.example.com
-    port: 5432
-    database-name: accounts
-    runtime-read-write-roles: [app_tenant, app_worker]
-```
+- **Managed** (a `managed-services` entry for the store, handed to the render as `managed-service`): the server is the environment's — a Cloud SQL instance, named by its `project:region:instance` connection name, with `auth-mode: external-identity`. The render emits the migration Job and nothing else: no Service, StatefulSet, Secret or volume, and no server image. The Job runs as the declared owner principal (its ServiceAccount is bound to it), reaches the instance through the Cloud SQL connector as that identity, applies the migrations, and grants the declared runtime principals; it mounts nothing and carries no password. Dependents are handed the database alone and connect as their own workload identity.
+- **In-cluster** (an `in-cluster-services` entry): the server is this service's StatefulSet, bootstrapped as described below.
 
-When `external-instances` is present, every deployment environment must have an entry; a misspelled or missing environment fails instead of silently provisioning an owned server. The nested database name and ordered role list attest the environment binding. Deployment fails before rendering if either differs from the top-level contract. `port` defaults to `5432` when omitted. The bootstrap Job connects to the declared host directly, then verifies that the externally supplied read-only and read-write DSNs resolve to that host, port, database, and the expected managed login roles before reporting success. A target change produces a new immutable Job identity.
-
-External instances currently require password authentication. `auth-mode: external-identity` is rejected before rendering because its managed bootstrap path is not yet compatible with the generated role reconciler described below.
+A render for an environment that declares neither is refused by name. There is no default: a store that moved to a managed instance must never be answered with a server in the cluster because an environment forgot to say so.
 
 Local database state survives ordinary stop/start and container recreation. In Docker mode, the agent mounts the official image's data directory from a Codefly-owned persistent runtime directory scoped by workspace, service, and naming scope. Stable and development scopes therefore keep independent databases even when they run from the same checkout.
 

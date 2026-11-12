@@ -1,4 +1,3 @@
-{{- if not .Deployment.Parameters.ExternalInstance }}
 {{- /*
   port is the in-cluster port core allocated to the tcp endpoint and handed to
   every consumer; it falls back to the container port when no mapping set it.
@@ -26,5 +25,4 @@ spec:
   # Headless — clients reach postgres via the StatefulSet pod's stable
   # DNS (<svc>-0.<svc>.<ns>.svc).
   clusterIP: None
-{{- end }}
 {{- end }}

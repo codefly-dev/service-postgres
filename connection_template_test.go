@@ -155,20 +155,3 @@ func TestRestrictedBootstrapJobDisablesSSLForTheManagedServer(t *testing.T) {
 		require.NotContains(t, job, migrationConnectionEnvironmentKey)
 	}
 }
-
-// An external instance's TLS is not this agent's: without-ssl still decides.
-func TestExternalInstanceConnectionsKeepTheDeclaredSSL(t *testing.T) {
-	builder, _ := newDeploymentTestBuilder(t)
-	builder.DatabaseName = "accounts"
-	builder.RuntimeReadWriteRoles = []string{"app_tenant"}
-	builder.ExternalInstances = map[string]ExternalInstance{"test": {
-		Host: "managed.postgres.example.com", Port: 6432, DatabaseName: "accounts", RuntimeReadWriteRoles: []string{"app_tenant"},
-	}}
-	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(t.TempDir(), nil, promotablePostgresSecretReferences()))
-	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
-	for _, value := range response.GetConfiguration().GetInfos()[0].GetConfigurationValues() {
-		last := value.GetTemplate().GetSegments()[len(value.GetTemplate().GetSegments())-1].GetLiteral()
-		require.Equal(t, "@managed.postgres.example.com:6432/accounts", last)
-	}
-}

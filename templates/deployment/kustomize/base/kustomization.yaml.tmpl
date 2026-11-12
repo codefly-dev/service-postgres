@@ -2,10 +2,8 @@ resources:
 {{- if not .Restricted }}
   - namespace.yaml
 {{- end }}
-{{- if not .Deployment.Parameters.ExternalInstance }}
   - stateful-set.yaml
   - service.yaml
-{{- end }}
 {{- if .Deployment.Parameters.WithBootstrap }}
   # Database bootstrap runner: applies migrations when configured, then
   # reconciles the capability-scoped runtime roles on every deployment.
