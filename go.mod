@@ -7,8 +7,8 @@ require (
 	github.com/codefly-dev/core v0.19.20-0.20261109231633-701c09e0c6b4
 	github.com/codefly-dev/gortk v0.2.0
 	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261112203454-4ff9d3c9d8d0
-	github.com/gofrs/flock v0.13.1
-	github.com/golang-migrate/migrate/v4 v4.19.1
+	github.com/gofrs/flock v0.13.2
+	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/lib/pq v1.12.3
 	github.com/stretchr/testify v1.12.1
@@ -29,7 +29,6 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.12.0 // indirect
-	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.8.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.60.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.62.0 // indirect
