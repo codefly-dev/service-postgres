@@ -24,6 +24,14 @@ var bootstrapMigrateGoMod []byte
 //go:embed go.sum
 var bootstrapMigrateGoSum []byte
 
+// managedBootstrapSource is the migration runner a managed store's Job runs. It
+// builds beside migrate from this module's own go.mod and go.sum, so every
+// migration image carries both runners and the image is the same whichever mode
+// an environment declares.
+//
+//go:embed cmd/managed-bootstrap/main.go
+var managedBootstrapSource []byte
+
 // bootstrapArchitectures are the architectures the bootstrap image is built for,
 // matching the recipe's linux/amd64 + linux/arm64 platform list. The lock must
 // build a migrate binary for each of them, and the image rejects any other.
@@ -89,6 +97,10 @@ func (bootstrapMigrateBinary) GoSumSHA256() string {
 	return fmt.Sprintf("%x", sha256.Sum256(bootstrapMigrateGoSum))
 }
 
+func (bootstrapMigrateBinary) ManagedBootstrapSHA256() string {
+	return fmt.Sprintf("%x", sha256.Sum256(managedBootstrapSource))
+}
+
 // Stage only agent-owned module inputs, never a consumer's module or credentials.
 func stageBootstrapMigrate(root string) error {
 	dir := filepath.Join(root, "migrate")
@@ -100,7 +112,11 @@ func stageBootstrapMigrate(root string) error {
 			return err
 		}
 	}
-	return nil
+	runner := filepath.Join(dir, "cmd", "managed-bootstrap")
+	if err := os.MkdirAll(runner, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(runner, "main.go"), managedBootstrapSource, 0o644)
 }
 
 // Reference is the base image the Dockerfile builds FROM. The locked digest is the
@@ -153,6 +169,7 @@ func (l *bootstrapImageLock) Provenance() []bootstrapProvenance {
 		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_GO_MOD", Label: "dev.codefly.bootstrap.migrate-go-mod", Value: l.Migrate.GoModSHA256()},
 		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_GO_SUM", Label: "dev.codefly.bootstrap.migrate-go-sum", Value: l.Migrate.GoSumSHA256()},
 		{Arg: "CODEFLY_BOOTSTRAP_MIGRATE_DRIVERS", Label: "dev.codefly.bootstrap.migrate-drivers", Value: "postgres,file"},
+		{Arg: "CODEFLY_BOOTSTRAP_MANAGED_RUNNER", Label: "dev.codefly.bootstrap.managed-runner", Value: l.Migrate.ManagedBootstrapSHA256()},
 	}
 }
 

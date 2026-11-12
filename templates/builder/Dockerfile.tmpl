@@ -3,14 +3,20 @@ FROM --platform=$BUILDPLATFORM {{ .Bootstrap.Migrate.Toolchain }} AS migrate-bui
 ARG TARGETARCH
 WORKDIR /src
 COPY bootstrap/migrate/go.mod bootstrap/migrate/go.sum ./
+# The managed store's migration runner builds beside migrate, from the same
+# module graph and verified the same way: a managed render runs this image's
+# /usr/local/bin/managed-bootstrap.
+COPY bootstrap/migrate/cmd ./cmd
 RUN set -eu; \
-    printf '%s  go.mod\n%s  go.sum\n' '{{ .Bootstrap.Migrate.GoModSHA256 }}' '{{ .Bootstrap.Migrate.GoSumSHA256 }}' | sha256sum -c -; \
+    printf '%s  go.mod\n%s  go.sum\n%s  cmd/managed-bootstrap/main.go\n' '{{ .Bootstrap.Migrate.GoModSHA256 }}' '{{ .Bootstrap.Migrate.GoSumSHA256 }}' '{{ .Bootstrap.Migrate.ManagedBootstrapSHA256 }}' | sha256sum -c -; \
     architecture="${TARGETARCH:-$(go env GOARCH)}"; \
     case "$architecture" in amd64|arm64) ;; *) echo "unsupported target architecture: $architecture" >&2; exit 1 ;; esac; \
     CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" GOTOOLCHAIN=local \
     go build -mod=readonly -trimpath -tags postgres,file \
       -ldflags='-s -w -X main.Version={{ .Bootstrap.Migrate.Version }}' \
-      -o /migrate github.com/golang-migrate/migrate/v4/cmd/migrate
+      -o /migrate github.com/golang-migrate/migrate/v4/cmd/migrate; \
+    CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" GOTOOLCHAIN=local \
+    go build -mod=readonly -trimpath -ldflags='-s -w' -o /managed-bootstrap ./cmd/managed-bootstrap
 # The runtime contains neither Go nor module manifests: its SBOM describes the
 # compiled binary, not the parent's unused module graph.
 COPY bootstrap /bootstrap
@@ -35,6 +41,7 @@ RUN printf '%s\n' {{ .Bootstrap.Packages.RepositoryArguments }} >/etc/apk/reposi
     && apk add --no-cache {{ .Bootstrap.Packages.Specs }}
 
 COPY --from=migrate-builder /migrate /usr/local/bin/migrate
+COPY --from=migrate-builder /managed-bootstrap /usr/local/bin/managed-bootstrap
 
 # Only the staged bootstrap artifact and the runtime-access program enter the
 # image. The build context is the whole service directory, which also holds
