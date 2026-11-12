@@ -222,8 +222,10 @@ func openCloudSQLPool(ctx context.Context, connection string, profile Connection
 		return nil, nil, fmt.Errorf("start the Cloud SQL connector: %w", err)
 	}
 	instanceName := profile.Instance
+	// No per-dial option: the dialer's defaults (private IP, IAM login) are
+	// the whole policy, and a dial that passed its own could widen them.
 	poolConfig.ConnConfig.DialFunc = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return dialer.Dial(ctx, instanceName, cloudsqlconn.WithPrivateIP())
+		return dialer.Dial(ctx, instanceName)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
@@ -327,7 +329,7 @@ func CloudSQLSocket(ctx context.Context, parent, instanceName string) (string, f
 			go func() {
 				defer open.Done()
 				defer client.Close()
-				server, err := dialer.Dial(serving, instanceName, cloudsqlconn.WithPrivateIP())
+				server, err := dialer.Dial(serving, instanceName)
 				if err != nil {
 					return
 				}

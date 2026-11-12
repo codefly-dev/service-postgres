@@ -175,8 +175,10 @@ func TestCloudSQLConnectorLogsInAsTheWorkloadOnly(t *testing.T) {
 	if !errors.Is(err, ErrConnectionUnavailable) {
 		t.Fatalf("a refused dial reported %v", err)
 	}
-	if len(dialer.instances) == 0 || dialer.instances[0] != testInstance || dialer.options != 1 {
-		t.Fatalf("dialled %v with %d options, want %s over private IP", dialer.instances, dialer.options, testInstance)
+	// Zero per-dial options: the dialer's defaults decide the transport, and no
+	// dial can widen them (a per-dial public-IP option would override them).
+	if len(dialer.instances) == 0 || dialer.instances[0] != testInstance || dialer.options != 0 {
+		t.Fatalf("dialled %v with %d per-dial options, want %s through the dialer's defaults alone", dialer.instances, dialer.options, testInstance)
 	}
 	if dialer.closed != 1 {
 		t.Fatalf("connector closed %d times after a failed boot", dialer.closed)
@@ -248,8 +250,8 @@ func TestCloudSQLSocketIsPrivateAndDialsTheInstance(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("the socket directory outlived its closer")
 	}
-	if len(dialer.instances) != 1 || dialer.instances[0] != testInstance || dialer.options != 1 || dialer.closed != 1 {
-		t.Fatalf("dialled %v with %d options, closed %d times", dialer.instances, dialer.options, dialer.closed)
+	if len(dialer.instances) != 1 || dialer.instances[0] != testInstance || dialer.options != 0 || dialer.closed != 1 {
+		t.Fatalf("dialled %v with %d per-dial options, closed %d times", dialer.instances, dialer.options, dialer.closed)
 	}
 }
 
