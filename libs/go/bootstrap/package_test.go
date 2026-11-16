@@ -86,7 +86,7 @@ func TestPackageRejectsDriftAndAmbiguousInputs(t *testing.T) {
 				h := sha256.Sum256(data)
 				b.PlanSHA256 = hex.EncodeToString(h[:])
 			}
-			_, tmp, e := snapshot(dir, b)
+			_, tmp, e := snapshot(dir, b, false)
 			if tmp != "" {
 				os.RemoveAll(tmp)
 			}
@@ -107,7 +107,7 @@ func TestPackageRejectsDriftAndAmbiguousInputs(t *testing.T) {
 func TestPackageAcceptsABindingWithWritersOnly(t *testing.T) {
 	dir, _, b := packageFixture(t, "CREATE TABLE example(id integer);")
 	b.ReadOnlyPrincipals = nil
-	_, tmp, e := snapshot(dir, b)
+	_, tmp, e := snapshot(dir, b, false)
 	if tmp != "" {
 		os.RemoveAll(tmp)
 	}
@@ -115,7 +115,7 @@ func TestPackageAcceptsABindingWithWritersOnly(t *testing.T) {
 		t.Fatalf("a binding with a writer and no reader was refused: %v", e)
 	}
 	b.ReadOnlyPrincipals, b.ReadWritePrincipals = []string{"bootstrap_reader"}, nil
-	if _, tmp, e = snapshot(dir, b); e != nil {
+	if _, tmp, e = snapshot(dir, b, false); e != nil {
 		t.Fatalf("a binding with a reader and no writer was refused: %v", e)
 	} else if tmp != "" {
 		os.RemoveAll(tmp)
@@ -124,7 +124,7 @@ func TestPackageAcceptsABindingWithWritersOnly(t *testing.T) {
 
 func TestSnapshotRetainsVerifiedBytes(t *testing.T) {
 	dir, _, b := packageFixture(t, "SELECT 1;")
-	_, tmp, e := snapshot(dir, b)
+	_, tmp, e := snapshot(dir, b, false)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -142,7 +142,7 @@ func TestReaderRolePackageVersions(t *testing.T) {
 			dir, p, b := packageFixture(t, "SELECT 1;")
 			p.ContractVersion, p.Access.ReadOnlyRoles = version, roles
 			writePlan(t, dir, p, &b)
-			_, tmp, err := snapshot(dir, b)
+			_, tmp, err := snapshot(dir, b, false)
 			if tmp != "" {
 				os.RemoveAll(tmp)
 			}
