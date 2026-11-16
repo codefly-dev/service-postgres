@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -50,17 +49,6 @@ func TestBootstrapImageLockDigestIgnoresDocumentFormatting(t *testing.T) {
 	require.Equal(t, bootstrapLock.LockDigest, fromIndented.LockDigest)
 }
 
-// The runtime needs psql, but no download or compiler package.
-func TestBootstrapImageLockPinsBuildAndCommandTooling(t *testing.T) {
-	pinned := map[string]string{}
-	for _, entry := range bootstrapLock.Packages.Pinned {
-		pinned[entry.Name] = entry.Version
-	}
-	require.Contains(t, pinned, "postgresql17-client")
-	require.NotContains(t, pinned, "curl", "source build needs no runtime download tool")
-	require.NotContains(t, pinned, "wget", "source build needs no runtime download tool")
-}
-
 func TestBootstrapProvenanceExposesEveryResolvedInput(t *testing.T) {
 	provenance := bootstrapLock.Provenance()
 	require.NotEmpty(t, provenance)
@@ -82,9 +70,6 @@ func TestBootstrapProvenanceExposesEveryResolvedInput(t *testing.T) {
 		values[entry.Label] = entry.Value
 	}
 	require.Equal(t, bootstrapLock.LockDigest, values["dev.codefly.bootstrap.lock-digest"])
-	require.Equal(t, bootstrapLock.Base.Reference(), values["dev.codefly.bootstrap.base"])
-	require.Equal(t, bootstrapLock.Packages.Specs(), values["dev.codefly.bootstrap.apk-packages"])
-	require.Equal(t, strings.Join(bootstrapLock.Packages.Repositories, " "), values["dev.codefly.bootstrap.apk-repositories"])
 	require.Equal(t, bootstrapLock.Migrate.Toolchain, values["dev.codefly.bootstrap.migrate-toolchain"])
 	require.Equal(t, bootstrapLock.Migrate.GoModSHA256(), values["dev.codefly.bootstrap.migrate-go-mod"])
 	require.Equal(t, bootstrapLock.Migrate.GoSumSHA256(), values["dev.codefly.bootstrap.migrate-go-sum"])
@@ -104,53 +89,16 @@ func TestParseBootstrapImageLockRejectsUnverifiableInput(t *testing.T) {
 		error string
 	}{
 		{
-			name:  "missing base digest",
-			amend: func(document map[string]any) { lockBase(document)["digest"] = "" },
-			error: "bootstrap base image digest must be a sha256 digest",
+			// The image is FROM scratch and installs no package: a lock naming a
+			// base or packages would be a second, unread source of truth.
+			name:  "a base of its own",
+			amend: func(document map[string]any) { document["base"] = map[string]any{"image": "alpine"} },
+			error: `parse bootstrap image lock: json: unknown field "base"`,
 		},
 		{
-			name:  "base pinned by tag instead of digest",
-			amend: func(document map[string]any) { lockBase(document)["digest"] = "3.21.7" },
-			error: "bootstrap base image digest must be a sha256 digest",
-		},
-		{
-			name:  "truncated base digest",
-			amend: func(document map[string]any) { lockBase(document)["digest"] = "sha256:48b0309ca019d89d" },
-			error: "bootstrap base image digest must be a sha256 digest",
-		},
-		{
-			name:  "missing base version",
-			amend: func(document map[string]any) { lockBase(document)["version"] = "" },
-			error: "bootstrap base image version is required",
-		},
-		{
-			name: "plaintext package repository",
-			amend: func(document map[string]any) {
-				lockPackages(document)["repositories"] = []any{"http://dl-cdn.alpinelinux.org/alpine/v3.21/main"}
-			},
-			error: `bootstrap apk repository must be an https URL, got "http://dl-cdn.alpinelinux.org/alpine/v3.21/main"`,
-		},
-		{
-			name:  "package repository left on the previous release branch",
-			amend: func(document map[string]any) { lockBase(document)["version"] = "3.22.1" },
-			error: `bootstrap apk repository "https://dl-cdn.alpinelinux.org/alpine/v3.21/main" does not serve the locked Alpine v3.22 branch`,
-		},
-		{
-			name: "package without an exact version",
-			amend: func(document map[string]any) {
-				lockPackages(document)["pinned"] = []any{map[string]any{"name": "curl", "version": ""}}
-			},
-			error: "bootstrap apk package curl must pin an exact version",
-		},
-		{
-			name:  "no package repositories",
-			amend: func(document map[string]any) { lockPackages(document)["repositories"] = []any{} },
-			error: "bootstrap apk repositories are required",
-		},
-		{
-			name:  "no pinned packages",
-			amend: func(document map[string]any) { lockPackages(document)["pinned"] = []any{} },
-			error: "bootstrap apk packages are required",
+			name:  "apk packages",
+			amend: func(document map[string]any) { document["packages"] = map[string]any{"pinned": []any{}} },
+			error: `parse bootstrap image lock: json: unknown field "packages"`,
 		},
 		{
 			name:  "migrate pinned to a moving reference",
@@ -199,33 +147,18 @@ func committedBootstrapLockDocument(t *testing.T) map[string]any {
 	return document
 }
 
-func lockBase(document map[string]any) map[string]any {
-	return document["base"].(map[string]any)
-}
-
-func lockPackages(document map[string]any) map[string]any {
-	return document["packages"].(map[string]any)
-}
-
 func lockMigrate(document map[string]any) map[string]any {
 	return document["migrate"].(map[string]any)
 }
 
 func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
-	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{
-		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
-	})
+	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{})
 
-	require.Contains(t, dockerfile, "FROM "+bootstrapLock.Base.Reference())
-	require.NotContains(t, dockerfile, bootstrapLock.Base.Image+":", "base image must not resolve through a mutable tag")
-
-	for _, repository := range bootstrapLock.Packages.Repositories {
-		require.Contains(t, dockerfile, `"`+repository+`"`)
-	}
-	require.Contains(t, dockerfile, ">/etc/apk/repositories")
-	// The apk line installs the locked set and nothing else: an unpinned package
-	// appended to it would ship whatever the repository serves that day.
-	require.Regexp(t, `(?m)apk add --no-cache `+regexp.QuoteMeta(bootstrapLock.Packages.Specs())+`$`, dockerfile)
+	require.Contains(t, dockerfile, "\nFROM scratch\n")
+	// Nothing resolves from a package index: an index serves only the newest
+	// revision of a package, so a pin breaks the build and no pin is not a lock.
+	require.NotRegexp(t, `(?m)^RUN .*\b(apk|apt-get)\b`, dockerfile)
+	require.Contains(t, dockerfile, "USER 65534:65534")
 
 	require.Contains(t, dockerfile, "FROM --platform=$BUILDPLATFORM "+bootstrapLock.Migrate.Toolchain+" AS migrate-builder")
 	require.NotContains(t, dockerfile, "releases/download")
@@ -253,19 +186,18 @@ func TestBootstrapDockerfileLocksEveryInput(t *testing.T) {
 // failing at render with a nil dereference.
 func TestBootstrapDockerfileRendersFromZeroValueTemplating(t *testing.T) {
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", DockerTemplating{})
-	require.Contains(t, dockerfile, "FROM "+bootstrapLock.Base.Reference())
-	require.Contains(t, dockerfile, "apk add --no-cache "+bootstrapLock.Packages.Specs())
+	require.Contains(t, dockerfile, "\nFROM scratch\n")
+	require.Contains(t, dockerfile, "FROM --platform=$BUILDPLATFORM "+bootstrapLock.Migrate.Toolchain)
 }
 
 // TestBootstrapImageBuildsLockedInputsPerArchitecture builds the image the
-// template renders and reads back what the locked inputs actually resolved to: the
-// base release, the pinned client version, and a migrate binary that executes on
-// the target architecture and reports the locked version.
+// template renders and reads back what it carries: a migrate binary that executes
+// on the target architecture and reports the locked version, the runner, and
+// nothing else — no shell to run anything else with.
 func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 	requireDocker(t)
 	context := bootstrapBuildContext(t)
 
-	machines := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}
 	for _, architecture := range bootstrapArchitectures {
 		t.Run(architecture, func(t *testing.T) {
 			platform := "linux/" + architecture
@@ -285,20 +217,15 @@ func TestBootstrapImageBuildsLockedInputsPerArchitecture(t *testing.T) {
 				require.Equal(t, entry.Value, labels[entry.Label])
 			}
 
-			machine, named := machines[architecture]
-			require.True(t, named, "no expected machine name for %s", architecture)
-
 			resolved, err := exec.Command("docker", "run", "--rm", "--platform", platform,
-				"--entrypoint", "sh", tag, "-c",
-				"migrate -version; uname -m; cat /etc/alpine-release; psql --version; if command -v curl; then echo CURL-SHIPPED; fi",
-			).CombinedOutput()
+				"--entrypoint", "/usr/local/bin/migrate", tag, "-version").CombinedOutput()
 			require.NoError(t, err, string(resolved))
 			require.Contains(t, string(resolved), strings.TrimPrefix(bootstrapLock.Migrate.Version, "v"))
-			require.Contains(t, string(resolved), machine)
-			require.Contains(t, string(resolved), bootstrapLock.Base.Version)
-			client, _, _ := strings.Cut(bootstrapPinnedVersion(t, "postgresql17-client"), "-r")
-			require.Contains(t, string(resolved), "(PostgreSQL) "+client)
-			require.NotContains(t, string(resolved), "CURL-SHIPPED", "no download tool is installed into the image")
+			inspect, err = exec.Command("docker", "image", "inspect", tag, "--format", "{{.Architecture}} {{.Config.User}}").Output()
+			require.NoError(t, err)
+			require.Equal(t, architecture+" 65534:65534", strings.TrimSpace(string(inspect)))
+			_, err = exec.Command("docker", "run", "--rm", "--platform", platform, "--entrypoint", "/bin/sh", tag, "-c", "true").CombinedOutput()
+			require.Error(t, err, "the image ships no shell")
 		})
 	}
 }
@@ -390,25 +317,16 @@ func TestBootstrapMigrateRejectsTamperedModuleInputs(t *testing.T) {
 }
 
 // bootstrapBuildContext stages a build context for the bootstrap Dockerfile: the
-// rendered Dockerfile plus the bootstrap.sql and runtime-access.sql it COPYs.
+// rendered Dockerfile plus the staged tree it COPYs.
 func bootstrapBuildContext(t *testing.T) string {
 	t.Helper()
 	context := t.TempDir()
-	parameters := DockerTemplating{
-		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
-		RuntimeAccessLockID:            runtimeAccessLockID,
-		ReadinessTimeoutSeconds:        defaultBootstrapReadinessSeconds,
-	}
+	parameters := DockerTemplating{ReadinessTimeoutSeconds: defaultBootstrapReadinessSeconds}
 	dockerfile := renderBuilderTemplate(t, "templates/builder/Dockerfile.tmpl", parameters)
 	require.NoError(t, os.WriteFile(filepath.Join(context, "Dockerfile"), []byte(dockerfile), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(context, "runtime-access.sql"), []byte("SELECT 1;\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(context, "bootstrap.sql"),
-		[]byte(renderBootstrapTemplate(t, parameters)), 0o644))
 	staged := filepath.Join(context, bootstrapDirectory)
 	require.NoError(t, os.MkdirAll(staged, 0o755))
 	require.NoError(t, stageBootstrapMigrate(staged))
-	require.NoError(t, os.WriteFile(filepath.Join(staged, "bootstrap.sh"),
-		[]byte(renderStagedTemplate(t, "templates/bootstrap/bootstrap.sh.tmpl", parameters)), 0o644))
 	return context
 }
 
@@ -436,17 +354,6 @@ func bootstrapMigrateBuildScript(t *testing.T, dockerfile string) string {
 	return scripts[0]
 }
 
-func bootstrapPinnedVersion(t *testing.T, name string) string {
-	t.Helper()
-	for _, pinned := range bootstrapLock.Packages.Pinned {
-		if pinned.Name == name {
-			return pinned.Version
-		}
-	}
-	t.Fatalf("bootstrap lock does not pin %s", name)
-	return ""
-}
-
 func requireDocker(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("docker"); err != nil {
@@ -468,7 +375,7 @@ func requireDocker(t *testing.T) {
 func requireDockerPlatform(t *testing.T, platform string) {
 	t.Helper()
 	probe := exec.Command("docker", "build", "--platform", platform, "--quiet", "-")
-	probe.Stdin = strings.NewReader("FROM " + bootstrapLock.Base.Reference() + "\nRUN true\n")
+	probe.Stdin = strings.NewReader("FROM " + bootstrapLock.Migrate.Toolchain + "\nRUN true\n")
 	output, err := probe.CombinedOutput()
 	if err == nil {
 		return

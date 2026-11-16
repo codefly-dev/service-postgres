@@ -1,8 +1,7 @@
-# Pinning the bootstrap image by digest stops it drifting, which also stops it
-# receiving upstream fixes. Only one of its inputs announces staleness on its own: a
-# replaced apk package version fails the build. A base digest the branch has moved
-# past, and a newer migrate release, never fail anything — so this reports them on a
-# schedule instead of gating pull requests on unrelated upstream releases.
+# Pinning the bootstrap image's migrate build stops it drifting, which also stops it
+# receiving upstream fixes. A Go builder digest upstream has moved past, and a newer
+# migrate release, never fail anything — so this reports them on a schedule instead
+# of gating pull requests on unrelated upstream releases.
 name: bootstrap-lock-freshness
 
 on:
@@ -18,8 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
       - name: Check bootstrap image lock against upstream
         run: .github/scripts/update-bootstrap-lock.sh --check

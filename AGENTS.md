@@ -145,8 +145,12 @@ variables only the qualify script supplies.
 - Bootstrap migrate is source-built from the maintained parent module; see
   `docs/bootstrap-migrate.md`. Inspect the binary graph, not just `go.mod`.
 - **The two image locks move by different mechanisms.** `bootstrap-image.json`
-  is written by a script; `runtime-image.json` is hand-edited and only verified.
-  Neither is a value to guess — see the skills below.
+  (the migrate source build) is written by a script; `runtime-image.json` is
+  hand-edited and only verified. Neither is a value to guess — see the skills below.
+- **The bootstrap image is FROM scratch: two static binaries, no shell.** The
+  runner (`libs/go/bootstrap.Run`) migrates and reconciles access for a managed
+  store and an in-cluster one alike; nothing is installed from a package index,
+  which keeps only the newest `-rN` and so breaks any revision pin the day it moves.
 - **A pull request never moves the shared runtime tag.** It publishes by digest;
   only a push to `main` tags.
 - **CI's own shape is under test.** `workflow_test.go` asserts step order and
@@ -160,8 +164,8 @@ Loaded on demand rather than carried here — `.claude/skills/`:
 
 - `runtime-image-relock` — the Dockerfile or one of its pins changed, and the
   digest in `runtime-image.json` has to move with it.
-- `bootstrap-image-lock` — a build fails "unable to select packages", or the
-  weekly freshness check reports drift.
+- `bootstrap-image-lock` — migrate or its Go toolchain moves, or the weekly
+  freshness check reports drift.
 - `standalone-runtime-module` — a change touches `libs/go`, alone or together
   with the parent module.
 

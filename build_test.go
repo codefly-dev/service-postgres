@@ -7,10 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
 
 	"github.com/codefly-dev/core/agents/services"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
@@ -141,10 +142,9 @@ func TestBuildEmitsRecipeToOutputDirectory(t *testing.T) {
 	// The rendered tree is a self-contained context: a consumer with no codefly
 	// toolchain can build it from the emitted files alone.
 	require.FileExists(t, filepath.Join(outputDirectory, "builder", "Dockerfile"))
-	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "bootstrap.sh"))
-	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "extensions.sql"))
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "plan.json"))
-	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources.sha256"))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", bootstrap.SelfHostedFile))
+	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "migrate", "cmd", "managed-bootstrap", "main.go"))
 	require.Equal(t, "bootstrap/dockerignore", recipe.GetDockerignore(),
 		"the build context is the service directory, so the recipe must declare an ignore that keeps local secrets out of it")
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
@@ -153,39 +153,15 @@ func TestBuildEmitsRecipeToOutputDirectory(t *testing.T) {
 	// The CLI resolves the recipe's "." context to the service directory, so
 	// everything the Dockerfile COPYs root-relative must also sit at the service
 	// directory root — otherwise the COPY the CLI runs fails to resolve.
-	require.FileExists(t, filepath.Join(builder.Location, "runtime-access.sql"))
-	require.FileExists(t, filepath.Join(builder.Location, "bootstrap", "bootstrap.sh"))
+	require.FileExists(t, filepath.Join(builder.Location, "bootstrap", "plan.json"))
 	require.FileExists(t, filepath.Join(builder.Location, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
-
-	// runtime-access.sql is also rendered into the recipe tree (never under
-	// builder/) so the emitted artifact stays a self-contained context.
-	require.FileExists(t, filepath.Join(outputDirectory, "runtime-access.sql"))
-	require.NoFileExists(t, filepath.Join(outputDirectory, "builder", "runtime-access.sql"))
+	// The runner applies no generated SQL: nothing is rendered beside the tree.
+	require.NoFileExists(t, filepath.Join(builder.Location, "runtime-access.sql"))
+	require.NoFileExists(t, filepath.Join(outputDirectory, "runtime-access.sql"))
 
 	// The plan the agent emits verifies against the tree it wrote, so the CLI
 	// builds it without the recipe drifting from the inventory.
 	require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, plan))
-}
-
-// TestFactoryScaffoldsGitignoreForGeneratedRuntimeAccess covers the file the
-// build writes into the service directory on every run: Create must scaffold a
-// .gitignore that keeps the generated runtime-access.sql out of version control,
-// so a consumer's `codefly build service` does not leave untracked noise beside
-// the committed migrations/. This also guards the `all:` embed — a plain
-// //go:embed drops the .gitignore dotfile and the render would silently produce
-// nothing.
-func TestFactoryScaffoldsGitignoreForGeneratedRuntimeAccess(t *testing.T) {
-	ctx := context.Background()
-	builder := newBuildTestBuilder(t)
-
-	require.NoError(t, builder.Templates(ctx,
-		create{DatabaseName: "test", TableName: "postgres"},
-		services.WithFactory(factoryFS)))
-
-	data, err := os.ReadFile(filepath.Join(builder.Location, ".gitignore"))
-	require.NoError(t, err, "Create must scaffold a .gitignore at the service root")
-	require.Contains(t, string(data), "/runtime-access.sql")
-	require.Contains(t, string(data), "/bootstrap.sql")
 }
 
 func TestBuildRecipeOmitsMigrationsWhenDisabled(t *testing.T) {
@@ -201,13 +177,7 @@ func TestBuildRecipeOmitsMigrationsWhenDisabled(t *testing.T) {
 	// Extension-only bootstrap: the artifact is still emitted and the image
 	// still reconciles runtime grants, but no lineage is staged or applied.
 	require.NoDirExists(t, filepath.Join(outputDirectory, "bootstrap", "sources"))
-	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "extensions.sql"))
-	require.FileExists(t, filepath.Join(outputDirectory, "runtime-access.sql"))
-	program, err := os.ReadFile(filepath.Join(outputDirectory, "bootstrap", "bootstrap.sh"))
-	require.NoError(t, err)
-	require.NotContains(t, readRendered(t, outputDirectory, "bootstrap.sql"), "/usr/local/bin/migrate")
-	require.Contains(t, string(program), "/app/bootstrap.sql")
-
+	require.NotEmpty(t, readPlanArtifact(t, outputDirectory).Extensions)
 	require.Empty(t, readPlanArtifact(t, outputDirectory).Lineages)
 
 	require.NotNil(t, response.GetResult().GetDockerBuildPlan())
@@ -253,7 +223,7 @@ func TestBuildRecipePurgesPreexistingOutputDirectory(t *testing.T) {
 // bootstrap Job.
 func TestBuildRecipeTreatsOwnSourceAbsenceAndEmptinessAlike(t *testing.T) {
 	ctx := context.Background()
-	programs := map[string]string{}
+	plans := map[string]string{}
 	for name, prepare := range map[string]func(*Builder){
 		"absent": func(builder *Builder) {
 			require.NoError(t, os.RemoveAll(builder.Local("migrations")))
@@ -271,15 +241,11 @@ func TestBuildRecipeTreatsOwnSourceAbsenceAndEmptinessAlike(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
-		program, err := os.ReadFile(filepath.Join(outputDirectory, "bootstrap", "bootstrap.sh"))
-		require.NoError(t, err)
-		require.NotContains(t, readRendered(t, outputDirectory, "bootstrap.sql"), "/usr/local/bin/migrate", name)
-		require.Contains(t, string(program), "/app/bootstrap.sql", name)
 		require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
 		require.Empty(t, readPlanArtifact(t, outputDirectory).Lineages, name)
-		programs[name] = string(program)
+		plans[name] = string(mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "plan.json")))
 	}
-	require.Equal(t, programs["absent"], programs["empty"],
+	require.Equal(t, plans["absent"], plans["empty"],
 		"an absent and an empty own migrations directory must bootstrap identically")
 }
 
@@ -304,13 +270,6 @@ func TestBuildStagesSiblingSourcesIntoTheBuildContext(t *testing.T) {
 		require.FileExists(t, filepath.Join(contextRoot, "bootstrap", "sources", "01-api", "1_api.up.sql"))
 		require.FileExists(t, filepath.Join(contextRoot, "bootstrap", "sources", "02-billing", "1_billing.up.sql"))
 	}
-
-	// The migrate invocations live in the locked psql session, one per lineage.
-	bootstrapSQL := readRendered(t, outputDirectory, "bootstrap.sql")
-	require.Contains(t, bootstrapSQL, `-path /app/bootstrap/sources/01-api`)
-	require.Contains(t, bootstrapSQL, `x-migrations-table=schema_migrations_api`)
-	require.Contains(t, bootstrapSQL, `-path /app/bootstrap/sources/02-billing`)
-	require.Contains(t, bootstrapSQL, `x-migrations-table=schema_migrations_billing`)
 
 	artifact := readPlanArtifact(t, outputDirectory)
 	require.Len(t, artifact.Lineages, 3)
@@ -484,9 +443,6 @@ func TestBuildStagesModesIndependentOfUmask(t *testing.T) {
 		require.Equal(t, expected, info.Mode().Perm(), path)
 		return nil
 	}))
-	runtimeAccess, err := os.Stat(filepath.Join(outputDirectory, "runtime-access.sql"))
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o644), runtimeAccess.Mode().Perm())
 }
 
 // TestBuildArtifactIsIdenticalAcrossCheckouts covers the published identity: two
@@ -515,36 +471,6 @@ func TestBuildArtifactIsIdenticalAcrossCheckouts(t *testing.T) {
 	require.Equal(t, firstDigest, secondDigest, "the recipe digest depends on where the sources happen to live")
 	require.NotContains(t, firstPlan, t.TempDir())
 	require.NotContains(t, firstPlan, "declared-path")
-}
-
-// TestBuildChecksumManifestCoversEveryStagedSource is what makes a drifted or
-// partly written context loud: the bootstrap program verifies this manifest
-// before it applies anything.
-func TestBuildChecksumManifestCoversEveryStagedSource(t *testing.T) {
-	ctx := context.Background()
-	builder := newBuildTestBuilder(t)
-	writeMigration(t, filepath.Join(filepath.Dir(builder.Location), "api", "migrations"), "1_api.up.sql")
-	builder.Settings.MigrationSources = []MigrationSource{{Name: "api"}}
-	outputDirectory := t.TempDir()
-
-	response, err := builder.Build(ctx, buildRequest(outputDirectory))
-	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
-
-	manifest := string(mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "sources.sha256")))
-	for _, staged := range []string{
-		"sources/00-store/1_create_table.up.sql",
-		"sources/00-store/1_create_table.down.sql",
-		"sources/01-api/1_api.up.sql",
-	} {
-		require.Contains(t, manifest, staged)
-	}
-	for _, line := range strings.Split(strings.TrimSpace(manifest), "\n") {
-		digest, path, found := strings.Cut(line, "  ")
-		require.True(t, found, line)
-		require.Len(t, digest, 64, "sha256sum -c expects a bare hex digest")
-		require.Equal(t, "sha256:"+digest, mustFileDigest(t, filepath.Join(outputDirectory, "bootstrap", path)))
-	}
 }
 
 func mustFileDigest(t *testing.T, path string) string {
@@ -576,7 +502,7 @@ func TestBuildRecipeLocksBootstrapInputs(t *testing.T) {
 
 	dockerfile, err := os.ReadFile(filepath.Join(outputDirectory, "builder", "Dockerfile"))
 	require.NoError(t, err)
-	require.Contains(t, string(dockerfile), "FROM "+bootstrapLock.Base.Reference())
+	require.Contains(t, string(dockerfile), "\nFROM scratch\n")
 }
 
 // TestBuildRecipeResolvesIdenticalInputsAcrossEmissions builds the recipe twice
@@ -678,7 +604,6 @@ func TestBuildRecipeContractOverGRPC(t *testing.T) {
 				require.Equal(t, "caller-owned", string(mustReadFile(t, marker)))
 				if output != "recipe" {
 					require.NoDirExists(t, filepath.Join(builder.Location, "bootstrap"))
-					require.NoFileExists(t, filepath.Join(builder.Location, "runtime-access.sql"))
 					entries, err := os.ReadDir(directory)
 					require.NoError(t, err)
 					require.Empty(t, entries)

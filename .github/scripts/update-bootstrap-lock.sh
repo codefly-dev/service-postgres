@@ -2,34 +2,16 @@
 
 # Moves bootstrap-image.json forward: the lock the bootstrap image builds from.
 #
-#   .github/scripts/update-bootstrap-lock.sh                 # re-resolve what the lock already targets
-#   .github/scripts/update-bootstrap-lock.sh --check         # report drift, write nothing, exit 1 if stale
-#   ALPINE_BRANCH=v3.22 .github/scripts/update-bootstrap-lock.sh
-#   MIGRATE_GO_IMAGE=golang:1.27.3-alpine3.24 .github/scripts/update-bootstrap-lock.sh
-#   BOOTSTRAP_PACKAGES="postgresql17-client" .github/scripts/update-bootstrap-lock.sh
+#   .github/scripts/update-bootstrap-lock.sh            # re-resolve what the lock already targets
+#   .github/scripts/update-bootstrap-lock.sh --check    # report drift, write nothing, exit 1 if stale
+#   MIGRATE_GO_IMAGE=golang:1.27.4-alpine3.23 .github/scripts/update-bootstrap-lock.sh
 #
-# Every value is resolved from upstream, never authored here: the base digest comes
-# from the registry, package versions from inside the digest-pinned base on both
-# architectures, and the Go toolchain manifest digest from the registry.
-# Migrate's version comes from go.mod. What the run targets — Alpine branch, package set
-# — is read out of the current lock, so a plain rerun re-resolves the lock's own
-# intent instead of a default that could silently revert someone's bump. The
-# environment variables are the only way to change what is targeted, the package
-# set (BOOTSTRAP_PACKAGES, space-separated) included. Run
-# `go test ./...` afterwards and commit the diff.
-#
-# Why pinning packages this way, and what it costs:
-#
-# Alpine publishes no immutable package snapshot — a release branch keeps only the
-# newest -rN of each package. Pinning exact versions therefore trades availability
-# for integrity: once upstream replaces a pinned package, the build fails
-# with "unable to select packages" instead of silently installing different bytes.
-# That failure is the signal to run this script, which is also how a security fix
-# reaches the image: rerun it, the resolved versions move, and the lock records what
-# the next build will install. That signal covers pinned packages only, so the
-# bootstrap-lock-freshness workflow runs --check on a schedule to catch the inputs
-# that never fail a build: a base digest the branch has moved past, and a newer
-# migrate release.
+# The lock pins only the source build: migrate's version comes from go.mod and the
+# Go builder's manifest digest from the registry (update-bootstrap-migrate.py). The
+# image is FROM scratch and installs no package, so there is no package pin here to
+# go stale. A pinned migrate source keeps compiling forever, so a newer upstream
+# release never fails a build; the bootstrap-lock-freshness workflow runs --check
+# on a schedule to report it instead.
 
 set -euo pipefail
 
@@ -42,87 +24,9 @@ elif [[ -n "${1:-}" ]]; then
 fi
 
 LOCK="$(git rev-parse --show-toplevel)/bootstrap-image.json"
-
-# The lock is the source of truth for what this run targets; the environment only
-# overrides it deliberately.
-lock_branch=$(jq -er '.packages.repositories[0] | capture("/(?<branch>v[0-9]+\\.[0-9]+)/").branch' "$LOCK")
-ALPINE_BRANCH=${ALPINE_BRANCH:-$lock_branch}
 migrate=$(python3 "$(dirname "$0")/update-bootstrap-migrate.py" --resolve)
 MIGRATE_VERSION=$(jq -er '.version' <<<"$migrate")
-if [[ -n "${BOOTSTRAP_PACKAGES:-}" ]]; then
-  read -r -a PACKAGES <<<"$BOOTSTRAP_PACKAGES"
-else
-  mapfile -t PACKAGES < <(jq -er '.packages.pinned[].name' "$LOCK")
-fi
-ARCHITECTURES=(amd64 arm64)
-# A package name reaches a shell inside the resolver container, so it is held to
-# apk's own name shape here rather than trusted as typed.
-for package in "${PACKAGES[@]}"; do
-  if [[ ! "$package" =~ ^[a-z0-9][a-z0-9._+-]*$ ]]; then
-    echo "not an apk package name: ${package@Q}" >&2
-    exit 1
-  fi
-done
-if [[ "${#PACKAGES[@]}" -eq 0 || "${#ARCHITECTURES[@]}" -eq 0 ]]; then
-  echo "could not read the package or architecture set from $LOCK" >&2
-  exit 1
-fi
-
-# One repository per apk repository line, all on the targeted branch. Additional
-# repositories in the lock are preserved by path, with the branch re-resolved.
-mapfile -t REPOSITORIES < <(jq -er --arg branch "$ALPINE_BRANCH" \
-  '.packages.repositories[] | sub("/v[0-9]+\\.[0-9]+/"; "/" + $branch + "/")' "$LOCK")
-if [[ "${#REPOSITORIES[@]}" -eq 0 ]]; then
-  echo "could not read the repository set from $LOCK" >&2
-  exit 1
-fi
-
-resolve_base_digest() {
-  local tag="alpine:${ALPINE_BRANCH#v}"
-  docker buildx imagetools inspect "$tag" |
-    awk '$1 == "Digest:" { print $2; exit }'
-}
-
-# The version each architecture resolves to must agree: one lock describes the
-# manifest list, so a per-architecture difference has to be resolved upstream
-# rather than averaged over here.
-resolve_package_versions() {
-  local base=$1
-  local resolved=""
-  local architecture
-  for architecture in "${ARCHITECTURES[@]}"; do
-    local versions
-    versions=$(docker run --rm --platform "linux/${architecture}" "$base" sh -c "
-      set -eu
-      printf '%s\n' ${REPOSITORIES[*]@Q} >/etc/apk/repositories
-      apk update >/dev/null
-      for package in ${PACKAGES[*]}; do
-        # apk policy lists candidates ascending, so the last one is what apk would
-        # install. Cross-check against the resolver itself: if a repository set ever
-        # makes these disagree, pinning the wrong candidate would silently lock an
-        # older, unpatched build.
-        candidate=\$(apk policy \"\$package\" | awk '/^  [^ ]/ { sub(/:\$/, \"\", \$1); version=\$1 } END { print version }')
-        selected=\$(apk add --simulate \"\$package\" | sed -n \"s/.* Installing \$package (\(.*\))\$/\1/p\" | tail -1)
-        if [ -z \"\$candidate\" ]; then
-          echo \"\$package: no candidate in the repositories\" >&2
-          exit 1
-        fi
-        if [ \"\$candidate\" != \"\$selected\" ]; then
-          echo \"\$package: apk policy offers \$candidate but apk would install \$selected\" >&2
-          exit 1
-        fi
-        printf '%s\n' \"\$candidate\"
-      done
-    ") || return 1
-    if [[ -z "$resolved" ]]; then
-      resolved=$versions
-    elif [[ "$resolved" != "$versions" ]]; then
-      echo "package versions differ across architectures; resolve upstream first" >&2
-      return 1
-    fi
-  done
-  printf '%s\n' "$resolved"
-}
+resolved=$(jq --argjson migrate "$migrate" '.migrate = $migrate' "$LOCK")
 
 # Reports a newer upstream migrate release. Nothing else signals it: the pinned
 # source version keeps compiling forever, so staleness here is invisible
@@ -141,44 +45,6 @@ report_migrate_staleness() {
   fi
   echo "migrate ${MIGRATE_VERSION} is the current upstream release"
 }
-
-digest=$(resolve_base_digest)
-if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "could not resolve the alpine:${ALPINE_BRANCH#v} digest" >&2
-  exit 1
-fi
-base="alpine@${digest}"
-
-release=$(docker run --rm "$base" cat /etc/alpine-release)
-
-# Command substitution, not process substitution: mapfile from <(…) discards the
-# producer's exit status, so a failed resolution would flow on as empty output.
-if ! versions_output=$(resolve_package_versions "$base"); then
-  exit 1
-fi
-mapfile -t versions <<<"$versions_output"
-if [[ "${#versions[@]}" -ne "${#PACKAGES[@]}" ]]; then
-  echo "could not resolve every package version from ${REPOSITORIES[*]}" >&2
-  exit 1
-fi
-
-pinned=$(jq -n '[]')
-for index in "${!PACKAGES[@]}"; do
-  pinned=$(jq --arg name "${PACKAGES[$index]}" --arg version "${versions[$index]}" \
-    '. + [{name: $name, version: $version}]' <<<"$pinned")
-done
-
-resolved=$(jq -n \
-  --arg version "$release" \
-  --arg digest "$digest" \
-  --argjson migrate "$migrate" \
-  --argjson repositories "$(jq -n --args '$ARGS.positional' "${REPOSITORIES[@]}")" \
-  --argjson pinned "$pinned" \
-  '{
-    base: {image: "alpine", version: $version, digest: $digest},
-    packages: {repositories: $repositories, pinned: $pinned},
-    migrate: $migrate
-  }')
 
 stale=false
 if ! diff -u "$LOCK" <(printf '%s\n' "$resolved") >/dev/null; then

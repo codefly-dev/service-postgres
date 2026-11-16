@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"net/url"
-	"strings"
 	"testing"
 
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	"github.com/codefly-dev/core/resources"
+	pgcontrol "github.com/codefly-dev/service-postgres/libs/go/controlplane"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,42 +50,12 @@ func TestExportedReadWriteConnectionCarriesNoRoleStartupParameter(t *testing.T) 
 // is what keeps appending a role from silently dropping every consumer back to
 // "permission denied" on its first write.
 func TestDefaultRuntimeReadWriteRoleIsStableWhenRolesAreAppended(t *testing.T) {
-	require.Equal(t, "", defaultRuntimeReadWriteRole(nil), "no configured role selects none")
-	require.Equal(t, "app_documents", defaultRuntimeReadWriteRole([]string{"app_documents"}))
-	require.Equal(t, "app_documents", defaultRuntimeReadWriteRole([]string{"app_documents", "app_worker"}),
+	require.Equal(t, "", pgcontrol.DefaultReadWriteRole(nil), "no configured role selects none")
+	require.Equal(t, "app_documents", pgcontrol.DefaultReadWriteRole([]string{"app_documents"}))
+	require.Equal(t, "app_documents", pgcontrol.DefaultReadWriteRole([]string{"app_documents", "app_worker"}),
 		"appending a role must not change the session default")
 	require.Equal(t, "app_documents",
-		defaultRuntimeReadWriteRole([]string{"app_documents", "app_worker", "app_backfill"}))
-	require.Equal(t, "app_worker", defaultRuntimeReadWriteRole([]string{"app_worker", "app_documents"}),
+		pgcontrol.DefaultReadWriteRole([]string{"app_documents", "app_worker", "app_backfill"}))
+	require.Equal(t, "app_worker", pgcontrol.DefaultReadWriteRole([]string{"app_worker", "app_documents"}),
 		"reordering the list is the way to change the default")
-}
-
-// The bootstrap Job runs runtime-access.sql in every deploy profile, including
-// the restricted one whose connection strings this agent never authors, so the
-// default role has to be established there too.
-func TestRuntimeAccessTemplateSetsTheDefaultReadWriteRole(t *testing.T) {
-	base := DockerTemplating{
-		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
-		ReadOnlyRole:                   "codefly_app_ro",
-		ReadWriteRole:                  "codefly_app_rw",
-		Schemas:                        []string{"public"},
-	}
-
-	delegated := base
-	delegated.ReadWriteRoles = []string{"app_documents", "app_worker"}
-	delegated.DefaultReadWriteRole = defaultRuntimeReadWriteRole(delegated.ReadWriteRoles)
-	accessSQL := renderRuntimeAccessTemplate(t, delegated)
-	require.Contains(t, accessSQL,
-		"SELECT format('ALTER ROLE %I SET role = %L', 'codefly_app_rw', 'app_documents')",
-		"the delegated login must default to the first configured role")
-	require.NotContains(t, accessSQL, "RESET role")
-	// The default is established after the memberships it depends on.
-	require.Greater(t, strings.Index(accessSQL, "SET role = %L"), strings.Index(accessSQL, "GRANT %I TO %I"),
-		"the default role must be set after the membership GRANTs")
-
-	generic := base
-	genericSQL := renderRuntimeAccessTemplate(t, generic)
-	require.Contains(t, genericSQL, "SELECT format('ALTER ROLE %I RESET role', 'codefly_app_rw')",
-		"without delegated roles the login must carry no default role")
-	require.NotContains(t, genericSQL, "SET role = %L")
 }

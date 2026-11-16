@@ -197,26 +197,6 @@ func lineageDigest(l schemaLineage) string {
 	return artifact.ContentDigest()
 }
 
-// stagedChecksums renders the staged content as a sha256sum manifest, relative
-// to the staging root. The bootstrap program verifies it before applying
-// anything: the image is built from the service directory by a later, separate
-// process, so a staged tree that drifted or was only partly written would
-// otherwise apply fewer migrations and report success.
-func (p *schemaPlan) stagedChecksums() []byte {
-	var manifest strings.Builder
-	for _, lineage := range p.lineages {
-		for _, file := range lineage.files {
-			manifest.WriteString(strings.TrimPrefix(file.digest, "sha256:"))
-			manifest.WriteString("  sources/")
-			manifest.WriteString(lineage.stage)
-			manifest.WriteString("/")
-			manifest.WriteString(file.name)
-			manifest.WriteString("\n")
-		}
-	}
-	return []byte(manifest.String())
-}
-
 func resolveSchemaAccess(settings *Settings) (schemaAccess, error) {
 	readOnlyRole, readWriteRole := runtimeRoleNames(settings.DatabaseName)
 	schemas, err := normalizedRuntimeSchemas(settings.RuntimeSchemas)
