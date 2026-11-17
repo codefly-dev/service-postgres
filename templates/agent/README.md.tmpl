@@ -39,7 +39,7 @@ On the Nix runtime every Postgres service of a run shares **one** Postgres serve
 - **Isolation.** Each database is closed to `PUBLIC`; only its own owner and runtime logins connect to it. No login of one service reaches another's database or the server's maintenance databases. Two services of one run declaring the same `database-name` are refused, naming both.
 - **Administration.** The server's bootstrap superuser exists only for the agent: it creates each database, its owner, and the declared extensions (pgvector is not a trusted extension). Its password is generated when the server is first initialized and is kept in an owner-only file beside the cluster; no service receives it.
 - **Endpoints.** The server listens on no TCP port, only on a private Unix socket. Each service's agent listens on the service's own allocated port, on loopback, and forwards every connection to that socket; authentication stays between the client and the server.
-- **Lifecycle.** The first service to start starts the server; each stop or destroy releases that service, and the last one stops the server, which frees its shared memory. A run killed without stopping leaves a server no live agent holds; the next service to start on the machine stops it. The cluster directory is retained per run, as each service's was.
+- **Lifecycle.** The first service to start starts the server; each stop or destroy releases that service, and the last one stops the server, which frees its shared memory. A run killed without stopping leaves a server no live agent holds; the next service to start on the machine stops it. The cluster directory is retained per run, as each service's was, unless the run is disposable (below).
 
 Native shutdown signals the recorded process birth through Core, so a reused PID is not a shutdown target.
 
@@ -56,8 +56,11 @@ Stop and destroy have one state-ownership contract, and it is the same on Docker
 | stop | released — the service's endpoint closes and, for the run's last service, the postmaster is terminated (Nix), or the container is stopped (Docker), freeing the published port | retained |
 | stop with `keep-running: true` (Docker only) | retained — the container stays up for the next invocation to reuse | retained |
 | destroy | released; the Docker container is also removed | retained |
+| destroy, in a disposable run (Nix) | released | removed with the run's last service |
 
-No operation deletes data. Dropping a database or a data directory needs an explicit authorization that the state is disposable and owned by the caller, which the stop and destroy calls do not carry — so a destroy is never read as permission to drop your database. A disposable reset arrives with the shared lifecycle contract in `codefly-dev/core#424`.
+No operation deletes your data. Dropping a database or a data directory needs an explicit authorization that the state is disposable and owned by the caller, which the stop and destroy calls do not carry — so a destroy is never read as permission to drop your database (`codefly-dev/core#424`).
+
+That authorization is the run's own: a **disposable run** — `codefly run --temporary-ports`, or a test's dependency stack, whose naming scope Codefly generated and nothing can run again — says so in the environment it hands the agent. Its Nix server directory (under the user cache directory, `codefly/postgres/run/`) is removed when the run ends: by the run itself once it has stopped its services, by the run's last service when it is destroyed, or, when the run was killed, by the next Postgres service to start on the machine or by `codefly clear`. A plain run, and a run under a naming scope you named, is never disposable: its data is retained through every operation.
 
 Stop releases only what the running invocation itself started. A session that never configured this service stops nothing.
 

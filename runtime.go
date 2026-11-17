@@ -13,6 +13,7 @@ import (
 
 	"github.com/codefly-dev/core/agents/services"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	"github.com/codefly-dev/core/runners/runstate"
 	"github.com/codefly-dev/core/wool"
 
 	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
@@ -54,6 +55,11 @@ type Runtime struct {
 	// postgres server (nixpg.go), serving the same connection string and
 	// database.
 	nixRuntime *nixPostgres
+	// nativeRoot and nativeState are the run's native state directory and this
+	// agent's claim on it. They outlive nixRuntime, which Stop clears: the
+	// claim is withdrawn by Destroy (disposeNative).
+	nativeRoot  string
+	nativeState *runstate.Hold
 
 	// extensionAdmin is the connection extensions are created with. On the
 	// run's shared server that is the server's administrator in this service's
@@ -645,6 +651,7 @@ func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationReq
 //	Stop                  released                      retained
 //	Stop + keep-running   retained (docker only)        retained
 //	Destroy               released, container removed   retained
+//	Destroy, disposable   released                      removed (native only)
 //
 // keep-running is the one row that is not backend-independent: reuse means the
 // next invocation reattaches to a live server, and only the container backend
@@ -655,11 +662,16 @@ func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationReq
 // later Init cannot end up running a second postmaster against the same data
 // directory.
 //
-// No operation deletes data. Dropping a database or a data directory requires
-// an explicit authorization proving that state is disposable and owned by the
-// caller; neither StopRequest nor DestroyRequest carries one, so an agent must
-// never infer the right to reset from the fact that it started the process
-// (codefly-dev/core#424).
+// No operation deletes data on its own. Dropping a database or a data
+// directory requires an explicit authorization proving that state is
+// disposable and owned by the caller; neither StopRequest nor DestroyRequest
+// carries one, so an agent must never infer the right to reset from the fact
+// that it started the process (codefly-dev/core#424).
+//
+// The authorization is the environment's: Environment.disposable, which the
+// invocation that generated the run's naming scope sets. Under it, Destroy of
+// the run's last native service removes the run's server directory
+// (disposeNative); Stop never does, because a service restarts inside a run.
 //
 // Stop releases only what THIS invocation holds a handle to: a runtime that
 // never ran Init owns no postmaster and no container, and stops nothing.
@@ -740,13 +752,13 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 			return s.Runtime.DestroyError(err)
 		}
 		s.reapHostResources(ctx)
-		return s.destroyResponse(action)
+		return s.destroyMessage(s.disposeNative(ctx, action))
 	}
 	// A nix invocation has no container to remove, and reaching for one would
 	// demand a docker daemon from a host that was very likely chosen for not
 	// having one.
 	if s.Runtime.IsNixRuntime() {
-		return s.destroyResponse("native postgres already stopped")
+		return s.destroyMessage(s.disposeNative(ctx, "native postgres already stopped"))
 	}
 
 	// Prefer the environment this invocation started: shutting that one down
@@ -807,9 +819,13 @@ func (s *Runtime) stopResponse(action string) (*runtimev0.StopResponse, error) {
 }
 
 func (s *Runtime) destroyResponse(action string) (*runtimev0.DestroyResponse, error) {
+	return s.destroyMessage(s.retentionSummary(action))
+}
+
+func (s *Runtime) destroyMessage(message string) (*runtimev0.DestroyResponse, error) {
 	return &runtimev0.DestroyResponse{Status: &runtimev0.DestroyStatus{
 		State:   runtimev0.DestroyStatus_SUCCESS,
-		Message: s.retentionSummary(action),
+		Message: message,
 	}}, nil
 }
 

@@ -34,8 +34,15 @@ package main
 //     is stopped by the next agent that initializes on this machine.
 //
 // Stopping the server releases its shared memory and semaphores; the cluster
-// directory is retained, exactly as a per-service cluster was (no operation of
-// this agent deletes data, codefly-dev/core#424).
+// directory is retained, exactly as a per-service cluster was: this agent never
+// infers the right to delete data (codefly-dev/core#424).
+//
+// The one exception is stated by the run's caller, not inferred. A run whose
+// environment is disposable (a generated naming scope: temporary ports, a
+// test's dependency stack) can never be run again, so its directory is
+// removed: by its last agent's Destroy, or, when the run was killed, by the
+// next agent to initialize on this machine or by `codefly clear`. The record
+// and the rule are core's (runners/runstate), shared with every native store.
 
 import (
 	"context"
@@ -57,6 +64,7 @@ import (
 	"time"
 
 	runners "github.com/codefly-dev/core/runners/base"
+	"github.com/codefly-dev/core/runners/runstate"
 	"github.com/gofrs/flock"
 	"github.com/lib/pq"
 )
@@ -129,6 +137,9 @@ type nixPostgres struct {
 	adminPassword string
 	holder        string
 	forwarder     *socketForwarder
+	// state is this agent's claim on the run's directory. It outlives release:
+	// a stopped service can start again, so only Destroy withdraws it.
+	state *runstate.Hold
 
 	// serverCancel cancels serverCtx, which supervision watches: a postmaster
 	// that disappears while this agent still holds the server is reported, one
@@ -194,24 +205,32 @@ func (h serverHolder) alive() bool {
 
 // acquireRunServer attaches this agent to its run's server, starting the
 // server when no live one exists, and records this agent as a holder.
-func acquireRunServer(ctx context.Context, key, service, logLevel string, out io.Writer) (_ *nixPostgres, acquireErr error) {
+func acquireRunServer(ctx context.Context, run runstate.Run, service, logLevel string, out io.Writer) (_ *nixPostgres, acquireErr error) {
 	servers, err := runServersDir()
 	if err != nil {
 		return nil, err
 	}
-	root := filepath.Join(servers, serviceHash(key)[:16])
+	root := filepath.Join(servers, serviceHash(runServerKey(run.Workspace, run.NamingScope))[:16])
 	if err := os.MkdirAll(filepath.Join(root, "holders"), 0o700); err != nil {
 		return nil, fmt.Errorf("create run server directory: %w", err)
 	}
 	collectAbandonedServers(ctx, servers, root)
 
-	unlock, err := lockRunServer(ctx, root)
+	unlock, err := lockRunServerDirectory(ctx, root)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
 
 	n := &nixPostgres{root: root, dataDir: filepath.Join(root, "pgdata")}
+	if n.state, err = runstate.Claim(root, run); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if acquireErr != nil {
+			_ = n.state.Release()
+		}
+	}()
 	live, err := pruneHolders(root)
 	if err != nil {
 		return nil, err
@@ -243,8 +262,55 @@ func acquireRunServer(ctx context.Context, key, service, logLevel string, out io
 	if err := n.register(service); err != nil {
 		return nil, err
 	}
+	// The postmaster is detached and outlives every agent: while it runs, the
+	// directory is in use whoever else is gone.
+	if err := n.state.Track(record.Postmaster.PID); err != nil {
+		return nil, err
+	}
 	n.watch(record.Postmaster)
 	return n, nil
+}
+
+// lockRunServerDirectory locks a run server this call is about to use, and
+// makes sure the directory it locked is still the one on disk: a disposable
+// run's directory is removed under this lock by its last agent's Destroy, and
+// a lock taken on the removed file would guard nothing.
+func lockRunServerDirectory(ctx context.Context, root string) (func(), error) {
+	for {
+		unlock, err := lockRunServer(ctx, root)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := os.Stat(filepath.Join(root, "lock")); err == nil {
+			return unlock, nil
+		}
+		unlock()
+		if err := os.MkdirAll(filepath.Join(root, "holders"), 0o700); err != nil {
+			return nil, fmt.Errorf("create run server directory: %w", err)
+		}
+	}
+}
+
+// disposeRunState withdraws an agent's claim on its run's directory and
+// removes the directory when the run was declared disposable and nothing uses
+// it any more. It reports whether it removed it. A directory that is already
+// gone was removed by the run's last agent.
+func disposeRunState(ctx context.Context, root string, state *runstate.Hold) (bool, error) {
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	unlock, err := lockRunServer(ctx, root)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	if err := state.Release(); err != nil {
+		return false, err
+	}
+	if live, err := pruneHolders(root); err != nil || live > 0 {
+		return false, err
+	}
+	return runstate.Collect(root)
 }
 
 // lockRunServer serializes every start, attach, release and collection of one
@@ -989,7 +1055,8 @@ func waitGone(postmaster processMark, budget time.Duration) bool {
 // collectAbandonedServers stops every other run server on this machine whose
 // holders are all gone: a run that was killed rather than stopped. A server
 // whose lock is taken is being started, attached or released right now, and is
-// left alone.
+// left alone. The directory of a stopped server is removed when its run was
+// disposable and nothing uses it; every other directory is retained.
 func collectAbandonedServers(ctx context.Context, servers, self string) {
 	entries, err := os.ReadDir(servers)
 	if err != nil {
@@ -1006,7 +1073,9 @@ func collectAbandonedServers(ctx context.Context, servers, self string) {
 			continue
 		}
 		if live, err := pruneHolders(root); err == nil && live == 0 {
-			_, _ = stopServer(root, filepath.Join(root, "pgdata"))
+			if _, err := stopServer(root, filepath.Join(root, "pgdata")); err == nil {
+				_, _ = runstate.Collect(root)
+			}
 		}
 		_ = lock.Unlock()
 	}
