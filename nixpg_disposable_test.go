@@ -78,7 +78,6 @@ func TestHelperClaimRunState(t *testing.T) {
 func abandonedRunServer(t *testing.T, servers, name, scope string) string {
 	t.Helper()
 	root := filepath.Join(servers, name)
-	require.NoError(t, os.MkdirAll(filepath.Join(root, "holders"), 0o700))
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "pgdata"), 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "pgdata", "PG_VERSION"), []byte(nativeMajor), 0o600))
 	claim := exec.Command(os.Args[0], "-test.run=^TestHelperClaimRunState$")
@@ -89,9 +88,9 @@ func abandonedRunServer(t *testing.T, servers, name, scope string) string {
 }
 
 // TestAbandonedDisposableRunStateIsCollected: a killed run never destroys its
-// agents. The next agent to initialize on the machine already stops such a
-// run's server; it also removes the directory when that run was disposable,
-// and only then.
+// agents. The next agent to initialize on the machine removes the directory
+// such a run left when that run was disposable, and only then.
+// TestKilledRunsServer covers the server it left running.
 func TestAbandonedDisposableRunStateIsCollected(t *testing.T) {
 	servers := t.TempDir()
 	disposable := abandonedRunServer(t, servers, "disposable", "invkilled")
@@ -103,7 +102,7 @@ func TestAbandonedDisposableRunStateIsCollected(t *testing.T) {
 	_, err := runstate.Claim(held, runstate.Run{Workspace: "/work/shop", NamingScope: "invlive", Disposable: true})
 	require.NoError(t, err)
 
-	collectAbandonedServers(context.Background(), servers, filepath.Join(servers, "self"))
+	collectAbandonedServers(servers)
 
 	require.NoDirExists(t, disposable)
 	require.FileExists(t, filepath.Join(persistent, "pgdata", "PG_VERSION"), "a developer's database is never removed")
