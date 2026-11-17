@@ -82,8 +82,8 @@ github.com/cloudflare/circl v1.6.3/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJ
 github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
 github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 h1:aBangftG7EVZoUb69Os8IaYg++6uMOdKK83QtkkvJik=
 github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2/go.mod h1:qwXFYgsP6T7XnJtbKlf1HP8AjxZZyzxMmc+Lq5GjlU4=
-github.com/codefly-dev/core v0.19.34-0.20261117163107-4b09840e116c h1:Ro9kIvGS4b+Qi6NNs65p0U2L/KnBEdrpXZ2rMdBcit8=
-github.com/codefly-dev/core v0.19.34-0.20261117163107-4b09840e116c/go.mod h1:BoFWBVL/cCXxIKa9dgu8O2faT2QZXGH+OpNktPE6DVc=
+github.com/codefly-dev/core v0.19.34-0.20261117211945-b67415c6891b h1:jD9GObftJycpWzmvyo7dJubEmvdRJiQt96Sus0e7qx4=
+github.com/codefly-dev/core v0.19.34-0.20261117211945-b67415c6891b/go.mod h1:BoFWBVL/cCXxIKa9dgu8O2faT2QZXGH+OpNktPE6DVc=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
 github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261116150011-ba68dd7d0fdd h1:2vSh6KfzAzmKglmtVgJnUPjMMNta4AD+J3BDGbcirrM=
