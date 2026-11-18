@@ -88,7 +88,7 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	require.Contains(t, unitTests.Run, "TestLifecycleContractDocker")
 	lifecycle := findWorkflowStep(t, workflow.Jobs["image"], "Run runtime lifecycle tests")
 	require.Empty(t, lifecycle.If)
-	require.Contains(t, lifecycle.Run, "^TestLifecycleContractDocker$")
+	require.Contains(t, lifecycle.Run, "^(TestLifecycleContractDocker|TestDestroyLoadedDockerContainer)$")
 
 	smoke := findWorkflowStep(t, workflow.Jobs["image"], "Smoke test runtime image")
 	require.Contains(t, smoke.Run, "--read-only")

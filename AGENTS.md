@@ -72,7 +72,7 @@ Derived from `.github/workflows/ci.yml` and the reusable
 go build ./...
 go vet ./...
 go mod tidy -diff        # CI fails on any diff
-go test ./... -skip '^(TestCreateToRunDocker|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
+go test ./... -skip '^(TestCreateToRunDocker|TestDestroyLoadedDockerContainer|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 ```
 
 That skip list is CI's unit step, and it is the inventory of what needs a
@@ -86,7 +86,7 @@ SERVICE_POSTGRES_TEST_IMAGE=service-postgres:test go test . \
   -run '^(TestDirtyMigrationFailsClosed|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 ```
 
-`TestLifecycleContractDocker` runs later still, against the *published* image.
+`TestLifecycleContractDocker` and `TestDestroyLoadedDockerContainer` run later still, against the *published* image.
 `TestCreateToRunDocker` runs in no ci.yml step at all — but the release
 workflow runs a plain `go test -v ./...` with no skip list, so every excluded
 test gates the release. A test that only fails there fails late.

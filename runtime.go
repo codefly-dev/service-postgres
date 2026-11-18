@@ -753,15 +753,11 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	// also closes the docker client and log stream it opened. Resolving the
 	// container by name remains the fallback so destroy keeps working for a
 	// caller that only loaded the service.
-	runner := s.runnerEnvironment
-	if runner == nil {
-		var err error
-		runner, err = dockerrun.NewDockerHeadlessEnvironment(ctx, s.dockerImage(), s.UniqueWithWorkspace())
-		if err != nil {
+	if s.runnerEnvironment != nil {
+		if err := s.runnerEnvironment.Shutdown(ctx); err != nil {
 			return s.Runtime.DestroyError(err)
 		}
-	}
-	if err := runner.Shutdown(ctx); err != nil {
+	} else if err := dockerrun.ShutdownNamedContainer(ctx, s.UniqueWithWorkspace()); err != nil {
 		return s.Runtime.DestroyError(err)
 	}
 	s.runnerEnvironment = nil
