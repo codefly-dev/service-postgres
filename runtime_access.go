@@ -72,8 +72,8 @@ type runtimeLogin struct {
 const maxRuntimeLoginNameLength = 16
 
 // reservedRuntimeLoginNames would collide with a managed key: the exported
-// owner-, read-only- and read-write-connection, and their passwords.
-var reservedRuntimeLoginNames = map[string]bool{"owner": true, "read-only": true, "read-write": true}
+// owner-, read-only-, read-write- and fixture-connection, and their passwords.
+var reservedRuntimeLoginNames = map[string]bool{"owner": true, "read-only": true, "read-write": true, "fixture": true}
 
 // resolveRuntimeLogins validates the declared logins and derives each one's
 // role and keys. Resolution fails on anything a render could not carry
@@ -198,6 +198,15 @@ func (s *Service) validateCredentials() error {
 		return err
 	}
 	used := map[string]string{s.postgresPassword: "owner", s.readOnlyPassword: "read-only", s.readWritePassword: "read-write"}
+	if s.fixturePassword != "" {
+		if s.externalIdentity() {
+			return fmt.Errorf("the fixture principal is a password login; external-identity mode provisions its logins outside this service: remove %s", fixturePasswordKey)
+		}
+		if other, taken := used[s.fixturePassword]; taken {
+			return fmt.Errorf("the fixture principal password must be distinct from the %s password", other)
+		}
+		used[s.fixturePassword] = "fixture principal"
+	}
 	for _, login := range logins {
 		password := s.loginPasswords[login.name]
 		if strings.TrimSpace(password) == "" {

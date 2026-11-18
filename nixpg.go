@@ -714,12 +714,18 @@ func (n *nixPostgres) provisionDatabase(ctx context.Context, service, database, 
 	// database's owner and keep the admin grant, which is enough to take the
 	// role and read the data. An owner role is this server's to create: one
 	// that already carries a membership was not created by this agent.
+	//
+	// The one membership this agent grants is the database's fixture principal
+	// (fixture.go), which an interrupted disposable run can leave behind: a
+	// plain membership, never WITH ADMIN OPTION, which is what a creator holds.
 	var exists, granted bool
 	if err := db.QueryRowContext(ctx, `
 		SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),
 		       EXISTS (SELECT 1 FROM pg_auth_members m
 		               JOIN pg_roles r ON r.oid = m.roleid
-		               WHERE r.rolname = $1)`, owner).Scan(&exists, &granted); err != nil {
+		               JOIN pg_roles member ON member.oid = m.member
+		               WHERE r.rolname = $1
+		                 AND NOT (member.rolname = $2 AND NOT m.admin_option))`, owner, fixtureRole(database)).Scan(&exists, &granted); err != nil {
 		return fmt.Errorf("look up the migration owner: %w", err)
 	}
 	if granted {
