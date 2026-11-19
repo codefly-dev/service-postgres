@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"os/exec"
 	"path"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/codefly-dev/core/network"
 	"github.com/codefly-dev/core/resources"
 	runners "github.com/codefly-dev/core/runners/base"
+	"github.com/codefly-dev/core/runners/dockerrun"
 	"github.com/codefly-dev/core/shared"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -407,4 +410,32 @@ func requireNoListener(t *testing.T, address string) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+// A fresh invocation can destroy a container without calling Init first.
+func TestDestroyLoadedDockerContainer(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPostgresFixture(t, ctx, resources.NewRuntimeContextContainer())
+	started, _ := fixture.start(t, ctx)
+	name := dockerrun.ContainerName(started.UniqueWithWorkspace())
+	containers := func() string {
+		t.Helper()
+		out, err := exec.Command("docker", "ps", "-aq", "--filter", "name=^/"+name+"$").CombinedOutput()
+		require.NoError(t, err, "%s", out)
+		return strings.TrimSpace(string(out))
+	}
+	require.NotEmpty(t, containers(), "positive control: fixture must own a container")
+	loaded := NewRuntime()
+	_, err := loaded.Load(ctx, &runtimev0.LoadRequest{
+		Identity:     fixture.identity,
+		Environment:  shared.Must(fixture.environment.Proto()),
+		DisableCatch: true,
+	})
+	require.NoError(t, err)
+	require.Nil(t, loaded.runnerEnvironment)
+	destroyed, err := loaded.Destroy(ctx, &runtimev0.DestroyRequest{})
+	require.NoError(t, err)
+	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState())
+	require.Empty(t, containers(), "Destroy must remove the container, not merely report success")
+	require.DirExists(t, started.retainedDataPath, "Destroy must retain database state")
 }
