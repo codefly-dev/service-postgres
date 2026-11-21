@@ -23,12 +23,32 @@ func Open(
 	if ctx == nil {
 		return nil, nil, errors.New("scoped Postgres context is required")
 	}
-	configuration, err := configured(options...)
+	readerPool, writerPool, configuration, err := openCapabilityPools(ctx, readOnlyConnection, readWriteConnection, options...)
 	if err != nil {
 		return nil, nil, err
 	}
+	closePools := func() {
+		readerPool.Close()
+		writerPool.Close()
+	}
+	factory, err := NewFactory(readerPool, writerPool, authenticator, options...)
+	if err != nil {
+		closePools()
+		return nil, nil, profileConnectionError(configuration.readerProfile, profileConnectionError(configuration.writerProfile, err))
+	}
+	var closeOnce sync.Once
+	return factory, func() { closeOnce.Do(closePools) }, nil
+}
+
+// openCapabilityPools opens and pings the distinct reader and writer pools
+// every request-time boundary is built on. The caller owns both.
+func openCapabilityPools(ctx context.Context, readOnlyConnection, readWriteConnection string, options ...Option) (*pgxpool.Pool, *pgxpool.Pool, config, error) {
+	configuration, err := configured(options...)
+	if err != nil {
+		return nil, nil, config{}, err
+	}
 	if err := resolveExternalIdentity(ctx, &configuration); err != nil {
-		return nil, nil, err
+		return nil, nil, config{}, err
 	}
 	if configuration.operationTimeout > 0 {
 		var cancel context.CancelFunc
@@ -37,7 +57,7 @@ func Open(
 	}
 	readerConfig, writerConfig, err := capabilityConfigsWithProfiles(readOnlyConnection, readWriteConnection, configuration)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, config{}, err
 	}
 	if configuration.accessTokenProvider != nil {
 		installAccessTokenProvider(readerConfig, configuration.accessTokenProvider)
@@ -51,12 +71,12 @@ func Open(
 	})
 	readerPool, err := pgxpool.NewWithConfig(ctx, readerConfig)
 	if err != nil {
-		return nil, nil, profileConnectionError(configuration.readerProfile, fmt.Errorf("open read-only Postgres capability: %w", err))
+		return nil, nil, config{}, profileConnectionError(configuration.readerProfile, fmt.Errorf("open read-only Postgres capability: %w", err))
 	}
 	writerPool, err := pgxpool.NewWithConfig(ctx, writerConfig)
 	if err != nil {
 		readerPool.Close()
-		return nil, nil, profileConnectionError(configuration.writerProfile, fmt.Errorf("open read-write Postgres capability: %w", err))
+		return nil, nil, config{}, profileConnectionError(configuration.writerProfile, fmt.Errorf("open read-write Postgres capability: %w", err))
 	}
 	closePools := func() {
 		readerPool.Close()
@@ -64,19 +84,13 @@ func Open(
 	}
 	if err := readerPool.Ping(ctx); err != nil {
 		closePools()
-		return nil, nil, profileConnectionError(configuration.readerProfile, fmt.Errorf("ping read-only Postgres capability: %w", err))
+		return nil, nil, config{}, profileConnectionError(configuration.readerProfile, fmt.Errorf("ping read-only Postgres capability: %w", err))
 	}
 	if err := writerPool.Ping(ctx); err != nil {
 		closePools()
-		return nil, nil, profileConnectionError(configuration.writerProfile, fmt.Errorf("ping read-write Postgres capability: %w", err))
+		return nil, nil, config{}, profileConnectionError(configuration.writerProfile, fmt.Errorf("ping read-write Postgres capability: %w", err))
 	}
-	factory, err := NewFactory(readerPool, writerPool, authenticator, options...)
-	if err != nil {
-		closePools()
-		return nil, nil, profileConnectionError(configuration.readerProfile, profileConnectionError(configuration.writerProfile, err))
-	}
-	var closeOnce sync.Once
-	return factory, func() { closeOnce.Do(closePools) }, nil
+	return readerPool, writerPool, configuration, nil
 }
 
 func capabilityConfigs(readOnlyConnection, readWriteConnection string) (*pgxpool.Config, *pgxpool.Config, error) {
