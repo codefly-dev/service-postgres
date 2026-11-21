@@ -99,7 +99,14 @@ func (s *Sandbox) Role(name string) string { return s.prefix + "_" + name }
 // The owner creates it, as a migration would.
 func (s *Sandbox) Login(t testing.TB, name string) string {
 	t.Helper()
-	s.Exec(t, s.Owner, `CREATE ROLE `+s.Role(name)+` LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS PASSWORD 'isolated-fixture-only'`)
+	return s.LoginBy(t, s.Owner, name)
+}
+
+// LoginBy is Login with the creating principal named: a suite creates its
+// extra logins through the fixture principal.
+func (s *Sandbox) LoginBy(t testing.TB, creator, name string) string {
+	t.Helper()
+	s.Exec(t, creator, `CREATE ROLE `+s.Role(name)+` LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS PASSWORD 'isolated-fixture-only'`)
 	return s.connection(s.Role(name), "isolated-fixture-only")
 }
 

@@ -15,6 +15,7 @@ import (
 	postgres "github.com/codefly-dev/service-postgres/libs/go"
 	"github.com/codefly-dev/service-postgres/libs/go/internal/rowscopefixture"
 	"github.com/codefly-dev/service-postgres/libs/go/rowscope"
+	"github.com/jackc/pgx/v5"
 )
 
 const rowScopeSeed = `INSERT INTO item (tenant, scope, principal, shared, body) VALUES
@@ -211,5 +212,80 @@ func TestRowScopeProtectIsIdempotentAndLeavesOtherRolesAlone(t *testing.T) {
 	conn := sandbox.Connect(t, login)
 	if _, err := conn.Exec(ctx, `SET ROLE `+sandbox.Role("privileged")); sqlState(err) != insufficientPrivilege {
 		t.Fatalf("the maintenance login assumed a mode role: %v", err)
+	}
+}
+
+// Everything a module's suite needs of a principal, obtained without a
+// superuser: the fixture principal as fixture.go provisions it beside an owner
+// that is not one (BYPASSRLS, CREATEROLE, a member of the owner).
+func TestRowScopeFixturePrincipalArrangesWithoutSuperuser(t *testing.T) {
+	sandbox := rowscopefixture.Open(t)
+	sandbox.Migrate(t, "item")
+	ctx := spikeContext(t)
+	fixture := sandbox.Connect(t, sandbox.Fixture)
+	if scalar[bool](t, ctx, fixture, `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`) {
+		t.Fatal("the sandbox's fixture principal is a superuser; this test proves nothing")
+	}
+	// Seed several partitions through forced row security, and read them back.
+	sandbox.Exec(t, sandbox.Fixture, rowScopeSeed)
+	if got := bodies(t, ctx, fixture, "item"); got != "a-in-s2,a-in-t2,a-private,b-private,b-shared" {
+		t.Fatalf("the fixture principal read %q", got)
+	}
+	// A login of its own making, granted one mode: no ALTER ROLE ... BYPASSRLS,
+	// no superuser, and the owner's ADMIN OPTION on the mode role is enough.
+	people := sandbox.LoginBy(t, sandbox.Fixture, "suite_people")
+	sandbox.Exec(t, sandbox.Fixture, `GRANT `+sandbox.Role("strict")+` TO `+sandbox.Role("suite_people")+` WITH INHERIT FALSE, SET TRUE`)
+	bound(t, ctx, sandbox.Connect(t, people), sandbox.Role("strict"), "t1", "s1", "human:a", func(tx pgx.Tx) {
+		if got := bodies(t, ctx, tx, "item"); got != "a-private,b-shared" {
+			t.Fatalf("a suite-made strict login read %q", got)
+		}
+	})
+	// It can assert as a mode role itself: the bypass is the login's, and a
+	// transaction that assumed the role is bound like the runtime login's.
+	sandbox.Exec(t, sandbox.Fixture, `GRANT `+sandbox.Role("strict")+` TO CURRENT_USER WITH INHERIT FALSE, SET TRUE`)
+	bound(t, ctx, fixture, sandbox.Role("strict"), "t1", "s1", "human:b", func(tx pgx.Tx) {
+		if got := bodies(t, ctx, tx, "item"); got != "b-private,b-shared" {
+			t.Fatalf("the fixture principal as strict read %q", got)
+		}
+	})
+	// Empty the table between tests: TRUNCATE is the owner's, and it is a member.
+	sandbox.Exec(t, sandbox.Fixture, `TRUNCATE item`)
+	if got := bodies(t, ctx, fixture, "item"); got != "" {
+		t.Fatalf("after TRUNCATE the table holds %q", got)
+	}
+}
+
+// The Postgres agent makes the first of a login's delegated roles its session
+// default. With a mode role first, a connection that skips the Store starts
+// with that role's privileges; with a role that holds nothing first, it is
+// refused the table, and the Store binds exactly as before.
+func TestRowScopeSessionDefaultRoleMustHoldNothing(t *testing.T) {
+	sandbox := rowscopefixture.Open(t)
+	sandbox.Migrate(t, "item")
+	sandbox.Exec(t, sandbox.Fixture, rowScopeSeed)
+	ctx := spikeContext(t)
+	connect := sandbox.Role("connect")
+	sandbox.Exec(t, sandbox.Owner, `CREATE ROLE `+connect+` NOLOGIN NOINHERIT`,
+		`GRANT `+connect+` TO `+sandbox.Role("ro")+`, `+sandbox.Role("rw")+` WITH INHERIT FALSE, SET TRUE`)
+	// The agent's reconciler does this, with an authority the owner lacks.
+	sandbox.Exec(t, sandbox.Admin, `ALTER ROLE `+sandbox.Role("ro")+` SET role = `+connect, `ALTER ROLE `+sandbox.Role("rw")+` SET role = `+connect)
+
+	raw := sandbox.Connect(t, sandbox.ReadWrite)
+	if got := scalar[string](t, ctx, raw, `SELECT current_user::text`); got != connect {
+		t.Fatalf("the session started as %q", got)
+	}
+	if _, err := raw.Exec(ctx, `SELECT * FROM item`); sqlState(err) != insufficientPrivilege {
+		t.Fatalf("a connection that skipped the Store read the table: %v", err)
+	}
+	store := openRowScopeStore(t, sandbox, postgres.Binding{Partition: "t1", Principal: "human:a", Reach: []string{"s1"}, Mode: postgres.Strict}, sandbox.Roles())
+	if got := readBodies(t, store); got != "a-private,b-shared" {
+		t.Fatalf("strict read %q", got)
+	}
+	// RESET ROLE inside the transaction lands on the powerless default.
+	if err := store.Write(ctx, func(ctx context.Context, tx postgres.WriteTx) error {
+		_, err := tx.Exec(ctx, `RESET ROLE; SELECT * FROM item`)
+		return err
+	}); sqlState(err) != insufficientPrivilege {
+		t.Fatalf("RESET ROLE reached the table: %v", err)
 	}
 }

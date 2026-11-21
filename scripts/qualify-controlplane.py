@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHILD = ROOT / "libs" / "go"
-ROW_SCOPE_PACKAGES = ["."]
+ROW_SCOPE_PACKAGES = [".", "./migrationtest", "./rowscopetest"]
 
 
 def main():
