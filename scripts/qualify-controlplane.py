@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHILD = ROOT / "libs" / "go"
+ROW_SCOPE_PACKAGES = ["."]
 
 
 def main():
@@ -75,6 +76,7 @@ def main():
             f"postgres://postgres@127.0.0.1:{int(binding['HostPort'])}/postgres"
         )
         env["SESSION_POLICY_TEST_DSN"] = env["SERVICE_POSTGRES_CONTROLPLANE_TEST_DSN"]
+        env["ROW_SCOPE_TEST_DSN"] = env["SERVICE_POSTGRES_CONTROLPLANE_TEST_DSN"]
         with tempfile.TemporaryDirectory(prefix="postgres-bootstrap-tools-") as tool_dir:
             migrate = str(Path(tool_dir) / "migrate")
             bootstrap = str(Path(tool_dir) / "managed-bootstrap")
@@ -112,6 +114,22 @@ def main():
             check=True,
             timeout=120,
         )
+        # Row confinement: the Postgres behaviours the Binding leans on. Every
+        # one of these skips without ROW_SCOPE_TEST_DSN, so they are selected by
+        # name here and a skip is a failure of this script, not a green run.
+        row_scope = subprocess.run(
+            ["go", "test", "-race", "-count=1", "-v", "-tags", "controlplaneintegration",
+             "-run", "^(TestSpike|TestRowScope)", *ROW_SCOPE_PACKAGES],
+            cwd=CHILD,
+            env=env,
+            check=True,
+            timeout=600,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        print(row_scope, flush=True)
+        if "--- SKIP" in row_scope or "--- PASS" not in row_scope:
+            raise RuntimeError("a row-confinement test skipped on the fixture that exists to run it")
         subprocess.run(
             [
                 "go",
