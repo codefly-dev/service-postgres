@@ -86,8 +86,8 @@ github.com/codefly-dev/core v0.19.35 h1:VudzLyUQR7FmZ3nYgU8i5WCY+Z8UNly5Qk4H2oyE
 github.com/codefly-dev/core v0.19.35/go.mod h1:BoFWBVL/cCXxIKa9dgu8O2faT2QZXGH+OpNktPE6DVc=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
-github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261116150011-ba68dd7d0fdd h1:2vSh6KfzAzmKglmtVgJnUPjMMNta4AD+J3BDGbcirrM=
-github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261116150011-ba68dd7d0fdd/go.mod h1:Wb3ThaIsBX+EHlVIVPRAUr+chJEKntqbp1Fzavfexpc=
+github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261121102701-85a02a031035 h1:cb3qouQs80OpNJtat5w/3I5SDxZ/i23IljD+L9h8UbY=
+github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261121102701-85a02a031035/go.mod h1:Wb3ThaIsBX+EHlVIVPRAUr+chJEKntqbp1Fzavfexpc=
 github.com/containerd/errdefs v1.0.0 h1:tg5yIfIlQIrxYtu9ajqY42W3lpS19XqdxRQeEwYG8PI=
 github.com/containerd/errdefs v1.0.0/go.mod h1:+YBYIdtsnF4Iw6nWZhJcqGSg/dwvV7tyJ/kCkyJ2k+M=
 github.com/containerd/errdefs/pkg v0.3.0 h1:9IKJ06FvyNlexW690DXuQNx2KA2cUJXx151Xdx3ZPPE=
