@@ -137,7 +137,7 @@ func TestSnapshotRetainsVerifiedBytes(t *testing.T) {
 }
 
 func TestReaderRolePackageVersions(t *testing.T) {
-	for _, version := range []string{schemaplan.ContractVersion, schemaplan.ReaderRolesContractVersion, "codefly.dev/postgres-schema-plan/v3"} {
+	for _, version := range []string{schemaplan.ContractVersion, schemaplan.ReaderRolesContractVersion, schemaplan.PasswordReaderRolesContractVersion, "codefly.dev/postgres-schema-plan/future"} {
 		for _, roles := range [][]string{nil, {"app_reader"}, {"bootstrap_rw"}, {"app_reader", "app_reader"}} {
 			dir, p, b := packageFixture(t, "SELECT 1;")
 			p.ContractVersion, p.Access.ReadOnlyRoles = version, roles
@@ -147,7 +147,7 @@ func TestReaderRolePackageVersions(t *testing.T) {
 				os.RemoveAll(tmp)
 			}
 			valid := (version == schemaplan.ContractVersion && roles == nil) ||
-				(version == schemaplan.ReaderRolesContractVersion && (roles == nil || len(roles) == 1 && roles[0] == "app_reader"))
+				((version == schemaplan.ReaderRolesContractVersion || version == schemaplan.PasswordReaderRolesContractVersion) && (roles == nil || len(roles) == 1 && roles[0] == "app_reader"))
 			if (err == nil) != valid {
 				t.Fatalf("version %s roles %v: %v", version, roles, err)
 			}

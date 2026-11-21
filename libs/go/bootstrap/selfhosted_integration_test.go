@@ -25,7 +25,7 @@ func TestSelfHostedBootstrapProvisionsPasswordLogins(t *testing.T) {
 	p.Database = "selfhosted_proof"
 	// Roles are cluster-wide: these must not be the managed test's groups.
 	p.Access.ReadOnlyRole, p.Access.ReadWriteRole = "selfhosted_ro", "selfhosted_rw"
-	p.ContractVersion = schemaplan.ReaderRolesContractVersion
+	p.ContractVersion = schemaplan.PasswordReaderRolesContractVersion
 	p.Access.ReadOnlyRoles = []string{"selfhosted_reader"}
 	p.Access.ReadWriteRoles = []string{"selfhosted_app"}
 	b = Binding{OwnerRole: "selfhosted_owner"}

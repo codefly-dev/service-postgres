@@ -91,7 +91,7 @@ func snapshot(directory string, binding Binding, selfHosted bool) (schemaplan.Pl
 	if err := decodeJSON(bytes.NewReader(data), &p); err != nil {
 		return p, "", err
 	}
-	if (p.ContractVersion != schemaplan.ContractVersion && p.ContractVersion != schemaplan.ReaderRolesContractVersion) ||
+	if (p.ContractVersion != schemaplan.ContractVersion && !p.DelegatesReaders()) ||
 		(p.ContractVersion == schemaplan.ContractVersion && p.Access.ReadOnlyRoles != nil) ||
 		p.Digest != p.ContentDigest() || p.Digest != binding.PlanDigest {
 		return fail("schema plan identity mismatch")
