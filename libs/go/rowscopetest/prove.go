@@ -5,6 +5,13 @@
 // and compares everything the database returns or changes with a model that
 // knows nothing about SQL.
 //
+// The model has four parts: the mode (whose rows), the access (whether it may
+// write at all), the write mode and the write reach (whose rows and which
+// scopes it may write, when that is less than what it reads). A Read binding
+// is attacked as well as exercised: on the reader's own login, in a READ WRITE
+// transaction, with every setting a writer would have, each write must be
+// permission denied, and so must assuming a write role.
+//
 // A module calls Prove from its own suite, once per row-confined table, on a
 // migrated disposable database. It is the half of the evidence the catalog
 // gate (migrationtest.CheckRowScope) cannot give: the gate checks that the
@@ -36,8 +43,9 @@ type Proof struct {
 	// the service itself opens its Store on.
 	ReadOnly  string
 	ReadWrite string
-	// Roles are the store's mode roles. Both are required: the proof compares
-	// the two modes.
+	// Roles are the store's roles. The read and the write role of both modes
+	// are required: the proof compares the modes and the accesses, and a store
+	// on the two-role form does not hold the model it proves.
 	Roles postgres.Roles
 	// Options are the Store options the service uses, and Settings the names
 	// its policies read, when they are not the defaults.
@@ -81,8 +89,14 @@ func Prove(t Reporter, proof Proof) {
 	if proof.Fixture == "" || proof.ReadOnly == "" || proof.ReadWrite == "" {
 		t.Fatalf("rowscopetest: the fixture, read-only and read-write connections are required")
 	}
-	if proof.Roles.Strict == "" || proof.Roles.Privileged == "" || proof.Table.Name == "" || proof.Body == "" {
-		t.Fatalf("rowscopetest: both mode roles, the table and its body column are required")
+	if proof.Table.Name == "" || proof.Body == "" {
+		t.Fatalf("rowscopetest: the table and its body column are required")
+	}
+	if proof.Roles.StrictRead == "" || proof.Roles.StrictWrite == "" || proof.Roles.PrivilegedRead == "" || proof.Roles.PrivilegedWrite == "" {
+		t.Fatalf("rowscopetest: the read and the write role of both modes are required (Roles.StrictRead, StrictWrite, PrivilegedRead, PrivilegedWrite); with one role per mode a Read binding's transaction holds the write grants, and READ ONLY is all that refuses its write")
+	}
+	if proof.Roles.Strict != "" || proof.Roles.Privileged != "" {
+		t.Fatalf("rowscopetest: name the four roles alone; Roles.Strict and Roles.Privileged are the two-role form")
 	}
 	p := prover{t: t, proof: proof, model: map[string]row{}}
 	p.defaults()
@@ -95,6 +109,14 @@ func Prove(t Reporter, proof Proof) {
 		t.Fatalf("rowscopetest: connect as the fixture principal: %v", err)
 	}
 	p.fixture = fixture
+	// Around the Store, as the reader's login itself: where a Read binding's
+	// writes are attempted with nothing but the database in the way.
+	reader, err := pgx.Connect(ctx, proof.ReadOnly)
+	if err != nil {
+		t.Fatalf("rowscopetest: connect as the read-only runtime login: %v", err)
+	}
+	p.reader = reader
+	t.Cleanup(func() { _ = reader.Close(context.Background()) })
 	t.Cleanup(func() {
 		// The proof's partitions are its own; nothing else is touched.
 		_, _ = fixture.Exec(context.Background(), `DELETE FROM `+p.table+` WHERE `+p.partition+` = ANY($1)`, p.partitions)
@@ -120,8 +142,8 @@ func Prove(t Reporter, proof Proof) {
 		p.round(round)
 	}
 	p.unbound()
-	t.Logf("rowscopetest: %s held over %d bindings: %d reads, %d writes accepted, %d refused, %d rows at the end (seed %d)",
-		p.table, p.proof.Rounds, p.reads, p.accepted, p.refused, len(p.model), p.proof.Seed)
+	t.Logf("rowscopetest: %s held over %d bindings: %d reads, %d writes accepted, %d refused, %d Read bindings attacked with %d writes all denied, %d rows at the end (seed %d)",
+		p.table, p.proof.Rounds, p.reads, p.accepted, p.refused, p.readers, p.denied, len(p.model), p.proof.Seed)
 }
 
 type prover struct {
@@ -130,12 +152,13 @@ type prover struct {
 	proof   Proof
 	random  *rand.Rand
 	fixture *pgx.Conn
+	reader  *pgx.Conn
 	store   *postgres.Store
 
 	table, key, partition, scope, principal, shared, body string
 	partitions, scopes, principals                        []string
 	model                                                 map[string]row
-	reads, accepted, refused                              int
+	reads, accepted, refused, readers, denied             int
 }
 
 func (p *prover) defaults() {
@@ -214,6 +237,25 @@ func (p *prover) randomBinding() postgres.Binding {
 	if p.random.IntN(12) == 0 {
 		binding.Partition += "-absent"
 	}
+	// The access, and what it writes when that is less than what it reads.
+	if p.random.IntN(3) == 0 {
+		binding.Access = postgres.Read
+		return binding
+	}
+	binding.Access = postgres.ReadWrite
+	if binding.Mode == postgres.Privileged && p.random.IntN(3) == 0 {
+		binding.WriteMode = postgres.Strict
+	}
+	if p.random.IntN(2) == 0 {
+		for _, scope := range binding.Reach {
+			if p.random.IntN(2) == 0 {
+				binding.WriteReach = append(binding.WriteReach, scope)
+			}
+		}
+		if len(binding.WriteReach) == 0 {
+			binding.WriteReach = []string{p.pick(binding.Reach)}
+		}
+	}
 	return binding
 }
 
@@ -231,11 +273,36 @@ func mayRead(binding postgres.Binding, candidate row) bool {
 	return binding.Mode == postgres.Privileged || candidate.shared || candidate.principal == binding.Principal
 }
 
+// writeMode and writeReach are what the Binding writes with: its mode and its
+// reach unless it names less.
+func writeMode(binding postgres.Binding) postgres.Mode {
+	if binding.WriteMode != 0 {
+		return binding.WriteMode
+	}
+	return binding.Mode
+}
+
+func writeReach(binding postgres.Binding) []string {
+	if binding.WriteReach != nil {
+		return binding.WriteReach
+	}
+	return binding.Reach
+}
+
 func mayWrite(binding postgres.Binding, candidate row) bool {
-	if !reaches(binding, candidate) {
+	if binding.Access != postgres.ReadWrite || !reaches(binding, candidate) || !slices.Contains(writeReach(binding), candidate.scope) {
 		return false
 	}
-	return binding.Mode == postgres.Privileged || candidate.principal == binding.Principal
+	return writeMode(binding) == postgres.Privileged || candidate.principal == binding.Principal
+}
+
+// seesInWrite is what a write transaction reads: the whole reach, as the mode
+// it writes in.
+func seesInWrite(binding postgres.Binding, candidate row) bool {
+	if binding.Access != postgres.ReadWrite || !reaches(binding, candidate) {
+		return false
+	}
+	return writeMode(binding) == postgres.Privileged || candidate.shared || candidate.principal == binding.Principal
 }
 
 func (p *prover) expected(binding postgres.Binding, may func(postgres.Binding, row) bool) []string {
@@ -302,40 +369,66 @@ func (p *prover) unbound() {
 		p.t.Fatalf("rowscopetest: an empty reach: %v, want ErrNoReach", err)
 	}
 
-	// Around the Store, as the runtime login itself.
+	// Around the Store, as each runtime login itself: the read roles on the
+	// reader's, the write roles on the writer's.
 	raw, err := pgx.Connect(p.ctx, p.proof.ReadWrite)
 	if err != nil {
 		p.t.Fatalf("rowscopetest: connect as the runtime login: %v", err)
 	}
 	defer raw.Close(context.Background())
-	if _, err := raw.Exec(p.ctx, `SELECT 1 FROM `+p.table); sqlState(err) != "42501" {
-		p.t.Fatalf("rowscopetest: the runtime login read %s without assuming a mode role (SQLSTATE %q): it holds a privilege of its own", p.table, sqlState(err))
-	}
-	for _, role := range []string{p.proof.Roles.Strict, p.proof.Roles.Privileged} {
-		// Nothing bound, then everything bound except the reach.
-		settings := p.proof.Settings
-		for _, bind := range [][]any{
-			{`SELECT set_config('role', $1, true)`, role},
-			{`SELECT set_config('role', $1, true), set_config($2, $3, true), set_config($4, $5, true), set_config($6, '', true)`,
-				role, settings.Partition, p.partitions[0], settings.Principal, p.principals[0], settings.Reach},
-		} {
-			tx, err := raw.Begin(p.ctx)
-			if err != nil {
-				p.t.Fatalf("rowscopetest: %v", err)
+	settings := p.proof.Settings
+	for _, login := range []struct {
+		name   string
+		conn   *pgx.Conn
+		roles  []string
+		writes bool
+	}{
+		{"read-only", p.reader, []string{p.proof.Roles.StrictRead, p.proof.Roles.PrivilegedRead}, false},
+		{"read-write", raw, []string{p.proof.Roles.StrictWrite, p.proof.Roles.PrivilegedWrite}, true},
+	} {
+		if _, err := login.conn.Exec(p.ctx, `SELECT 1 FROM `+p.table); sqlState(err) != "42501" {
+			p.t.Fatalf("rowscopetest: the %s runtime login read %s without assuming a role (SQLSTATE %q): it holds a privilege of its own", login.name, p.table, sqlState(err))
+		}
+		for _, role := range login.roles {
+			// Nothing bound; everything bound except the reach; and, for a role
+			// that writes, everything bound except the write reach.
+			binds := [][]any{
+				{`SELECT set_config('role', $1, true)`, role},
+				{`SELECT set_config('role', $1, true), set_config($2, $3, true), set_config($4, $5, true), set_config($6, '', true), set_config($7, $8, true)`,
+					role, settings.Partition, p.partitions[0], settings.Principal, p.principals[0], settings.Reach, settings.WriteReach, strings.Join(p.scopes, ",")},
 			}
-			if _, err := tx.Exec(p.ctx, bind[0].(string), bind[1:]...); err != nil {
-				p.t.Fatalf("rowscopetest: assume %s: %v", role, err)
+			if login.writes {
+				binds = append(binds, []any{`SELECT set_config('role', $1, true), set_config($2, $3, true), set_config($4, $5, true), set_config($6, $7, true), set_config($8, '', true)`,
+					role, settings.Partition, p.partitions[0], settings.Principal, p.principals[0], settings.Reach, strings.Join(p.scopes, ","), settings.WriteReach})
 			}
-			var seen int
-			if err := tx.QueryRow(p.ctx, `SELECT count(*) FROM `+p.table).Scan(&seen); err != nil || seen != 0 {
-				p.t.Fatalf("rowscopetest: %s with no reach read %d rows (%v)", role, seen, err)
-			}
-			for _, statement := range []string{`UPDATE ` + p.table + ` SET ` + p.body + ` = 'unbound'`, `DELETE FROM ` + p.table} {
-				if tag, err := tx.Exec(p.ctx, statement); err != nil || tag.RowsAffected() != 0 {
-					p.t.Fatalf("rowscopetest: %s with no reach changed %d rows (%v)", role, tag.RowsAffected(), err)
+			for index, bind := range binds {
+				tx, err := login.conn.BeginTx(p.ctx, pgx.TxOptions{AccessMode: pgx.ReadWrite})
+				if err != nil {
+					p.t.Fatalf("rowscopetest: %v", err)
 				}
+				if _, err := tx.Exec(p.ctx, bind[0].(string), bind[1:]...); err != nil {
+					p.t.Fatalf("rowscopetest: assume %s on the %s login: %v", role, login.name, err)
+				}
+				var seen int
+				if err := tx.QueryRow(p.ctx, `SELECT count(*) FROM `+p.table).Scan(&seen); err != nil || (seen != 0 && index < 2) {
+					p.t.Fatalf("rowscopetest: %s with no reach read %d rows (%v)", role, seen, err)
+				}
+				if login.writes {
+					for _, statement := range []string{`UPDATE ` + p.table + ` SET ` + p.body + ` = 'unbound'`, `DELETE FROM ` + p.table} {
+						if tag, err := tx.Exec(p.ctx, statement); err != nil || tag.RowsAffected() != 0 {
+							p.t.Fatalf("rowscopetest: %s with no reach or no write reach changed %d rows (%v)", role, tag.RowsAffected(), err)
+						}
+					}
+				}
+				_ = tx.Rollback(p.ctx)
 			}
-			_ = tx.Rollback(p.ctx)
+		}
+	}
+	// The fence on the access: no SQL on the reader's connection may assume a
+	// role that writes.
+	for _, role := range []string{p.proof.Roles.StrictWrite, p.proof.Roles.PrivilegedWrite} {
+		if _, err := p.reader.Exec(p.ctx, `SELECT set_config('role', $1, true)`, role); sqlState(err) != "42501" {
+			p.t.Fatalf("rowscopetest: the read-only runtime login may assume write role %s (SQLSTATE %q): SQL sent in a read transaction can write", role, sqlState(err))
 		}
 	}
 	p.compare("an unbound transaction")
@@ -345,7 +438,10 @@ func (p *prover) round(round int) {
 	p.t.Helper()
 	binding := p.randomBinding()
 	ctx := context.WithValue(p.ctx, bindingKey{}, binding)
-	describe := fmt.Sprintf("round %d, %s as %s in %s reaching %v", round, binding.Mode, binding.Principal, binding.Partition, binding.Reach)
+	describe := fmt.Sprintf("round %d, %s %s as %s in %s reaching %v", round, binding.Mode, binding.Access, binding.Principal, binding.Partition, binding.Reach)
+	if binding.Access == postgres.ReadWrite {
+		describe += fmt.Sprintf(", writing %s in %v", writeMode(binding), writeReach(binding))
+	}
 
 	// Read: exactly the rows the model allows, on the reader login.
 	var seen []string
@@ -377,8 +473,25 @@ func (p *prover) round(round int) {
 	p.reads++
 	p.same(describe+": read", seen, p.expected(binding, mayRead))
 
+	// A Read binding never mutates: the Store gives it no writer, and the
+	// database refuses what its transaction could send anyway.
+	if binding.Access == postgres.Read {
+		err := p.store.Write(ctx, func(context.Context, postgres.WriteTx) error {
+			p.t.Fatalf("rowscopetest: %s: a Read binding opened a write transaction", describe)
+			return nil
+		})
+		if !errors.Is(err, postgres.ErrReadOnly) {
+			p.t.Fatalf("rowscopetest: %s: write on a Read binding: %v, want ErrReadOnly", describe, err)
+		}
+		p.attack(binding, describe)
+		if round%10 == 9 {
+			p.compare(describe)
+		}
+		return
+	}
+
 	// Write: one action per round, aimed as often at what is not the caller's.
-	switch p.random.IntN(6) {
+	switch p.random.IntN(7) {
 	case 0: // rewrite every row in sight
 		body := fmt.Sprintf("round-%d", round)
 		touched := p.write(ctx, describe, `UPDATE `+p.table+` SET `+p.body+` = $1 RETURNING `+p.key+`::text`, body)
@@ -388,82 +501,107 @@ func (p *prover) round(round int) {
 			changed.body = body
 			p.model[key] = changed
 		}
-	case 1: // delete one named row, whoever's it is
-		key, target := p.target(binding)
-		if key == "" {
-			break
+	case 1: // delete named rows, whoever's they are: one per kind of miss
+		for _, key := range p.targets(binding) {
+			target := p.model[key]
+			touched := p.write(ctx, describe, `DELETE FROM `+p.table+` WHERE `+p.key+`::text = $1 RETURNING `+p.key+`::text`, key)
+			if mayWrite(binding, target) {
+				p.same(describe+": delete of a row it may write", touched, []string{key})
+				delete(p.model, key)
+			} else {
+				p.same(describe+": delete of a row it may not write", touched, nil)
+			}
 		}
-		touched := p.write(ctx, describe, `DELETE FROM `+p.table+` WHERE `+p.key+`::text = $1 RETURNING `+p.key+`::text`, key)
-		if mayWrite(binding, target) {
-			p.same(describe+": delete of a row it may write", touched, []string{key})
-			delete(p.model, key)
-		} else {
-			p.same(describe+": delete of a row it may not write", touched, nil)
-		}
-	case 2: // rewrite one named row, whoever's it is
-		key, target := p.target(binding)
-		if key == "" {
-			break
-		}
+	case 2: // rewrite named rows, whoever's they are: one per kind of miss
 		body := fmt.Sprintf("round-%d", round)
-		touched := p.write(ctx, describe, `UPDATE `+p.table+` SET `+p.body+` = $1 WHERE `+p.key+`::text = $2 RETURNING `+p.key+`::text`, body, key)
-		if mayWrite(binding, target) {
-			p.same(describe+": update of a row it may write", touched, []string{key})
-			target.body = body
-			p.model[key] = target
-		} else {
-			p.same(describe+": update of a row it may not write", touched, nil)
+		for _, key := range p.targets(binding) {
+			target := p.model[key]
+			touched := p.write(ctx, describe, `UPDATE `+p.table+` SET `+p.body+` = $1 WHERE `+p.key+`::text = $2 RETURNING `+p.key+`::text`, body, key)
+			if mayWrite(binding, target) {
+				p.same(describe+": update of a row it may write", touched, []string{key})
+				target.body = body
+				p.model[key] = target
+			} else {
+				p.same(describe+": update of a row it may not write", touched, nil)
+			}
 		}
-	case 3, 4: // insert a row: the caller's own, or one step away from it
-		candidate := row{
-			partition: binding.Partition, scope: binding.Reach[p.random.IntN(len(binding.Reach))], principal: binding.Principal,
+	case 3, 4: // insert: the caller's own row where it may write, then each row one step away from it
+		reach := writeReach(binding)
+		own := row{
+			partition: binding.Partition, scope: reach[p.random.IntN(len(reach))], principal: binding.Principal,
 			shared: p.random.IntN(4) == 0, body: fmt.Sprintf("round-%d", round),
 		}
-		switch p.random.IntN(5) {
-		case 1: // another principal's, where the caller may otherwise write
-			candidate.principal = p.pick(p.principals)
-		case 2: // its own, in a scope that may be out of reach
-			candidate.scope = p.pick(p.scopes)
-		case 3: // its own, in another partition
-			candidate.partition = p.pick(p.partitions)
-		case 4: // anything at all
-			shared := candidate.shared
-			candidate = p.randomRow()
-			candidate.shared, candidate.body = shared, fmt.Sprintf("round-%d", round)
+		candidates := []row{own}
+		step := func(edit func(*row)) {
+			candidate := own
+			edit(&candidate)
+			candidates = append(candidates, candidate)
 		}
-		statement, extra := p.insertSQL()
-		var key string
-		err := p.store.Write(ctx, func(ctx context.Context, tx postgres.WriteTx) error {
-			return tx.QueryRow(ctx, statement, p.insertArguments(candidate, extra)...).Scan(&key)
+		// Another principal's, where the caller may otherwise write.
+		step(func(candidate *row) { candidate.principal = p.pick(p.principals) })
+		// Its own, in a scope it reads and may not write, or any scope at all.
+		step(func(candidate *row) {
+			candidate.scope = p.pick(p.scopes)
+			for _, scope := range binding.Reach {
+				if !slices.Contains(reach, scope) {
+					candidate.scope = scope
+				}
+			}
 		})
-		switch {
-		case mayWrite(binding, candidate) && err != nil:
-			p.t.Fatalf("rowscopetest: %s: insert of %+v it may write was refused: %v", describe, candidate, err)
-		case mayWrite(binding, candidate):
-			p.model[key] = candidate
-			p.accepted++
-		case sqlState(err) != "42501":
-			p.t.Fatalf("rowscopetest: %s: insert of %+v it may not write: %v, want a row-policy refusal", describe, candidate, err)
-		default:
-			p.refused++
+		// Its own, in another partition.
+		step(func(candidate *row) { candidate.partition = p.pick(p.partitions) })
+		// Anything at all.
+		step(func(candidate *row) {
+			shared, body := candidate.shared, candidate.body
+			*candidate = p.randomRow()
+			candidate.shared, candidate.body = shared, body
+		})
+		statement, extra := p.insertSQL()
+		for _, candidate := range candidates {
+			var key string
+			err := p.store.Write(ctx, func(ctx context.Context, tx postgres.WriteTx) error {
+				return tx.QueryRow(ctx, statement, p.insertArguments(candidate, extra)...).Scan(&key)
+			})
+			switch {
+			case mayWrite(binding, candidate) && err != nil:
+				p.t.Fatalf("rowscopetest: %s: insert of %+v it may write was refused: %v", describe, candidate, err)
+			case mayWrite(binding, candidate):
+				p.model[key] = candidate
+				p.accepted++
+			case sqlState(err) != "42501":
+				p.t.Fatalf("rowscopetest: %s: insert of %+v it may not write: %v, want a row-policy refusal", describe, candidate, err)
+			default:
+				p.refused++
+			}
 		}
 	case 5: // move every row in sight to another scope, principal or partition
-		column, value := p.scope, binding.Reach[0]
-		switch p.random.IntN(3) {
-		case 1:
-			column, value = p.principal, binding.Principal
-		case 2:
-			column, value = p.partition, binding.Partition
-		}
 		// Even to a value the binding itself holds: these columns never change.
-		err := p.store.Write(ctx, func(ctx context.Context, tx postgres.WriteTx) error {
-			_, err := tx.Exec(ctx, `UPDATE `+p.table+` SET `+column+` = $1`, value)
-			return err
-		})
-		if sqlState(err) != "42501" {
-			p.t.Fatalf("rowscopetest: %s: UPDATE of %s: %v, want permission denied", describe, column, err)
+		for _, move := range []struct{ column, value string }{
+			{p.scope, writeReach(binding)[0]}, {p.principal, binding.Principal}, {p.partition, binding.Partition},
+		} {
+			err := p.store.Write(ctx, func(ctx context.Context, tx postgres.WriteTx) error {
+				_, err := tx.Exec(ctx, `UPDATE `+p.table+` SET `+move.column+` = $1`, move.value)
+				return err
+			})
+			if sqlState(err) != "42501" {
+				p.t.Fatalf("rowscopetest: %s: UPDATE of %s: %v, want permission denied", describe, move.column, err)
+			}
+			p.refused++
 		}
-		p.refused++
+	case 6: // read inside the write transaction: the reach, as the write mode
+		var seen []string
+		if err := p.store.Write(ctx, func(ctx context.Context, tx postgres.WriteTx) error {
+			rows, err := tx.Query(ctx, `SELECT `+p.key+`::text FROM `+p.table)
+			if err != nil {
+				return err
+			}
+			seen, err = pgx.CollectRows(rows, pgx.RowTo[string])
+			return err
+		}); err != nil {
+			p.t.Fatalf("rowscopetest: %s: read inside a write transaction: %v", describe, err)
+		}
+		p.reads++
+		p.same(describe+": read inside a write transaction", seen, p.expected(binding, seesInWrite))
 	}
 	// What the database now holds is what the model says, whatever the
 	// transaction reported about itself.
@@ -474,34 +612,95 @@ func (p *prover) round(round int) {
 
 var errRollBack = errors.New("roll back")
 
-// target picks the row a write is aimed at. Aiming at random would almost
-// always miss by the partition alone, and prove only the wall; so half the
-// time it is the nearest miss there is, a row the binding may read and may not
-// write, and otherwise a row of the binding's partition, or any row.
-func (p *prover) target(binding postgres.Binding) (string, row) {
-	var near, local, all []string
-	for key, candidate := range p.model {
+// attack sends, as the reader's login in a READ WRITE transaction bound to the
+// Read binding's own role, the writes its transaction could be made to send.
+// Every setting is bound as a writer's would be, the write reach included, so
+// that nothing stands in the way but what the role holds: each must be
+// permission denied, not a silent zero.
+func (p *prover) attack(binding postgres.Binding, describe string) {
+	p.t.Helper()
+	role := p.proof.Roles.StrictRead
+	if binding.Mode == postgres.Privileged {
+		role = p.proof.Roles.PrivilegedRead
+	}
+	settings := p.proof.Settings
+	reach := strings.Join(binding.Reach, ",")
+	tx, err := p.reader.BeginTx(p.ctx, pgx.TxOptions{AccessMode: pgx.ReadWrite})
+	if err != nil {
+		p.t.Fatalf("rowscopetest: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(p.ctx, `SELECT set_config($1, $2, true), set_config($3, $4, true), set_config($5, $6, true), set_config($7, $8, true), set_config('role', $9, true)`,
+		settings.Partition, binding.Partition, settings.Principal, binding.Principal, settings.Reach, reach, settings.WriteReach, reach, role); err != nil {
+		p.t.Fatalf("rowscopetest: %s: assume %s on the read-only login: %v", describe, role, err)
+	}
+	insert, extra := p.insertSQL()
+	own := row{partition: binding.Partition, scope: binding.Reach[0], principal: binding.Principal, body: "attack"}
+	for _, attempt := range []struct {
+		statement string
+		arguments []any
+	}{
+		{`DELETE FROM ` + p.table, nil},
+		{`UPDATE ` + p.table + ` SET ` + p.body + ` = 'attack'`, nil},
+		{insert, p.insertArguments(own, extra)},
+		{`SELECT 1 FROM ` + p.table + ` FOR UPDATE`, nil},
+		{`TRUNCATE ` + p.table, nil},
+	} {
+		savepoint, err := tx.Begin(p.ctx)
+		if err != nil {
+			p.t.Fatalf("rowscopetest: %v", err)
+		}
+		_, err = savepoint.Exec(p.ctx, attempt.statement, attempt.arguments...)
+		_ = savepoint.Rollback(p.ctx)
+		if sqlState(err) != "42501" {
+			p.t.Fatalf("rowscopetest: %s: on read role %s outside READ ONLY, %s => %v (SQLSTATE %q), want permission denied: the role holds more than SELECT (seed %d)",
+				describe, role, attempt.statement, err, sqlState(err), p.proof.Seed)
+		}
+		p.denied++
+	}
+	p.readers++
+}
+
+// targets picks the rows a write is aimed at. Aiming at random would almost
+// always miss by the partition alone, and prove only the wall; so there is one
+// row of each kind of nearest miss that exists — a row the write transaction
+// sees and may not write because it is another principal's, one it sees in a
+// scope outside its write reach, one its reads return and its write
+// transaction does not — and then a row of the binding's partition, or any row.
+func (p *prover) targets(binding postgres.Binding) []string {
+	var byPrincipal, byReach, byMode, local, all []string
+	keys := p.keys()
+	sort.Strings(keys)
+	for _, key := range keys {
+		candidate := p.model[key]
 		all = append(all, key)
 		if candidate.partition == binding.Partition {
 			local = append(local, key)
 		}
-		if mayRead(binding, candidate) && !mayWrite(binding, candidate) {
-			near = append(near, key)
+		switch inWriteReach := slices.Contains(writeReach(binding), candidate.scope); {
+		case mayWrite(binding, candidate):
+		case seesInWrite(binding, candidate) && inWriteReach:
+			byPrincipal = append(byPrincipal, key)
+		case seesInWrite(binding, candidate):
+			byReach = append(byReach, key)
+		case mayRead(binding, candidate):
+			byMode = append(byMode, key)
 		}
 	}
-	from := all
-	switch choice := p.random.IntN(4); {
-	case choice < 2 && len(near) > 0:
-		from = near
-	case choice < 3 && len(local) > 0:
-		from = local
+	any := all
+	if len(local) > 0 && p.random.IntN(2) == 0 {
+		any = local
 	}
-	if len(from) == 0 {
-		return "", row{}
+	var picked []string
+	for _, from := range [][]string{byPrincipal, byReach, byMode, any} {
+		if len(from) == 0 {
+			continue
+		}
+		if key := p.pick(from); !slices.Contains(picked, key) {
+			picked = append(picked, key)
+		}
 	}
-	sort.Strings(from)
-	key := p.pick(from)
-	return key, p.model[key]
+	return picked
 }
 
 func (p *prover) write(ctx context.Context, describe, statement string, arguments ...any) []string {

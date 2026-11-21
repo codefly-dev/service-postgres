@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	postgres "github.com/codefly-dev/service-postgres/libs/go"
 	"github.com/codefly-dev/service-postgres/libs/go/internal/rowscopefixture"
 	"github.com/codefly-dev/service-postgres/libs/go/migrationtest"
 )
@@ -16,7 +17,13 @@ func gateFindings(t *testing.T, sandbox *rowscopefixture.Sandbox, connection str
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	gate.Roles = sandbox.Roles()
+	if gate.Roles == (postgres.Roles{}) {
+		gate.Roles = sandbox.Roles()
+	}
+	// The sandbox's two logins each serve both modes, as one process would.
+	if gate.BothModes == nil {
+		gate.BothModes = []string{sandbox.Role("ro"), sandbox.Role("rw")}
+	}
 	findings, err := migrationtest.CheckRowScope(ctx, sandbox.Connect(t, connection), gate)
 	if err != nil {
 		t.Fatal(err)
@@ -37,11 +44,15 @@ func TestRowScopeGatePassesOnAProtectedStore(t *testing.T) {
 	sandbox.Exec(t, sandbox.Owner,
 		`CREATE TABLE schema_migrations (version bigint PRIMARY KEY, dirty boolean NOT NULL)`,
 		`CREATE TABLE unit (code text PRIMARY KEY)`,
-		`GRANT SELECT ON unit TO `+sandbox.Role("strict")+`, `+sandbox.Role("privileged"),
+		`GRANT SELECT ON unit TO `+sandbox.Role("strict_read")+`, `+sandbox.Role("privileged_read")+`, `+sandbox.Role("strict_write"),
+		// A sequence a writer advances, and no reader may.
+		`CREATE SEQUENCE ticket`,
+		`GRANT USAGE ON SEQUENCE ticket TO `+sandbox.Role("strict_write")+`, `+sandbox.Role("privileged_write"),
 		`CREATE VIEW item_bodies WITH (security_invoker = true) AS SELECT id, body FROM item`,
-		`GRANT SELECT ON item_bodies TO `+sandbox.Role("strict"))
+		`GRANT SELECT ON item_bodies TO `+sandbox.Role("strict_read"))
 	gate := migrationtest.RowScopeGate{
-		Logins: []string{sandbox.Role("ro"), sandbox.Role("rw")},
+		Logins:    []string{sandbox.Role("ro"), sandbox.Role("rw")},
+		BothModes: []string{sandbox.Role("ro"), sandbox.Role("rw")},
 		Exempt: []migrationtest.RowScopeExemption{
 			{Relation: "public.schema_migrations", Reason: "the migration ledger: owner-only, no runtime grant"},
 			{Relation: "public.unit", Reason: "reference data, the same for every partition"},
@@ -69,7 +80,8 @@ func TestRowScopeGateFindsEachDefect(t *testing.T) {
 		superuser bool
 		want      []string
 	}
-	strict := func(s *rowscopefixture.Sandbox) string { return s.Role("strict") }
+	strict := func(s *rowscopefixture.Sandbox) string { return s.Role("strict_write") }
+	reader := func(s *rowscopefixture.Sandbox) string { return s.Role("strict_read") }
 	for name, test := range map[string]defect{
 		"row security never enabled": {
 			damage: func(*rowscopefixture.Sandbox) []string {
@@ -107,7 +119,7 @@ func TestRowScopeGateFindsEachDefect(t *testing.T) {
 		"the partition policy is permissive": {
 			damage: func(s *rowscopefixture.Sandbox) []string {
 				return []string{`DROP POLICY rowscope_partition ON item`,
-					`CREATE POLICY rowscope_partition ON item FOR ALL TO ` + strict(s) + `, ` + s.Role("privileged") + `
+					`CREATE POLICY rowscope_partition ON item FOR ALL TO ` + strict(s) + `, ` + s.Role("privileged_write") + `, ` + reader(s) + `, ` + s.Role("privileged_read") + `
 						USING (tenant = NULLIF(current_setting('codefly.current_tenant_id', true), ''))`}
 			},
 			want: []string{`to the partition (USING and WITH CHECK reading codefly.current_tenant_id)`},
@@ -149,7 +161,7 @@ func TestRowScopeGateFindsEachDefect(t *testing.T) {
 		},
 		"the scope column is mutable": {
 			damage: func(s *rowscopefixture.Sandbox) []string {
-				return []string{`GRANT UPDATE (scope) ON item TO ` + s.Role("privileged")}
+				return []string{`GRANT UPDATE (scope) ON item TO ` + s.Role("privileged_write")}
 			},
 			want: []string{`may UPDATE "scope"`},
 		},
@@ -212,13 +224,105 @@ func TestRowScopeGateFindsEachDefect(t *testing.T) {
 		"a mode role that does not exist": {
 			gate: func(*rowscopefixture.Sandbox) migrationtest.RowScopeGate { return migrationtest.RowScopeGate{} },
 			damage: func(s *rowscopefixture.Sandbox) []string {
-				return []string{`ALTER ROLE ` + s.Role("privileged") + ` RENAME TO ` + s.Role("renamed")}
+				return []string{`ALTER ROLE ` + s.Role("privileged_write") + ` RENAME TO ` + s.Role("renamed")}
 			},
 			want: []string{`mode role "`, `does not exist`},
 		},
 		"a mode role that can log in": {
 			damage: func(s *rowscopefixture.Sandbox) []string { return []string{`ALTER ROLE ` + strict(s) + ` LOGIN`} },
 			want:   []string{`can log in`},
+		},
+		// The access: a read role holds SELECT alone, on anything.
+		"a read role holds DELETE": {
+			damage: func(s *rowscopefixture.Sandbox) []string { return []string{`GRANT DELETE ON item TO ` + reader(s)} },
+			want:   []string{`public.item: read role "`, `holds INSERT, UPDATE, DELETE or TRUNCATE on it`},
+		},
+		"a read role holds UPDATE on one column": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`GRANT UPDATE (body) ON item TO ` + s.Role("privileged_read")}
+			},
+			want: []string{`public.item: read role "`, `holds INSERT, UPDATE, DELETE or TRUNCATE on it`},
+		},
+		"a read role may TRUNCATE": {
+			damage: func(s *rowscopefixture.Sandbox) []string { return []string{`GRANT TRUNCATE ON item TO ` + reader(s)} },
+			want:   []string{`public.item: read role "`},
+		},
+		"a read role writes an exempt table": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`CREATE TABLE unit (code text PRIMARY KEY)`, `GRANT SELECT, INSERT ON unit TO ` + reader(s)}
+			},
+			gate: func(*rowscopefixture.Sandbox) migrationtest.RowScopeGate {
+				return migrationtest.RowScopeGate{Exempt: []migrationtest.RowScopeExemption{{Relation: "public.unit", Reason: "reference data"}}}
+			},
+			want: []string{`public.unit: read role "`},
+		},
+		"a read role may advance a sequence": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`CREATE SEQUENCE ticket`, `GRANT USAGE ON SEQUENCE ticket TO ` + reader(s)}
+			},
+			want: []string{`public.ticket: read role "`, `holds USAGE or UPDATE on this sequence`},
+		},
+		"a read role inherits the write role": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`GRANT ` + strict(s) + ` TO ` + reader(s) + ` WITH INHERIT TRUE, SET FALSE`}
+			},
+			want: []string{`public.item: read role "`, `is a member of "`},
+		},
+		// The fence: which roles a login's SQL can reach.
+		"the reader's login may assume a write role": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`GRANT ` + strict(s) + ` TO ` + s.Role("ro") + ` WITH INHERIT FALSE, SET TRUE`}
+			},
+			gate: func(s *rowscopefixture.Sandbox) migrationtest.RowScopeGate {
+				return migrationtest.RowScopeGate{Logins: []string{s.Role("ro")}}
+			},
+			want: []string{`runtime login "`, `_ro" may SET ROLE to read role "`, `which writes`},
+		},
+		"the writer's login may assume a read role": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`GRANT ` + reader(s) + ` TO ` + s.Role("rw") + ` WITH INHERIT FALSE, SET TRUE`}
+			},
+			want: []string{`_rw" may SET ROLE to read role "`},
+		},
+		"the reader's login reaches a write role through the read role": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`GRANT ` + strict(s) + ` TO ` + reader(s) + ` WITH INHERIT FALSE, SET TRUE`}
+			},
+			as:   func(s *rowscopefixture.Sandbox) string { return s.ReadOnly },
+			want: []string{`_ro" may SET ROLE to read role "`, `is a member of "`},
+		},
+		"one login for both modes, not accepted": {
+			gate: func(*rowscopefixture.Sandbox) migrationtest.RowScopeGate {
+				return migrationtest.RowScopeGate{BothModes: []string{}}
+			},
+			want: []string{`_rw" may SET ROLE to "`, `can run privileged`, `list this one in BothModes`},
+		},
+		"BothModes names a login that holds one mode": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`REVOKE ` + s.Role("privileged_write") + ` FROM ` + s.Role("rw")}
+			},
+			want: []string{`_rw" is listed in BothModes and may assume the roles of one mode at most`},
+		},
+		// The write reach.
+		"a write verb is not bound to the write reach": {
+			damage: func(*rowscopefixture.Sandbox) []string { return []string{`DROP POLICY rowscope_reach_delete ON item`} },
+			want:   []string{`no RESTRICTIVE policy binds DELETE by mode role "`, `to the write reach (reading codefly.current_write_scopes)`},
+		},
+		"the write-reach policy reads the reach": {
+			damage: func(s *rowscopefixture.Sandbox) []string {
+				return []string{`DROP POLICY rowscope_reach_insert ON item`,
+					`CREATE POLICY rowscope_reach_insert ON item AS RESTRICTIVE FOR INSERT TO ` + strict(s) + `, ` + s.Role("privileged_write") + `
+						WITH CHECK (scope = ANY (string_to_array(NULLIF(current_setting('codefly.current_scopes', true), ''), ',')))`}
+			},
+			want: []string{`no RESTRICTIVE policy binds INSERT by mode role "`},
+		},
+		"one name for two roles": {
+			gate: func(s *rowscopefixture.Sandbox) migrationtest.RowScopeGate {
+				roles := s.Roles()
+				roles.StrictRead = roles.StrictWrite
+				return migrationtest.RowScopeGate{Roles: roles}
+			},
+			want: []string{`is named for two of the store's roles`},
 		},
 		// The gate asks what the production login can reach. Run as a login
 		// that bypasses row security it would pass on anything, so it says so.
@@ -257,4 +361,30 @@ func TestRowScopeGateFindsEachDefect(t *testing.T) {
 			t.Log("\n" + findings)
 		})
 	}
+}
+
+// A store migrated before the read and write roles existed still passes every
+// check it passed, and is told exactly what it lacks: per mode, that one role
+// serves reads and writes; per write verb, that nothing binds it to the write
+// reach. Nothing else.
+func TestRowScopeGateTellsATwoRoleStoreWhatIsMissing(t *testing.T) {
+	sandbox := rowscopefixture.Open(t)
+	sandbox.MigrateTwoRoles(t, "item")
+	findings := gateFindings(t, sandbox, sandbox.ReadWrite, migrationtest.RowScopeGate{Roles: sandbox.TwoRoles(), Logins: []string{sandbox.Role("ro")}})
+	lines := strings.Split(findings, "\n")
+	var legacy, unbound int
+	for _, line := range lines {
+		switch {
+		case strings.Contains(line, "is the two-role form's") && strings.Contains(line, "rowscope.Bootstrap"):
+			legacy++
+		case strings.HasPrefix(line, "public.item: no RESTRICTIVE policy binds ") && strings.Contains(line, "to the write reach"):
+			unbound++
+		default:
+			t.Fatalf("an unexpected finding on a two-role store: %s\nall:\n%s", line, findings)
+		}
+	}
+	if legacy != 2 || unbound != 6 {
+		t.Fatalf("%d two-role findings and %d write-reach findings, want 2 and 6:\n%s", legacy, unbound, findings)
+	}
+	t.Log("\n" + findings)
 }

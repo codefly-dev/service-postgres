@@ -50,12 +50,13 @@ func TestStoreBindsSettingsAndRoleInOneStatement(t *testing.T) {
 		"codefly.current_principal", "human:dana",
 		"codefly.current_actor", "service:wiki",
 		"app_x_strict",
+		"codefly.current_write_scopes", "", // a read transaction has no write reach
 	}
 	if len(reader.tx.executions) != 1 || !reflect.DeepEqual(reader.tx.executions[0].arguments, want) {
 		t.Fatalf("binding arguments = %#v, want %#v", reader.tx.executions, want)
 	}
-	if statement := reader.tx.executions[0].statement; !strings.Contains(statement, "set_config('role', $11, true)") || strings.Count(statement, ", true)") != 6 {
-		t.Fatalf("binding statement is not six transaction-local settings: %s", statement)
+	if statement := reader.tx.executions[0].statement; !strings.Contains(statement, "set_config('role', $11, true)") || strings.Count(statement, ", true)") != 7 {
+		t.Fatalf("binding statement is not seven transaction-local settings: %s", statement)
 	}
 
 	privileged := strictBinding()
@@ -64,7 +65,7 @@ func TestStoreBindsSettingsAndRoleInOneStatement(t *testing.T) {
 	if err := store.Write(context.Background(), func(context.Context, WriteTx) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if writer.options.AccessMode != pgx.ReadWrite || writer.tx.executions[0].arguments[10] != "app_x_privileged" || !writer.tx.committed {
+	if writer.options.AccessMode != pgx.ReadWrite || writer.tx.executions[0].arguments[10] != "app_x_privileged" || writer.tx.executions[0].arguments[12] != "s1,s2" || !writer.tx.committed {
 		t.Fatalf("privileged write bound %#v", writer.tx.executions)
 	}
 }
@@ -121,7 +122,8 @@ func TestStoreRefusesAnIncompleteBindingBeforeDatabaseAccess(t *testing.T) {
 // The typed errors must stay distinguishable from each other: a caller maps
 // "nobody" and "nowhere" to different answers.
 func TestBindingErrorsAreDistinct(t *testing.T) {
-	all := []error{ErrNoBinding, ErrNoPartition, ErrNoPrincipal, ErrUnknownMode, ErrNoReach, ErrInvalidReach, ErrModeNotGranted, ErrReadOnly}
+	all := []error{ErrNoBinding, ErrNoPartition, ErrNoPrincipal, ErrUnknownMode, ErrNoReach, ErrInvalidReach, ErrModeNotGranted, ErrReadOnly,
+		ErrUnknownAccess, ErrWriteExceedsRead, ErrSplitBinding}
 	for i, one := range all {
 		for j, other := range all {
 			if i != j && errors.Is(one, other) {
@@ -188,6 +190,8 @@ func TestStoreRolesAndSettingsFailClosed(t *testing.T) {
 		WithBindingSettings("codefly.scopes", "codefly.principal;drop", "codefly.actor"),
 		WithBindingSettings("codefly.one", "codefly.one", "codefly.actor"),
 		WithBindingSettings("codefly.current_tenant_id", "codefly.principal", "codefly.actor"),
+		WithWriteReachSetting("write_scopes"),
+		WithWriteReachSetting("codefly.current_scopes"),
 	} {
 		if _, err := newStore(backend, backend, binder, testRoles, option); err == nil {
 			t.Fatal("unsafe or repeated binding setting accepted")
@@ -286,5 +290,127 @@ func TestFactoryScopeIsUnchangedByBindings(t *testing.T) {
 	execution := backend.tx.executions[0]
 	if execution.statement != `SELECT set_config($1, $2, true), set_config($3, $4, true)` || len(execution.arguments) != 4 {
 		t.Fatalf("factory installed %q with %#v", execution.statement, execution.arguments)
+	}
+}
+
+var accessRoles = AccessRoles("app_x")
+
+// The role a transaction assumes is decided by the Binding's mode and by which
+// capability was asked for, never by the handler: a Reader is the read role
+// whatever the access, a Writer the write role of the write mode.
+func TestStoreAssumesTheRoleOfTheModeAndTheAccess(t *testing.T) {
+	if accessRoles != (Roles{StrictRead: "app_x_strict_read", StrictWrite: "app_x_strict_write", PrivilegedRead: "app_x_privileged_read", PrivilegedWrite: "app_x_privileged_write"}) {
+		t.Fatalf("AccessRoles = %#v", accessRoles)
+	}
+	change := func(edit func(*Binding)) Binding {
+		binding := strictBinding()
+		edit(&binding)
+		return binding
+	}
+	for name, test := range map[string]struct {
+		binding           Binding
+		roles             Roles
+		read, write       string
+		writeReach        string
+		readErr, writeErr error
+	}{
+		"strict, access unnamed":        {strictBinding(), accessRoles, "app_x_strict_read", "app_x_strict_write", "s1,s2", nil, nil},
+		"strict read-write":             {change(func(b *Binding) { b.Access = ReadWrite }), accessRoles, "app_x_strict_read", "app_x_strict_write", "s1,s2", nil, nil},
+		"strict read":                   {change(func(b *Binding) { b.Access = Read }), accessRoles, "app_x_strict_read", "", "", nil, ErrReadOnly},
+		"privileged read":               {change(func(b *Binding) { b.Mode, b.Access = Privileged, Read }), accessRoles, "app_x_privileged_read", "", "", nil, ErrReadOnly},
+		"privileged read-write":         {change(func(b *Binding) { b.Mode = Privileged }), accessRoles, "app_x_privileged_read", "app_x_privileged_write", "s1,s2", nil, nil},
+		"privileged read, strict write": {change(func(b *Binding) { b.Mode, b.WriteMode = Privileged, Strict }), accessRoles, "app_x_privileged_read", "app_x_strict_write", "s1,s2", nil, nil},
+		"reads two scopes, writes one":  {change(func(b *Binding) { b.WriteReach = []string{"s2", "s2"} }), accessRoles, "app_x_strict_read", "app_x_strict_write", "s2", nil, nil},
+		// The deprecated field still narrows, and is never overruled.
+		"ReadOnly alone":             {change(func(b *Binding) { b.ReadOnly = true }), accessRoles, "app_x_strict_read", "", "", nil, ErrReadOnly},
+		"ReadOnly against ReadWrite": {change(func(b *Binding) { b.ReadOnly, b.Access = true, ReadWrite }), accessRoles, "app_x_strict_read", "", "", nil, ErrReadOnly},
+		// What a Read binding says about writing is still checked.
+		"read with a wider write mode":  {change(func(b *Binding) { b.Access, b.WriteMode = Read, Privileged }), accessRoles, "", "", "", ErrWriteExceedsRead, ErrWriteExceedsRead},
+		"strict read, privileged write": {change(func(b *Binding) { b.WriteMode = Privileged }), accessRoles, "", "", "", ErrWriteExceedsRead, ErrWriteExceedsRead},
+		"write reach outside the reach": {change(func(b *Binding) { b.WriteReach = []string{"s1", "s3"} }), accessRoles, "", "", "", ErrWriteExceedsRead, ErrWriteExceedsRead},
+		"write reach named and empty":   {change(func(b *Binding) { b.WriteReach = []string{} }), accessRoles, "", "", "", ErrNoReach, ErrNoReach},
+		"write reach with a comma":      {change(func(b *Binding) { b.WriteReach = []string{"s1,s2"} }), accessRoles, "", "", "", ErrInvalidReach, ErrInvalidReach},
+		"unknown access":                {change(func(b *Binding) { b.Access = 3 }), accessRoles, "", "", "", ErrUnknownAccess, ErrUnknownAccess},
+		"unknown write mode":            {change(func(b *Binding) { b.WriteMode = 7 }), accessRoles, "", "", "", ErrUnknownMode, ErrUnknownMode},
+		// A Store names only the roles its process runs.
+		"a store of readers":         {strictBinding(), Roles{StrictRead: "r"}, "r", "", "", nil, ErrModeNotGranted},
+		"a store of writers":         {strictBinding(), Roles{StrictWrite: "w"}, "", "w", "s1,s2", ErrModeNotGranted, nil},
+		"no role for the write mode": {change(func(b *Binding) { b.Mode, b.WriteMode = Privileged, Strict }), Roles{PrivilegedRead: "r", PrivilegedWrite: "w"}, "r", "", "", nil, ErrModeNotGranted},
+		// The two-role form: one role per mode for both, and nothing split.
+		"two roles":                  {strictBinding(), testRoles, "app_x_strict", "app_x_strict", "s1,s2", nil, nil},
+		"two roles, read":            {change(func(b *Binding) { b.Access = Read }), testRoles, "app_x_strict", "", "", nil, ErrReadOnly},
+		"two roles, split mode":      {change(func(b *Binding) { b.Mode, b.WriteMode = Privileged, Strict }), testRoles, "app_x_privileged", "", "", nil, ErrSplitBinding},
+		"two roles, split reach":     {change(func(b *Binding) { b.WriteReach = []string{"s1"} }), testRoles, "app_x_strict", "", "", nil, ErrSplitBinding},
+		"two roles and a read role":  {strictBinding(), Roles{Strict: "both", StrictRead: "r"}, "r", "both", "s1,s2", nil, nil},
+		"two roles and a write role": {change(func(b *Binding) { b.WriteReach = []string{"s1"} }), Roles{Strict: "both", StrictWrite: "w"}, "both", "w", "s1", nil, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			reader, writer := &fakeBeginner{tx: &fakeTransaction{}}, &fakeBeginner{tx: &fakeTransaction{}}
+			store := newTestStore(t, reader, writer, FixedBinder(test.binding), test.roles)
+			err := store.Read(context.Background(), func(context.Context, ReadTx) error { return nil })
+			if !errors.Is(err, test.readErr) || (test.readErr == nil && err != nil) {
+				t.Fatalf("read error = %v, want %v", err, test.readErr)
+			}
+			if test.readErr == nil {
+				arguments := reader.tx.executions[0].arguments
+				if arguments[10] != test.read || arguments[12] != "" || reader.options.AccessMode != pgx.ReadOnly {
+					t.Fatalf("read assumed %v with write reach %q, want %q and none", arguments[10], arguments[12], test.read)
+				}
+			}
+			err = store.Write(context.Background(), func(context.Context, WriteTx) error { return nil })
+			if !errors.Is(err, test.writeErr) || (test.writeErr == nil && err != nil) {
+				t.Fatalf("write error = %v, want %v", err, test.writeErr)
+			}
+			if test.writeErr != nil {
+				if writer.beginCalls != 0 {
+					t.Fatal("a refused write opened a transaction")
+				}
+				return
+			}
+			arguments := writer.tx.executions[0].arguments
+			if arguments[10] != test.write || arguments[11] != "codefly.current_write_scopes" || arguments[12] != test.writeReach || arguments[5] != "s1,s2" {
+				t.Fatalf("write assumed %v with write reach %q in reach %q, want %q and %q", arguments[10], arguments[12], arguments[5], test.write, test.writeReach)
+			}
+		})
+	}
+}
+
+func TestStoreRolesMustBeDistinctAcrossModesAndAccesses(t *testing.T) {
+	backend := &fakeBeginner{tx: &fakeTransaction{}}
+	for name, roles := range map[string]Roles{
+		"read is write":           {StrictRead: "one", StrictWrite: "one"},
+		"read role of both modes": {StrictRead: "one", PrivilegedRead: "one"},
+		"two-role form reused":    {Strict: "one", StrictRead: "one"},
+		"reset keyword":           {PrivilegedRead: "none"},
+	} {
+		if _, err := newStore(backend, backend, FixedBinder(strictBinding()), roles); err == nil {
+			t.Fatalf("%s: roles %#v accepted", name, roles)
+		}
+	}
+}
+
+// A capability carries the access it was minted with: the worker that replays
+// it cannot write on a Read one, and cannot write wider than it recorded.
+func TestCapabilityCarriesItsAccess(t *testing.T) {
+	backend := &fakeBeginner{tx: &fakeTransaction{}}
+	nobody := BinderFunc(func(context.Context) (Binding, error) { return Binding{}, errors.New("no call") })
+	store := newTestStore(t, backend, backend, nobody, accessRoles)
+	recorded := strictBinding()
+	recorded.Mode, recorded.WriteMode, recorded.WriteReach = Privileged, Strict, []string{"s1"}
+	capability, err := store.Capability(recorded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded.WriteReach[0] = "s2"
+	if err := store.Write(capability.Context(context.Background()), func(context.Context, WriteTx) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if arguments := backend.tx.executions[0].arguments; arguments[10] != "app_x_strict_write" || arguments[12] != "s1" {
+		t.Fatalf("capability bound %#v", arguments)
+	}
+	// One no transaction of this Store could honour is refused when minted.
+	readers := newTestStore(t, backend, backend, nobody, Roles{PrivilegedRead: "r"})
+	if _, err := readers.Capability(strictBinding()); !errors.Is(err, ErrModeNotGranted) {
+		t.Fatalf("capability for a mode with no role: %v", err)
 	}
 }
