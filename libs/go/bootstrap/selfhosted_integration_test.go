@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/codefly-dev/service-postgres/libs/go/controlplane"
+	"github.com/codefly-dev/service-postgres/libs/go/schemaplan"
 )
 
 // TestSelfHostedBootstrapProvisionsPasswordLogins runs the in-cluster path: the
@@ -20,10 +21,12 @@ func TestSelfHostedBootstrapProvisionsPasswordLogins(t *testing.T) {
 	admin := fixtureDB(t, "postgres", "postgres")
 	statement(t, admin, "CREATE ROLE selfhosted_owner LOGIN CREATEROLE NOSUPERUSER PASSWORD 'owner-only'")
 	statement(t, admin, "CREATE DATABASE selfhosted_proof OWNER selfhosted_owner")
-	dir, p, b := packageFixture(t, "CREATE TABLE receipts(id serial PRIMARY KEY, value text); CREATE ROLE selfhosted_app NOLOGIN; GRANT INSERT, SELECT ON receipts TO selfhosted_app; GRANT USAGE ON SEQUENCE receipts_id_seq TO selfhosted_app;")
+	dir, p, b := packageFixture(t, "CREATE TABLE receipts(id serial PRIMARY KEY, value text); CREATE ROLE selfhosted_reader NOLOGIN; GRANT SELECT ON receipts TO selfhosted_reader; CREATE ROLE selfhosted_app NOLOGIN; GRANT INSERT, SELECT ON receipts TO selfhosted_app; GRANT USAGE ON SEQUENCE receipts_id_seq TO selfhosted_app;")
 	p.Database = "selfhosted_proof"
 	// Roles are cluster-wide: these must not be the managed test's groups.
 	p.Access.ReadOnlyRole, p.Access.ReadWriteRole = "selfhosted_ro", "selfhosted_rw"
+	p.ContractVersion = schemaplan.ReaderRolesContractVersion
+	p.Access.ReadOnlyRoles = []string{"selfhosted_reader"}
 	p.Access.ReadWriteRoles = []string{"selfhosted_app"}
 	b = Binding{OwnerRole: "selfhosted_owner"}
 	writePlan(t, dir, p, &b)
@@ -62,6 +65,10 @@ func TestSelfHostedBootstrapProvisionsPasswordLogins(t *testing.T) {
 		t.Fatal("unexpected login set: want owner, ro, rw and maintenance")
 	}
 	owner := fixtureDB(t, "selfhosted_proof", "selfhosted_owner")
+	if value(t, owner, "SELECT pg_has_role('selfhosted_ro','selfhosted_reader','MEMBER')::text") != "true" ||
+		value(t, owner, "SELECT has_table_privilege('selfhosted_ro','receipts','SELECT')::text") != "false" {
+		t.Fatal("password reader requires delegated membership and no direct SELECT")
+	}
 	if value(t, owner, "SELECT (version=1 AND NOT dirty)::text FROM schema_migrations_application") != "true" {
 		t.Fatal("ledger mismatch")
 	}

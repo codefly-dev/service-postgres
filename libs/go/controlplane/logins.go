@@ -32,6 +32,10 @@ type PasswordAccess struct {
 	ReadWriteRole     string
 	ReadWritePassword string
 	Schemas           []string
+	// ReconcileReadOnlyRoleMemberships opts into exclusive reader delegation.
+	// An empty list in this mode revokes every reader membership.
+	ReconcileReadOnlyRoleMemberships bool
+	ReadOnlyRoles                    []string
 	// ReadWriteRoles are the read-write login's delegated application roles.
 	ReadWriteRoles []string
 	Logins         []PasswordLogin
@@ -74,6 +78,8 @@ func ReconcilePasswordAccess(ctx context.Context, tx *sql.Tx, access PasswordAcc
 			Database:                          access.Database,
 			OwnerRole:                         access.OwnerRole,
 			ReadOnlyRole:                      access.ReadOnlyRole,
+			ReadOnlyRoles:                     access.ReadOnlyRoles,
+			ReconcileReadOnlyRoleMemberships:  access.ReconcileReadOnlyRoleMemberships,
 			ReadWriteRole:                     login.Role,
 			Schemas:                           access.Schemas,
 			ReadWriteRoles:                    login.ReadWriteRoles,

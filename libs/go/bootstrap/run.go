@@ -268,7 +268,8 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 	}
 	if o.Password != nil {
 		if e = controlplane.ReconcilePasswordAccess(ctx, tx, controlplane.PasswordAccess{Database: p.Database, OwnerRole: o.Binding.OwnerRole,
-			ReadOnlyRole: p.Access.ReadOnlyRole, ReadOnlyPassword: o.Password.ReadOnly, ReadWriteRole: p.Access.ReadWriteRole, ReadWritePassword: o.Password.ReadWrite,
+			ReadOnlyRole: p.Access.ReadOnlyRole, ReadOnlyPassword: o.Password.ReadOnly,
+			ReadOnlyRoles: p.Access.ReadOnlyRoles, ReconcileReadOnlyRoleMemberships: p.ContractVersion == schemaplan.ReaderRolesContractVersion, ReadWriteRole: p.Access.ReadWriteRole, ReadWritePassword: o.Password.ReadWrite,
 			Schemas: p.Access.Schemas, ReadWriteRoles: p.Access.ReadWriteRoles, Logins: o.Password.Logins}); e != nil {
 			return result, errors.New("runtime access reconciliation failed")
 		}

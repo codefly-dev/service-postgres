@@ -181,6 +181,10 @@ identity mode and reconciles its application-role memberships. Platform bindings
 still supply the pre-existing login principals. Packages must not reconstruct the
 primitive's role-name algorithm or create its managed groups in application SQL.
 
+For self-hosted password plans, the same v2 policy applies directly to the
+managed read-only login. The login explicitly selects its application reader
+role per transaction. Additional writer logins do not grant it direct SELECT.
+
 V2 reader delegation is exclusive: the group has CONNECT/USAGE, no direct table or
 sequence privileges, and no default SELECT. Sessions explicitly select the
 application reader role, just as they select an application writer role. An empty
