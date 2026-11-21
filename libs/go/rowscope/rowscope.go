@@ -1,17 +1,23 @@
 // Package rowscope emits the SQL that makes one table row-confined, so that an
 // application's migrations state which table and which columns and never
-// hand-write a policy: the two mode roles, the grants, ENABLE and FORCE ROW
-// LEVEL SECURITY, and the strict and privileged policies a postgres.Store's
-// Binding is read by.
+// hand-write a policy: the roles of each mode and access, the grants, ENABLE
+// and FORCE ROW LEVEL SECURITY, and the strict and privileged policies a
+// postgres.Store's Binding is read by.
 //
 // It emits text and runs nothing. A migration embeds the output (or a
 // generator writes it to a numbered migration file), and the migration owner
 // runs it; migrationtest.CheckRowScope then checks the catalog the migrations
 // left, whatever wrote them.
 //
-// The shape is proved in ../rowscope_spike_integration_test.go. Two things it
-// relies on are easy to get wrong by hand, which is why it is emitted:
+// The shape is proved in ../rowscope_spike_integration_test.go and
+// ../rowscope_access_spike_integration_test.go. Four things it relies on are
+// easy to get wrong by hand, which is why it is emitted:
 //
+//   - a read role holds SELECT and nothing else, so a write on it is refused
+//     with permission denied in any transaction, READ ONLY or not.
+//   - every policy names the roles it applies to, read and write, one by one.
+//     No role is a member of another: what a role reaches is what the catalog
+//     says about that role, and SET ROLE has no chain to walk.
 //   - a row's partition, scope and principal are immutable after insert
 //     because no mode role holds UPDATE on those columns. No policy stops a
 //     privileged transaction re-stamping a principal; the column privilege does.
@@ -31,19 +37,24 @@ import (
 
 // Settings names the transaction-local settings the policies read. They must
 // be the names the Store installs: WithScopeSettings' first name for the
-// partition and WithBindingSettings' first two for the reach and the principal.
+// partition, WithBindingSettings' first two for the reach and the principal,
+// and WithWriteReachSetting's for the write reach.
 type Settings struct {
 	Partition string
 	Reach     string
 	Principal string
+	// WriteReach is the scopes a write transaction may write, a subset of the
+	// reach. It is empty in a read transaction.
+	WriteReach string
 }
 
 // DefaultSettings are the Store's defaults.
 func DefaultSettings() Settings {
 	return Settings{
-		Partition: "codefly.current_tenant_id",
-		Reach:     "codefly.current_scopes",
-		Principal: "codefly.current_principal",
+		Partition:  "codefly.current_tenant_id",
+		Reach:      "codefly.current_scopes",
+		Principal:  "codefly.current_principal",
+		WriteReach: "codefly.current_write_scopes",
 	}
 }
 
@@ -134,16 +145,75 @@ func Columns(table Table) ([]string, error) {
 	}, nil
 }
 
-// Logins names the runtime logins that may assume each mode's role. A login
-// listed under Strict alone can never run a privileged transaction, whatever
-// SQL it sends: that membership is the only fence on the mode Postgres has.
-// List a login under both only when one process must serve both.
+// Logins names the runtime logins that may assume each role. Membership is
+// the only fence Postgres has on the mode and on the access: SET ROLE is
+// checked against the session's login, so SQL sent on a connection can assume
+// exactly the roles its login was granted, and no others.
+//
+//   - A login listed under read roles alone can never write a confined table,
+//     in any transaction. That is the reader pool's login.
+//   - A login listed under the strict roles alone can never run privileged.
+//
+// A login is refused under both a read role and a role that can write. Listing
+// one under both modes is allowed, and gives up the second fence for it.
 type Logins struct {
+	// Strict and Privileged are the logins of the two-role form's roles.
 	Strict     []string
 	Privileged []string
+
+	StrictRead      []string
+	StrictWrite     []string
+	PrivilegedRead  []string
+	PrivilegedWrite []string
 }
 
-// Bootstrap returns the statements that create the mode roles, idempotently, and
+// access is one role of a store, with what Protect and Bootstrap need of it.
+type access struct {
+	role       string
+	logins     []string
+	privileged bool
+	// reads and writes: a two-role form's role does both.
+	reads, writes bool
+}
+
+func accesses(roles postgres.Roles, logins Logins) []access {
+	all := []access{
+		{roles.Strict, logins.Strict, false, true, true},
+		{roles.StrictRead, logins.StrictRead, false, true, false},
+		{roles.StrictWrite, logins.StrictWrite, false, false, true},
+		{roles.Privileged, logins.Privileged, true, true, true},
+		{roles.PrivilegedRead, logins.PrivilegedRead, true, true, false},
+		{roles.PrivilegedWrite, logins.PrivilegedWrite, true, false, true},
+	}
+	return all
+}
+
+func named(all []access) ([]access, error) {
+	var kept []access
+	for _, one := range all {
+		if one.role == "" {
+			if len(one.logins) > 0 {
+				return nil, errors.New("logins were named for a mode that has no role")
+			}
+			continue
+		}
+		if err := validateIdentifier(one.role); err != nil {
+			return nil, fmt.Errorf("mode role: %w", err)
+		}
+		for _, other := range kept {
+			if other.role == one.role {
+				return nil, fmt.Errorf("role %q is named twice: distinct mode roles are required", one.role)
+			}
+		}
+		kept = append(kept, one)
+	}
+	if len(kept) == 0 {
+		return nil, errors.New("the role of at least one mode is required")
+	}
+	return kept, nil
+}
+
+// Bootstrap returns the statements that create the roles, idempotently, and
 // grant them to the named logins. Each role is NOLOGIN and holds nothing but
 // what Protect grants it. Each membership is INHERIT FALSE, SET TRUE: the
 // login gains nothing by connecting, and assumes the role per transaction.
@@ -152,127 +222,158 @@ type Logins struct {
 // service's runtime-read-write-roles, and let the migration create the roles
 // alone. PostgreSQL 16 or later.
 func Bootstrap(roles postgres.Roles, logins Logins) ([]string, error) {
+	all, err := named(accesses(roles, logins))
+	if err != nil {
+		return nil, err
+	}
 	var statements []string
-	for _, mode := range []struct {
-		role   string
-		logins []string
-	}{{roles.Strict, logins.Strict}, {roles.Privileged, logins.Privileged}} {
-		if mode.role == "" {
-			if len(mode.logins) > 0 {
-				return nil, errors.New("logins were named for a mode that has no role")
-			}
-			continue
-		}
-		if err := validateIdentifier(mode.role); err != nil {
-			return nil, fmt.Errorf("mode role: %w", err)
-		}
-		role := quote(mode.role)
+	reader, writer := map[string]string{}, map[string]string{}
+	for _, one := range all {
+		role := quote(one.role)
 		// A role an earlier migration left wider is not adopted: a migration
 		// owner without the attribute could not narrow it, so this one fails.
 		statements = append(statements, `DO $rowscope$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = `+literal(mode.role)+`) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = `+literal(one.role)+`) THEN
     CREATE ROLE `+role+` NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-  ELSIF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = `+literal(mode.role)+`
+  ELSIF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = `+literal(one.role)+`
       AND (rolcanlogin OR rolinherit OR rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)) THEN
-    RAISE EXCEPTION 'role % exists and is wider than a mode role may be', `+literal(mode.role)+`;
+    RAISE EXCEPTION 'role % exists and is wider than a mode role may be', `+literal(one.role)+`;
   END IF;
 END $rowscope$`)
-		for _, login := range mode.logins {
+		for _, login := range one.logins {
 			if err := validateIdentifier(login); err != nil {
 				return nil, fmt.Errorf("runtime login: %w", err)
 			}
-			if login == roles.Strict || login == roles.Privileged {
-				return nil, errors.New("a mode role cannot be granted to a mode role")
+			for _, other := range all {
+				if login == other.role {
+					return nil, errors.New("a mode role cannot be granted to a mode role")
+				}
+			}
+			// A read role proper is the access fence; a login that also holds
+			// a role that writes can step over it from a read transaction.
+			if one.writes {
+				writer[login] = one.role
+			} else {
+				reader[login] = one.role
+			}
+			if reader[login] != "" && writer[login] != "" {
+				return nil, fmt.Errorf("login %q would hold read role %q and %q, which writes: SQL on its read transactions could assume the second", login, reader[login], writer[login])
 			}
 			statements = append(statements, `GRANT `+role+` TO `+quote(login)+` WITH INHERIT FALSE, SET TRUE`)
 		}
-	}
-	if len(statements) == 0 {
-		return nil, errors.New("the role of at least one mode is required")
 	}
 	return statements, nil
 }
 
 // Protect returns the statements that confine one table: the grants to the
-// mode roles, ENABLE and FORCE ROW LEVEL SECURITY, the two restrictive
-// policies that bind both modes to the partition and the reach, the strict
-// policies, the privileged policy, and the index the policies are served by.
+// roles, ENABLE and FORCE ROW LEVEL SECURITY, the restrictive policies that
+// bind every role to the partition and the reach and every write to the write
+// reach, the strict policies, the privileged ones, and the index the policies
+// are served by.
 //
-// It is idempotent and complete: every grant a mode role held on the table is
+// A read role is granted SELECT and nothing else. A write role is granted
+// SELECT, INSERT, DELETE and UPDATE of the mutable columns, and is named in
+// its mode's read policy itself: no role inherits from another.
+//
+// It is idempotent and complete: every grant a named role held on the table is
 // revoked first and every policy it names is replaced, so a later migration
-// that adds a mutable column runs Protect again. It never touches a policy or
-// a grant of any other role, so a maintenance role keeps its own.
+// that adds a mutable column, or the read and write roles to a store that had
+// one role per mode, runs Protect again. It never touches a policy or a grant
+// of any other role, so a maintenance role keeps its own.
 func Protect(table Table, roles postgres.Roles, settings Settings) ([]string, error) {
 	table = table.defaulted()
 	if err := table.validate(); err != nil {
 		return nil, err
 	}
-	for name, setting := range map[string]string{"partition": settings.Partition, "reach": settings.Reach, "principal": settings.Principal} {
+	for name, setting := range map[string]string{"partition": settings.Partition, "reach": settings.Reach, "principal": settings.Principal, "write reach": settings.WriteReach} {
 		if err := validateSetting(setting); err != nil {
 			return nil, fmt.Errorf("%s setting: %w", name, err)
 		}
 	}
-	var modes []string
-	for _, role := range []string{roles.Strict, roles.Privileged} {
-		if role == "" {
-			continue
-		}
-		if err := validateIdentifier(role); err != nil {
-			return nil, fmt.Errorf("mode role: %w", err)
-		}
-		modes = append(modes, quote(role))
+	if settings.WriteReach == settings.Reach {
+		return nil, errors.New("the reach and the write reach are two settings")
 	}
-	if len(modes) == 0 || roles.Strict == roles.Privileged {
-		return nil, errors.New("distinct mode roles are required, at least one")
+	all, err := named(accesses(roles, Logins{}))
+	if err != nil {
+		return nil, err
 	}
-	both := strings.Join(modes, ", ")
+	list := func(keep func(access) bool) string {
+		var kept []string
+		for _, one := range all {
+			if keep(one) {
+				kept = append(kept, quote(one.role))
+			}
+		}
+		return strings.Join(kept, ", ")
+	}
+	every := list(func(access) bool { return true })
+	readers := list(func(one access) bool { return !one.writes })
+	writers := list(func(one access) bool { return one.writes })
+	strict := list(func(one access) bool { return !one.privileged })
+	strictWriters := list(func(one access) bool { return !one.privileged && one.writes })
+	privilegedReaders := list(func(one access) bool { return one.privileged && !one.writes })
+	privilegedWriters := list(func(one access) bool { return one.privileged && one.writes })
+
 	name := table.Qualified()
 	partition, scope, principal, shared := quote(table.Partition), quote(table.Scope), quote(table.Principal), quote(table.Shared)
 	read := func(setting string) string {
 		return `(SELECT NULLIF(current_setting(` + literal(setting) + `, true), ''))`
 	}
+	within := func(setting string) string {
+		return scope + ` = ANY ((SELECT string_to_array(NULLIF(current_setting(` + literal(setting) + `, true), ''), ','))::text[])`
+	}
 	inPartition := partition + ` = ` + read(settings.Partition)
-	inReach := scope + ` = ANY ((SELECT string_to_array(NULLIF(current_setting(` + literal(settings.Reach) + `, true), ''), ','))::text[])`
+	inReach, inWriteReach := within(settings.Reach), within(settings.WriteReach)
 	own := principal + ` = ` + read(settings.Principal)
 
 	statements := []string{
-		`GRANT USAGE ON SCHEMA ` + quote(table.Schema) + ` TO ` + both,
-		`REVOKE ALL ON TABLE ` + name + ` FROM ` + both,
-		`GRANT SELECT, INSERT, DELETE ON TABLE ` + name + ` TO ` + both,
+		`GRANT USAGE ON SCHEMA ` + quote(table.Schema) + ` TO ` + every,
+		`REVOKE ALL ON TABLE ` + name + ` FROM ` + every,
 	}
-	if len(table.Mutable) > 0 {
-		columns := make([]string, len(table.Mutable))
-		for index, column := range table.Mutable {
-			columns[index] = quote(column)
+	if writers != "" {
+		statements = append(statements, `GRANT SELECT, INSERT, DELETE ON TABLE `+name+` TO `+writers)
+		if len(table.Mutable) > 0 {
+			columns := make([]string, len(table.Mutable))
+			for index, column := range table.Mutable {
+				columns[index] = quote(column)
+			}
+			statements = append(statements, `GRANT UPDATE (`+strings.Join(columns, ", ")+`) ON TABLE `+name+` TO `+writers)
 		}
-		statements = append(statements, `GRANT UPDATE (`+strings.Join(columns, ", ")+`) ON TABLE `+name+` TO `+both)
+	}
+	if readers != "" {
+		// SELECT, and that is all: the refusal of a write is the grant's.
+		statements = append(statements, `GRANT SELECT ON TABLE `+name+` TO `+readers)
 	}
 	statements = append(statements,
 		`ALTER TABLE `+name+` ENABLE ROW LEVEL SECURITY`,
 		`ALTER TABLE `+name+` FORCE ROW LEVEL SECURITY`,
 	)
-	policy := func(suffix, definition string) {
+	policy := func(suffix, roles, definition string) {
+		if roles == "" {
+			return
+		}
 		statements = append(statements,
 			`DROP POLICY IF EXISTS `+quote("rowscope_"+suffix)+` ON `+name,
-			`CREATE POLICY `+quote("rowscope_"+suffix)+` ON `+name+` `+definition,
+			`CREATE POLICY `+quote("rowscope_"+suffix)+` ON `+name+` `+strings.Replace(definition, "TO ROLES", "TO "+roles, 1),
 		)
 	}
-	// The wall and the reach bind both modes. RESTRICTIVE: ANDed with whatever
+	// The wall and the reach bind every role. RESTRICTIVE: ANDed with whatever
 	// else is ever written for these roles.
-	policy("partition", `AS RESTRICTIVE FOR ALL TO `+both+` USING (`+inPartition+`) WITH CHECK (`+inPartition+`)`)
-	policy("reach", `AS RESTRICTIVE FOR ALL TO `+both+` USING (`+inReach+`) WITH CHECK (`+inReach+`)`)
-	if roles.Strict != "" {
-		strict := quote(roles.Strict)
-		// Mine, or shared, to read; mine to write.
-		policy("strict_read", `FOR SELECT TO `+strict+` USING (`+shared+` OR `+own+`)`)
-		policy("strict_insert", `FOR INSERT TO `+strict+` WITH CHECK (`+own+`)`)
-		policy("strict_modify", `FOR UPDATE TO `+strict+` USING (`+own+`) WITH CHECK (`+own+`)`)
-		policy("strict_delete", `FOR DELETE TO `+strict+` USING (`+own+`)`)
-	}
-	if roles.Privileged != "" {
-		// Bounded only by the two restrictive policies above.
-		policy("privileged", `FOR ALL TO `+quote(roles.Privileged)+` USING (true) WITH CHECK (true)`)
-	}
+	policy("partition", every, `AS RESTRICTIVE FOR ALL TO ROLES USING (`+inPartition+`) WITH CHECK (`+inPartition+`)`)
+	policy("reach", every, `AS RESTRICTIVE FOR ALL TO ROLES USING (`+inReach+`) WITH CHECK (`+inReach+`)`)
+	// The write reach binds every write, verb by verb: a policy is for one
+	// command or for all of them, and SELECT must not read this setting.
+	policy("reach_insert", writers, `AS RESTRICTIVE FOR INSERT TO ROLES WITH CHECK (`+inWriteReach+`)`)
+	policy("reach_modify", writers, `AS RESTRICTIVE FOR UPDATE TO ROLES USING (`+inWriteReach+`) WITH CHECK (`+inWriteReach+`)`)
+	policy("reach_delete", writers, `AS RESTRICTIVE FOR DELETE TO ROLES USING (`+inWriteReach+`)`)
+	// Strict: mine, or shared, to read; mine to write.
+	policy("strict_read", strict, `FOR SELECT TO ROLES USING (`+shared+` OR `+own+`)`)
+	policy("strict_insert", strictWriters, `FOR INSERT TO ROLES WITH CHECK (`+own+`)`)
+	policy("strict_modify", strictWriters, `FOR UPDATE TO ROLES USING (`+own+`) WITH CHECK (`+own+`)`)
+	policy("strict_delete", strictWriters, `FOR DELETE TO ROLES USING (`+own+`)`)
+	// Privileged: bounded only by the restrictive policies above.
+	policy("privileged", privilegedWriters, `FOR ALL TO ROLES USING (true) WITH CHECK (true)`)
+	policy("privileged_read", privilegedReaders, `FOR SELECT TO ROLES USING (true)`)
 	statements = append(statements,
 		`CREATE INDEX IF NOT EXISTS `+quote(indexName(table.Name))+` ON `+name+` (`+partition+`, `+scope+`, `+principal+`)`)
 	return statements, nil

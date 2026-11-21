@@ -154,6 +154,7 @@ type config struct {
 	reachSetting         string
 	principalSetting     string
 	actorSetting         string
+	writeReachSetting    string
 	operationTimeout     time.Duration
 	readIsolation        pgx.TxIsoLevel
 	accessTokenProvider  AccessTokenProvider
@@ -371,7 +372,8 @@ type transactionScope struct {
 	tenantID      string
 	userSetting   string
 	userID        string
-	// bound is set by a Store alone: the rest of a Binding and its mode's role.
+	// bound is set by a Store alone: the rest of a Binding and the role of its
+	// mode and access.
 	bound *boundScope
 }
 
@@ -519,11 +521,12 @@ func runTransaction(
 
 func configured(options ...Option) (config, error) {
 	configuration := config{
-		tenantSetting:    "codefly.current_tenant_id",
-		userSetting:      "codefly.current_user_id",
-		reachSetting:     "codefly.current_scopes",
-		principalSetting: "codefly.current_principal",
-		actorSetting:     "codefly.current_actor",
+		tenantSetting:     "codefly.current_tenant_id",
+		userSetting:       "codefly.current_user_id",
+		reachSetting:      "codefly.current_scopes",
+		principalSetting:  "codefly.current_principal",
+		actorSetting:      "codefly.current_actor",
+		writeReachSetting: "codefly.current_write_scopes",
 	}
 	for _, option := range options {
 		if option == nil {

@@ -26,7 +26,7 @@ migration inventories and owns isolated database create/clone/drop mechanics.
 It requires the plugin-private owner connection explicitly and is never exposed
 through the authenticated application `Factory`.
 
-## Row confinement: `Store`, `Binding` and the two modes
+## Row confinement: `Store`, `Binding`, the mode and the access
 
 `Factory` confines a transaction to a tenant and a user id. `Store` is the same
 boundary — private reader and writer pools, `Reader`, `Writer`,
@@ -37,57 +37,161 @@ boundary — private reader and writer pools, `Reader`, `Writer`,
 type Binding struct {
     Partition string   // the wall; required
     Principal string   // whose rows, "kind:id"; required
-    Reach     []string // the scopes this call may touch; empty is ErrNoReach
+    Reach     []string // the scopes this call may read; empty is ErrNoReach
     Mode      Mode     // Strict or Privileged; the zero value is ErrUnknownMode
     Actor     string   // who is executing; recorded, read by no policy
-    ReadOnly  bool     // refuses a Writer
+    Access    Access   // Read or ReadWrite; the zero value is what ReadOnly says
+    WriteMode  Mode     // whose rows it writes, when narrower than Mode; zero is Mode
+    WriteReach []string // the scopes it may write, when fewer than Reach; nil is Reach
+    ReadOnly  bool     // Deprecated: Access: Read. Still wins over Access.
 }
 
-store, closeStore, err := postgres.OpenStore(ctx, readOnly, readWrite, binder,
-    postgres.Roles{Strict: "app_x_strict", Privileged: "app_x_privileged"})
+type Roles struct {
+    StrictRead, StrictWrite, PrivilegedRead, PrivilegedWrite string
+    Strict, Privileged string // the two-role form: one role per mode, for both
+}
 
+roles := postgres.AccessRoles("app_x") // app_x_strict_read, app_x_strict_write,
+                                       // app_x_privileged_read, app_x_privileged_write
+store, closeStore, err := postgres.OpenStore(ctx, readOnly, readWrite, binder, roles)
+
+err = store.Read(ctx, func(ctx context.Context, tx postgres.ReadTx) error { … })
 err = store.Write(ctx, func(ctx context.Context, tx postgres.WriteTx) error { … })
 ```
 
 The library does not know what a partition, a scope or a principal is to the
-application, and it never chooses a mode: a `Binder` hands it the Binding
-already decided, from whatever the application verified about the call. Its
-vocabulary stops at partition, principal, reach, mode and actor.
+application, and it chooses neither the mode nor the access: a `Binder` hands
+it the Binding already decided, from whatever the application verified the
+call may do. Its vocabulary stops at partition, principal, reach, mode, access
+and actor. No handler is given a way to ask for more than its Binding says.
+
+**Mode** is whose rows; **access** is whether the Binding writes at all.
 
 | | reads | writes |
 | --- | --- | --- |
 | `Strict` | partition = P, scope ∈ reach, and (principal = me or the row is shared) | inserts stamped principal = me; updates and deletes its own rows |
 | `Privileged` | partition = P, scope ∈ reach, any principal | within reach, for any principal |
+| `Access: Read`, either mode | as its mode | none: `Writer` is `ErrReadOnly`, and its role holds `SELECT` alone |
 
-In both, a row's partition, scope and principal never change after insert, an
-empty reach reaches nothing, and nobody crosses a partition. There is no third
-mode: crossing a partition is `Maintenance`, opened from a different connection
-at the composition root.
+A `ReadWrite` Binding may write less than it reads, two ways:
 
-Per transaction a Store issues one statement: five `set_config(..., true)` and
-`set_config('role', <the mode's role>, true)`, which is `SET LOCAL ROLE`. The
-settings are `codefly.current_tenant_id` and `codefly.current_user_id` (the two
+- `WriteMode: Strict` on a `Privileged` Binding — *privileged read, strict
+  write*. It reads every principal's rows and writes its own. Wider than
+  `Mode` is `ErrWriteExceedsRead`.
+- `WriteReach` — the scopes it may write, a subset of `Reach`. It reads the
+  others and cannot insert into, update or delete in them. A scope outside
+  `Reach` is `ErrWriteExceedsRead`. To write nowhere, say `Access: Read`.
+
+In every case a row's partition, scope and principal never change after
+insert, an empty reach reaches nothing, and nobody crosses a partition. There
+is no third mode: crossing a partition is `Maintenance`, opened from a
+different connection at the composition root.
+
+### One role per mode and access
+
+Which role a transaction assumes follows from the Binding and from which
+capability was asked for, never from an argument:
+
+| Transaction | Pool, access mode | Role assumed | Reads | Writes |
+| --- | --- | --- | --- | --- |
+| `Reader` / `Read`, any Binding | reader, `READ ONLY` | the **read** role of `Mode` | `Reach`, as `Mode` | refused: no grant |
+| `Writer` / `Write`, a `ReadWrite` Binding | writer, `READ WRITE` | the **write** role of `WriteMode` | `Reach`, as `WriteMode` | `WriteReach`, as `WriteMode` |
+| `Writer` / `Write`, a `Read` Binding | — | — | — | `ErrReadOnly`, no transaction |
+
+Two consequences worth knowing before they surprise:
+
+- A read is on the read role even when the Binding may write. The reader's
+  login is never granted a write role.
+- What a write transaction *reads* is what its write role reads. Under
+  *privileged read, strict write* the write transaction sees its own and the
+  shared rows, not everyone's: read the wider set in a `Read` first. One role
+  that reads as privileged and writes as strict would be a fifth role; it is
+  not built.
+
+Per transaction a Store issues one statement: six `set_config(..., true)` and
+`set_config('role', <the role>, true)`, which is `SET LOCAL ROLE`. The settings
+are `codefly.current_tenant_id` and `codefly.current_user_id` (the two
 `Factory` installs, the second with the principal's bare id, so existing
-policies keep working), plus `codefly.current_scopes` (the reach, comma
-separated), `codefly.current_principal` and `codefly.current_actor`
-(`WithBindingSettings` renames the last three). Everything ends with the
-transaction, committed or not.
+policies keep working), `codefly.current_scopes` (the reach, comma separated),
+`codefly.current_principal`, `codefly.current_actor` (`WithBindingSettings`
+renames those three) and `codefly.current_write_scopes` (the write reach;
+`WithWriteReachSetting` renames it; empty in every read transaction).
+Everything ends with the transaction, committed or not.
 
 Refusals are typed and happen before a connection is acquired: `ErrNoBinding`,
 `ErrNoPartition`, `ErrNoPrincipal` (each also `ErrUnauthenticated`),
-`ErrUnknownMode`, `ErrNoReach`, `ErrInvalidReach`, `ErrReadOnly` and
-`ErrModeNotGranted` (each also `ErrUnauthorized`). `ErrModeNotGranted` is also
-what the database's own refusal to assume the role is reported as.
+`ErrUnknownMode`, `ErrUnknownAccess`, `ErrNoReach`, `ErrInvalidReach`,
+`ErrWriteExceedsRead`, `ErrSplitBinding`, `ErrReadOnly` and `ErrModeNotGranted`
+(each also `ErrUnauthorized`). `ErrModeNotGranted` is the Store having no role
+for the transaction's mode and access, and also what the database's own
+refusal to assume the role is reported as.
 
 `Store.Capability(binding)` is the Binding of work that has no call — a job
 replaying what its admission recorded. It is opaque, attaches to a context,
-and is honoured by the Store that minted it alone.
+carries its access with it, and is honoured by the Store that minted it alone.
 
 `Open`, `NewFactory`, `Maintenance` and every existing option are unchanged.
 
+### Who enforces what
+
+| | Enforced by the database | Enforced by the library only |
+| --- | --- | --- |
+| partition, reach, principal | forced row policies read the settings — for statements **sent as written** | that the settings are bound at all, to a complete Binding |
+| mode | the role: its policies, and whether the pool's login may assume it | which role is asked for |
+| access `Read` | the read role holds `SELECT` only: `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `SELECT … FOR UPDATE`, `COPY FROM`, `MERGE` are `permission denied` in any transaction; and the reader's login may assume no write role | `ErrReadOnly` before a connection is acquired; `READ ONLY` on the reader pool (a second refusal, and the one that also stops `nextval`) |
+| write mode | the write role's policies | which write role is asked for |
+| write reach | restrictive per-verb policies read `codefly.current_write_scopes` — for statements sent as written | `WriteReach ⊆ Reach` |
+| immutability of partition, scope, principal | column privileges: no role holds `UPDATE` on them | — |
+
+"Sent as written" is the limit of everything in the first column that is a
+*setting*: `set_config` is unprivileged, so SQL the process can be made to run
+verbatim can rebind the principal, the reach, the partition — and the write
+reach. Nothing in Postgres closes that. What SQL text cannot do is assume a
+role its login was not granted: **the mode and the access are fenced, the
+identity and the write reach are a floor.** So "may read this scope and not
+write it" is a hard fence only as `Access: Read`; as a narrower `WriteReach`
+beside a scope it may write, it holds for a forgotten predicate and not for
+injected SQL.
+
+### Logins: the role × login table
+
+`SET ROLE` is checked against the *session's login*, not the current role. From
+any transaction of a login, SQL can reach exactly the roles that login holds
+`SET` on, and no others. So the fence is which roles each login is granted:
+
+| Login (pool) | Granted, `WITH INHERIT FALSE, SET TRUE` | From a `strict_read` transaction on it, SQL can reach |
+| --- | --- | --- |
+| people, read-only connection | `_strict_read` | `_strict_read`, or the bare login (no privilege) |
+| people, read-write connection | `_strict_write` | — (it runs no read transaction); from `_strict_write`: itself only |
+| unattended, read-only connection | `_privileged_read` | — ; from `_privileged_read`: itself only |
+| unattended, read-write connection | `_privileged_write` | — ; from `_privileged_write`: itself only |
+| *one process for both modes*, read-only | `_strict_read`, `_privileged_read` | `_privileged_read` too: the mode is not fenced, the access still is |
+| *one process for both modes*, read-write | `_strict_write`, `_privileged_write` | from `_strict_write`: `_privileged_write` too |
+| **never**: any login with a read role and a role that writes | | a write role, from a read transaction; only `READ ONLY` is left |
+
+Rules that follow:
+
+- **A login holds read roles or write roles, never both.** That is the two
+  connections a service already has: the read-only login gets the read roles,
+  the read-write login the write roles. `rowscope.Bootstrap` refuses a login
+  listed under both, and the gate reports one.
+- **One pair of logins per process class** gives the fence on the mode as well:
+  the process that serves people gets the strict pair, the one that runs
+  unattended work the privileged pair. *Privileged read, strict write* for a
+  person is `_privileged_read` on the reader's login and `_strict_write` on the
+  writer's: no SQL on the write connection reads as privileged, none on the
+  read connection writes.
+- One process serving both modes on one pair of logins is allowed and gives up
+  the fence on the mode for it. The gate makes you say so
+  (`RowScopeGate.BothModes`).
+- No role is a member of another. A write role is named in its mode's read
+  policy itself; it does not inherit it. A membership between two of these
+  roles is a `SET ROLE` path or an inherited grant, and the gate reports any.
+
 ### What it guarantees, exactly
 
-Proved claim by claim in `rowscope_spike_integration_test.go`:
+Proved claim by claim in `rowscope_spike_integration_test.go` and
+`rowscope_access_spike_integration_test.go`:
 
 - **A statement sent as written cannot reach a row outside its Binding.** A
   query that never mentions the principal, a forgotten predicate, a wrong join:
@@ -95,21 +199,20 @@ Proved claim by claim in `rowscope_spike_integration_test.go`:
 - **A connection that skips the Store is refused the table** (`permission
   denied`), because the runtime login holds no table privilege of its own. It
   does not read everything and it does not read nothing silently.
-- **A login granted the strict role alone can never run a privileged
+- **A Read binding's transaction cannot write, whatever SQL it sends**, on a
+  login granted read roles alone: the role holds no write privilege and the
+  login can assume no role that does. `READ ONLY` is no longer what this rests
+  on. (`READ ONLY` is checked before privileges, so a write attempted in a
+  `READ ONLY` transaction is refused the same way whatever the role holds — a
+  test of the grants must attempt it in a `READ WRITE` one. `Prove` does.)
+- **A login granted the strict roles alone can never run a privileged
   transaction**, whatever SQL it sends. Membership is a catalog fact.
 
-It is **not** a boundary against SQL the process can be made to run verbatim:
+It is **not** a boundary against SQL the process can be made to run verbatim,
+for anything carried by a setting: see *Who enforces what*.
 
-- `set_config` is unprivileged, so SQL inside a transaction can rebind the
-  principal, the reach or the partition. Nothing in Postgres closes this.
-- `SET ROLE` is checked against the login, so a login that may assume both
-  mode roles can go from strict to privileged inside a strict transaction.
-  **Serve people from a login granted the strict role alone**, and run
-  unattended work on another: two Stores on two logins. The agent's
-  `runtime-logins` setting provisions such a login.
-- The read-only login assumes the same role as the writer, so on the reader
-  pool it is the `READ ONLY` transaction that refuses a write, not the grants.
-  SQL inside the transaction cannot lift it.
+A sequence is not a row: a role with `USAGE` on one advances it, no policy
+applies and no rollback undoes it. A read role must hold none.
 
 ### Migrations: package `rowscope`
 
@@ -117,9 +220,9 @@ A module does not hand-write a policy. Its migration embeds what `rowscope`
 emits (`rowscope.Script` joins statements into one body):
 
 ```go
-roles := postgres.Roles{Strict: "app_x_strict", Privileged: "app_x_privileged"}
+roles := postgres.AccessRoles("app_x")
 
-rowscope.Bootstrap(roles, rowscope.Logins{})   // the two NOLOGIN roles
+rowscope.Bootstrap(roles, rowscope.Logins{})   // the four NOLOGIN roles
 rowscope.Columns(rowscope.Table{Name: "record"})
 //   "tenant" text NOT NULL CHECK ("tenant" <> '')
 //   "scope" text NOT NULL CHECK ("scope" <> '' AND position(',' in "scope") = 0)
@@ -129,14 +232,26 @@ rowscope.Protect(rowscope.Table{Name: "record", Mutable: []string{"payload", "sh
     roles, rowscope.DefaultSettings())
 ```
 
-`Protect` revokes whatever the mode roles held on the table, grants `SELECT,
-INSERT, DELETE` and `UPDATE` on the `Mutable` columns only, enables and forces
-row security, replaces its seven policies (two restrictive ones binding both
-roles to the partition and the reach; strict read, insert, modify and delete;
-one privileged) and creates the `(partition, scope, principal)` index. It is
-idempotent, so the migration that adds a mutable column runs it again, and it
-touches no other role's grant or policy. Column names are the table's own
-(`Table.Partition`, `.Scope`, `.Principal`, `.Shared`). PostgreSQL 16 or later.
+`Protect` revokes whatever the named roles held on the table; grants the read
+roles `SELECT` and the write roles `SELECT, INSERT, DELETE` and `UPDATE` on the
+`Mutable` columns only; enables and forces row security; replaces its eleven
+policies; and creates the `(partition, scope, principal)` index.
+
+| Policy | Kind | For | Roles |
+| --- | --- | --- | --- |
+| `rowscope_partition` | restrictive | all | all four |
+| `rowscope_reach` | restrictive | all (reads the reach) | all four |
+| `rowscope_reach_insert`, `_modify`, `_delete` | restrictive | one write verb each (read the write reach) | the two write roles |
+| `rowscope_strict_read` | permissive | `SELECT`: shared or mine | `_strict_read`, `_strict_write` |
+| `rowscope_strict_insert`, `_modify`, `_delete` | permissive | mine | `_strict_write` |
+| `rowscope_privileged_read` | permissive | `SELECT`: true | `_privileged_read` |
+| `rowscope_privileged` | permissive | all: true | `_privileged_write` |
+
+It is idempotent, so the migration that adds a mutable column runs it again,
+and it touches no other role's grant or policy. Name only the roles the store
+has: a store of readers names the two read roles and is emitted no write grant
+and no write policy. Column names are the table's own (`Table.Partition`,
+`.Scope`, `.Principal`, `.Shared`). PostgreSQL 16 or later.
 
 Three things a module still owns, because no policy can:
 
@@ -148,9 +263,18 @@ Three things a module still owns, because no policy can:
   principal)`**, or the child's parent is checked in SQL. A reference to an
   invisible row succeeds.
 - A column fed by a sequence that is not an identity column needs `USAGE` on
-  the sequence granted to the mode roles.
+  the sequence granted to the **write** roles, and to no read role.
 
-**Memberships.** Under the Postgres agent, list the roles in the service's
+**Memberships.** Outside the agent, `Bootstrap` also emits the grants:
+
+```go
+rowscope.Bootstrap(roles, rowscope.Logins{
+    StrictRead: []string{"svc_people_ro"}, StrictWrite: []string{"svc_people_rw"},
+    PrivilegedRead: []string{"svc_jobs_ro"}, PrivilegedWrite: []string{"svc_jobs_rw"},
+})
+```
+
+Under the Postgres agent, list the **write** roles in the service's
 `runtime-read-write-roles`; the agent grants them to the read-write login,
 which is `NOINHERIT` and holds no table grant. Two things to know there:
 
@@ -160,12 +284,32 @@ which is `NOINHERIT` and holds no table grant. Two things to know there:
   refused. List first a role that holds nothing (`app_x_connect`, `NOLOGIN`,
   created by the same migration). The gate below fails otherwise.
 - The agent has no equivalent setting for the read-only login yet, which
-  therefore still receives a direct `SELECT` on every table. Until it does, a
-  Store's reader needs a second `runtime-logins` entry, or the gate reports the
-  read-only login. This is a gap in the agent, not something to grant around.
+  therefore receives a direct `SELECT` on every table and no read role. Until
+  it does, a Store's reader is a second `runtime-logins` entry granted the read
+  roles, or the gate reports the read-only login. This is a gap in the agent,
+  not something to grant around — and not a reason to put the read roles on
+  the read-write login, which is the one thing the fence forbids.
 
-Outside the agent, `rowscope.Bootstrap(roles, rowscope.Logins{Strict: …,
-Privileged: …})` also emits `GRANT … WITH INHERIT FALSE, SET TRUE` per login.
+### A store that has two roles
+
+A store migrated before the read and write roles existed named
+`Roles{Strict: "app_x_strict", Privileged: "app_x_privileged"}`. It keeps
+working unchanged: both fields are still there, a read and a write of a mode
+assume the one role, `Access: Read` still gets no `Writer`. What it has is the
+floor it had — on its reader pool `READ ONLY` is all that refuses a write — and
+a Binding whose writes are narrower than its reads is `ErrSplitBinding`, since
+its catalog has nothing to enforce that with. The gate tells it what is
+missing, per role and per table, and `Prove` refuses it. To adopt the four:
+
+1. One migration: `rowscope.Bootstrap(postgres.AccessRoles("app_x"), logins)`
+   and `rowscope.Protect` again for every table. Every policy that named the
+   old roles is replaced.
+2. Deploy with `Roles: postgres.AccessRoles("app_x")`. The two forms can be
+   mixed while that rolls out (`Roles{Strict: "app_x_strict", StrictRead:
+   "app_x_strict_read"}` reads on the new role and writes on the old).
+3. A later migration revokes the old roles' grants and drops them.
+
+`TestRowScopeTwoRoleStoreKeepsWorkingAndCanAdoptTheFour` runs exactly this.
 
 ### The gate and the proof
 
@@ -175,7 +319,8 @@ Both run from the module's own suite, on a migrated disposable database.
 // As the PRODUCTION runtime login, never the owner or the fixture principal:
 migrationtest.RequireRowScope(t, ctx, runtimeLoginConn, migrationtest.RowScopeGate{
     Roles:  roles,
-    Logins: []string{readOnlyLogin},
+    Logins: []string{readOnlyLogin},          // every other login a Store runs on
+    // BothModes: []string{…},                // only for one process serving both modes
     Exempt: []migrationtest.RowScopeExemption{
         {Relation: "public.schema_migrations", Reason: "the migration ledger: no runtime grant"},
     },
@@ -188,11 +333,25 @@ and reach policies or a permissive policy (with `WITH CHECK`) for a verb it
 holds, a mode role that may `UPDATE` a row's partition, scope or principal, a
 policy for `PUBLIC` or one reading a setting without `NULLIF`, a view that is
 not `security_invoker`, any materialized view, and any table privilege a
-runtime login holds itself. A relation that is legitimately not row-scoped is
-exempted by name with a reason; an exemption without one, or naming something
-that is gone, fails. Run as a superuser, an owner or a `BYPASSRLS` login it
-reports that instead of passing. It does not check index shape or
-`SECURITY DEFINER` functions.
+runtime login holds itself. For the access it also reports:
+
+- a read role holding `INSERT`, `UPDATE` (any column), `DELETE` or `TRUNCATE`
+  on any relation — exempt or not, directly or by inheritance — or `USAGE` or
+  `UPDATE` on a sequence;
+- a role that writes with no restrictive policy binding a write verb it holds
+  to the write reach;
+- a runtime login that may `SET ROLE` to a read role and to a role that writes
+  (through however many memberships: it asks `pg_has_role(…, 'SET')`);
+- a runtime login that may `SET ROLE` to roles of both modes, unless it is
+  listed in `BothModes` — and a login listed there that does not;
+- a mode role that is a member of any role;
+- a role of the two-role form, with what to create instead.
+
+A relation that is legitimately not row-scoped is exempted by name with a
+reason; an exemption without one, or naming something that is gone, fails. Run
+as a superuser, an owner or a `BYPASSRLS` login it reports that instead of
+passing. It does not check index shape or `SECURITY DEFINER` functions, nor
+what a login may assume outside the store's own roles.
 
 ```go
 rowscopetest.Prove(t, rowscopetest.Proof{
@@ -204,10 +363,16 @@ rowscopetest.Prove(t, rowscopetest.Proof{
 ```
 
 `Prove` seeds random rows through the fixture principal, then runs a few
-hundred random Bindings through a `Store` on the runtime logins and compares
-every row returned or changed with a model that shares no code with the
-policies. The gate says the policies are there; the proof says what they let
-through. Once per row-confined table.
+hundred random Bindings — mode, access, write mode and write reach all vary —
+through a `Store` on the runtime logins and compares every row returned or
+changed with a model that shares no code with the policies. A `Read` Binding
+is also *attacked*: on the reader's own login, in a `READ WRITE` transaction
+bound to its read role with every setting a writer would have, each of
+`DELETE`, `UPDATE`, `INSERT`, `SELECT … FOR UPDATE` and `TRUNCATE` must be
+`permission denied` — not a silent zero — and the reader's login must be unable
+to assume a write role. It needs the four roles, and logins that can assume
+both modes. The gate says the policies and grants are there; the proof says
+what they let through. Once per row-confined table.
 
 ### Tests, and the principals a test gets without a superuser
 
@@ -221,15 +386,17 @@ superuser. That is enough for everything below, and nothing below needs
 | A test needs | It uses |
 | --- | --- |
 | to seed several partitions, read across them, `TRUNCATE` | `fixture-connection` |
-| a **strict** or **privileged** transaction | a `Store` on `read-only-connection` / `read-write-connection` with `postgres.FixedBinder(postgres.Binding{…, Mode: postgres.Strict})` |
-| a login that can only ever be strict | through `fixture-connection`: `CREATE ROLE x LOGIN NOINHERIT PASSWORD …; GRANT CONNECT ON DATABASE … TO x; GRANT app_x_strict TO x WITH INHERIT FALSE, SET TRUE` |
-| to assert as a mode role on the fixture connection itself | `GRANT app_x_strict TO CURRENT_USER WITH INHERIT FALSE, SET TRUE`, then `SET LOCAL ROLE app_x_strict` and the settings inside a transaction: the bypass is the login's, and the assumed role is bound |
+| a **strict** or **privileged**, **read** or **read-write** transaction | a `Store` on `read-only-connection` / `read-write-connection` with `postgres.FixedBinder(postgres.Binding{…, Mode: postgres.Strict, Access: postgres.Read})` |
+| a login that can only ever be strict, or only ever read | through `fixture-connection`: `CREATE ROLE x LOGIN NOINHERIT PASSWORD …; GRANT CONNECT ON DATABASE … TO x; GRANT app_x_strict_read TO x WITH INHERIT FALSE, SET TRUE` |
+| to prove a read role cannot write | on the reader's login, around the Store: `BEGIN` (read write), `SET LOCAL ROLE app_x_strict_read`, the settings, then the write — expect `42501`. In a `READ ONLY` transaction it would be `25006` whatever the role holds |
+| to assert as a mode role on the fixture connection itself | `GRANT app_x_strict_read TO CURRENT_USER WITH INHERIT FALSE, SET TRUE`, then `SET LOCAL ROLE app_x_strict_read` and the settings inside a transaction: the bypass is the login's, and the assumed role is bound |
 | a **maintenance** connection | `postgres.OpenMaintenance(ctx, <the maintenance login's connection>, "app_x_retention", postgres.WithRestrictedSession())` — a `runtime-logins` entry whose role has its own grant and its own `TO app_x_retention` policy; in a suite that has none, a login created as in the row above and granted that role |
 
 Arrange with the fixture principal; act and assert on the runtime logins. A
 test that passes as the owner or as a `BYPASSRLS` login proves nothing about
-confinement. `TestRowScopeFixturePrincipalArrangesWithoutSuperuser` runs every
-row of that table against a fixture principal that is not a superuser.
+confinement. `TestRowScopeFixturePrincipalArrangesWithoutSuperuser` runs the
+rows of that table against a fixture principal that is not a superuser, and
+`TestRowScopeReadBindingIsRefusedWritesByTheDatabase` the read-role one.
 
 **Two rules a superuser hid**, which the migration recipes below turn on:
 

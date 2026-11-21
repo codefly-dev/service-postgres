@@ -20,11 +20,21 @@ import (
 type RowScopeGate struct {
 	// Schemas are the store's schemas. Empty means "public".
 	Schemas []string
-	// Roles are the mode roles. Name the ones the store has.
+	// Roles are the store's roles, per mode and access. Name the ones the
+	// store has, as its Store names them.
 	Roles postgres.Roles
 	// Logins are further runtime logins to check, beside the one the gate's
-	// own connection arrived as (which is always checked).
+	// own connection arrived as (which is always checked). Name every login a
+	// Store of this store runs on: the fence between read and write, and
+	// between the modes, is which roles each of them may assume.
 	Logins []string
+	// BothModes lists the runtime logins that are meant to assume roles of
+	// both modes: one process serving people and unattended work on one login.
+	// SQL sent in a strict transaction of such a login can assume the
+	// privileged role, so it is accepted by name, never by default, and a name
+	// here that does not hold both fails the gate. No such list exists for a
+	// login that may assume a read role and a role that writes.
+	BothModes []string
 	// Settings are the names the policies must read. Zero means the defaults.
 	Settings rowscope.Settings
 	// Columns names the partition, scope and principal columns of every table
@@ -99,6 +109,14 @@ func RequireRowScope(t RowScopeReporter, ctx context.Context, db CatalogQuerier,
 //     CHECK for a verb that writes;
 //   - a mode role that may UPDATE a row's partition, scope or principal, or
 //     holds TRUNCATE, REFERENCES or TRIGGER;
+//   - a read role that holds INSERT, UPDATE, DELETE or TRUNCATE on any
+//     relation, exempt or not, or USAGE or UPDATE on a sequence;
+//   - a role that writes with no restrictive policy binding each write verb it
+//     holds to the write reach;
+//   - a runtime login that may SET ROLE to a read role and to a role that
+//     writes, or to roles of both modes unless it is listed in BothModes;
+//   - a mode role that is a member of any role;
+//   - a role of the two-role form, which serves reads and writes alike;
 //   - a policy granted to PUBLIC, or one that reads a setting without NULLIF;
 //   - any table privilege held by a runtime login itself, exempt table or not;
 //   - a view that is not security_invoker, and any materialized view;
@@ -110,7 +128,24 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 	if ctx == nil || db == nil {
 		return nil, errors.New("row-scope gate requires a context and a connection")
 	}
-	if gate.Roles.Strict == "" && gate.Roles.Privileged == "" {
+	type modeRole struct {
+		name, mode    string
+		reads, writes bool
+	}
+	var declared []modeRole
+	for _, one := range []modeRole{
+		{gate.Roles.Strict, "strict", true, true},
+		{gate.Roles.StrictRead, "strict", true, false},
+		{gate.Roles.StrictWrite, "strict", false, true},
+		{gate.Roles.Privileged, "privileged", true, true},
+		{gate.Roles.PrivilegedRead, "privileged", true, false},
+		{gate.Roles.PrivilegedWrite, "privileged", false, true},
+	} {
+		if one.name != "" {
+			declared = append(declared, one)
+		}
+	}
+	if len(declared) == 0 {
 		return nil, errors.New("row-scope gate requires the role of at least one mode")
 	}
 	if len(gate.Schemas) == 0 {
@@ -118,6 +153,9 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 	}
 	if gate.Settings == (rowscope.Settings{}) {
 		gate.Settings = rowscope.DefaultSettings()
+	}
+	if gate.Settings.WriteReach == "" {
+		gate.Settings.WriteReach = rowscope.DefaultSettings().WriteReach
 	}
 	var findings []RowScopeFinding
 	report := func(relation, format string, arguments ...any) {
@@ -144,11 +182,19 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 	}
 
 	var modes []string
-	for _, role := range []string{gate.Roles.Strict, gate.Roles.Privileged} {
-		if role != "" {
-			modes = append(modes, role)
+	access := map[string]modeRole{}
+	for _, one := range declared {
+		if _, twice := access[one.name]; twice {
+			report("", "role %q is named for two of the store's roles: each mode and access has its own", one.name)
+			continue
+		}
+		modes = append(modes, one.name)
+		access[one.name] = one
+		if one.reads && one.writes {
+			report("", "mode role %q is the two-role form's: %s reads and writes assume the one role, so on the reader pool READ ONLY is all that refuses a write; create the %s read and write roles (rowscope.Bootstrap), protect each table again (rowscope.Protect), grant the read role to the reader's login and the write role to the writer's, and name them in Roles", one.name, one.mode, one.mode)
 		}
 	}
+	checked := append(slices.Clone(gate.Logins), gate.BothModes...)
 
 	// Who is asking, and what the roles are.
 	type role struct {
@@ -164,7 +210,7 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 		func(row pgx.Rows) (role, error) {
 			var found role
 			return found, row.Scan(&found.name, &found.login, &found.super, &found.bypass, &found.createRole, &found.createDB, &found.session, &found.current)
-		}, append(slices.Clone(modes), gate.Logins...))
+		}, append(slices.Clone(modes), checked...))
 	if err != nil {
 		return nil, fmt.Errorf("read roles: %w", err)
 	}
@@ -193,12 +239,98 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 			report("", "the runtime login's connection arrives as mode role %q: a connection that skips the Store then holds that role's privileges with nothing bound, and RESET ROLE returns to it", mode)
 		}
 	}
-	for _, login := range gate.Logins {
+	for _, login := range checked {
 		if _, exists := known[login]; !exists {
 			report("", "runtime login %q does not exist", login)
 		}
 	}
 	sort.Strings(logins)
+	logins = slices.Compact(logins)
+
+	// The fence. SET ROLE is checked against the session's login, so the roles
+	// SQL text can reach from any transaction of a login are the roles that
+	// login holds SET on, through however many memberships.
+	type membership struct{ member, role string }
+	settable, err := collect(ctx, db, `
+		SELECT l.rolname::text, m.rolname::text
+		FROM pg_roles l, pg_roles m
+		WHERE l.rolname = ANY($1::text[]) AND m.rolname = ANY($2::text[]) AND pg_has_role(l.oid, m.oid, 'SET')
+		ORDER BY 1, 2`,
+		func(row pgx.Rows) (membership, error) {
+			var found membership
+			return found, row.Scan(&found.member, &found.role)
+		}, logins, modes)
+	if err != nil {
+		return nil, fmt.Errorf("read what each login may assume: %w", err)
+	}
+	for _, login := range logins {
+		var read, write, strict, privileged string
+		for _, may := range settable {
+			if may.member != login {
+				continue
+			}
+			role := access[may.role]
+			switch {
+			case role.writes && write == "":
+				write = role.name
+			case !role.writes && read == "":
+				read = role.name
+			}
+			switch {
+			case role.mode == "strict" && strict == "":
+				strict = role.name
+			case role.mode == "privileged" && privileged == "":
+				privileged = role.name
+			}
+		}
+		if read != "" && write != "" {
+			report("", "runtime login %q may SET ROLE to read role %q and to %q, which writes: SQL sent in one of its read transactions can assume the second and write; grant a login read roles or write roles, never both", login, read, write)
+		}
+		both := strict != "" && privileged != ""
+		switch accepted := slices.Contains(gate.BothModes, login); {
+		case both && !accepted:
+			report("", "runtime login %q may SET ROLE to %q and to %q: SQL sent in one of its strict transactions can run privileged; give each mode its own login, or list this one in BothModes to accept that", login, strict, privileged)
+		case accepted && !both:
+			report("", "runtime login %q is listed in BothModes and may assume the roles of one mode at most", login)
+		}
+	}
+	chained, err := collect(ctx, db, `
+		SELECT pg_get_userbyid(a.member)::text, pg_get_userbyid(a.roleid)::text
+		FROM pg_auth_members a
+		WHERE pg_get_userbyid(a.member) = ANY($1::text[])
+		ORDER BY 1, 2`,
+		func(row pgx.Rows) (membership, error) {
+			var found membership
+			return found, row.Scan(&found.member, &found.role)
+		}, modes)
+	if err != nil {
+		return nil, fmt.Errorf("read the mode roles' own memberships: %w", err)
+	}
+	for _, chain := range chained {
+		report("", "mode role %q is a member of %q: every policy and grant of that role is now this one's too, or one SET ROLE away from its logins; a mode role is a member of nothing", chain.member, chain.role)
+	}
+
+	// A sequence is not a row: a read role that may advance one changes state
+	// no row policy sees and no rollback undoes.
+	type sequence struct{ name, role string }
+	advanced, err := collect(ctx, db, `
+		SELECT n.nspname || '.' || c.relname, r.rolname::text
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace, pg_roles r
+		WHERE n.nspname = ANY($1::text[]) AND c.relkind = 'S' AND r.rolname = ANY($2::text[])
+		  AND (has_sequence_privilege(r.oid, c.oid, 'USAGE') OR has_sequence_privilege(r.oid, c.oid, 'UPDATE'))
+		ORDER BY 1, 2`,
+		func(row pgx.Rows) (sequence, error) {
+			var found sequence
+			return found, row.Scan(&found.name, &found.role)
+		}, gate.Schemas, modes)
+	if err != nil {
+		return nil, fmt.Errorf("read sequence privileges: %w", err)
+	}
+	for _, found := range advanced {
+		if role := access[found.role]; !role.writes {
+			report(found.name, "read role %q holds USAGE or UPDATE on this sequence: a Read binding's transaction could advance it", found.role)
+		}
+	}
 
 	type relation struct {
 		oid                   uint32
@@ -227,6 +359,7 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 		role                                   string
 		read, insert, update, remove, truncate bool
 		references, trigger, anyColumn         bool
+		writeColumn                            bool
 		updatable                              []string
 	}
 	privileges, err := collect(ctx, db, `
@@ -236,6 +369,7 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 		       has_table_privilege(r.oid, c.oid, 'TRUNCATE'), has_table_privilege(r.oid, c.oid, 'REFERENCES'),
 		       has_table_privilege(r.oid, c.oid, 'TRIGGER'),
 		       has_any_column_privilege(r.oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES'),
+		       has_any_column_privilege(r.oid, c.oid, 'INSERT, UPDATE'),
 		       ARRAY(SELECT a.attname::text FROM pg_attribute a
 		             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
 		               AND has_column_privilege(r.oid, c.oid, a.attnum, 'UPDATE'))
@@ -244,7 +378,7 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 		func(row pgx.Rows) (privilege, error) {
 			var found privilege
 			return found, row.Scan(&found.oid, &found.role, &found.read, &found.insert, &found.update, &found.remove,
-				&found.truncate, &found.references, &found.trigger, &found.anyColumn, &found.updatable)
+				&found.truncate, &found.references, &found.trigger, &found.anyColumn, &found.writeColumn, &found.updatable)
 		}, gate.Schemas, append(slices.Clone(modes), logins...))
 	if err != nil {
 		return nil, fmt.Errorf("read privileges: %w", err)
@@ -299,6 +433,11 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 		for _, mode := range modes {
 			if found.owner == mode {
 				report(found.name, "is owned by mode role %q", mode)
+			}
+			// SELECT and nothing else, on anything: this is what refuses a
+			// Read binding's write when the transaction is not READ ONLY.
+			if own := grants[mode]; !access[mode].writes && (own.insert || own.update || own.remove || own.truncate || own.writeColumn) {
+				report(found.name, "read role %q holds INSERT, UPDATE, DELETE or TRUNCATE on it, directly or by inheritance: a Read binding's transaction could write; a read role holds SELECT alone", mode)
 			}
 		}
 		if exempt[found.name] {
@@ -393,6 +532,29 @@ func CheckRowScope(ctx context.Context, db CatalogQuerier, gate RowScopeGate) ([
 				}
 				if verb.writes && !slices.ContainsFunc(permissive, func(written policy) bool { return written.checked }) {
 					report(found.name, "mode role %q may %s with no WITH CHECK policy", mode, verb.name)
+				}
+			}
+			// Each write is bound to the write reach by a policy for its own
+			// verb: the FOR ALL policy above reads the reach, which is wider.
+			writeReach := "current_setting('" + gate.Settings.WriteReach + "'"
+			for _, verb := range []struct {
+				name, command string
+				held          bool
+				using, check  bool
+			}{
+				{"INSERT", "a", own.insert, false, true},
+				{"UPDATE", "w", own.update || len(own.updatable) > 0, true, true},
+				{"DELETE", "d", own.remove, true, false},
+			} {
+				if !verb.held || !access[mode].writes {
+					continue
+				}
+				if !slices.ContainsFunc(applies(verb.command, false), func(restrictive policy) bool {
+					// With no WITH CHECK of its own, a policy's USING is its check.
+					check := orDefault(restrictive.withCheck, restrictive.using)
+					return (!verb.using || strings.Contains(restrictive.using, writeReach)) && (!verb.check || strings.Contains(check, writeReach))
+				}) {
+					report(found.name, "no RESTRICTIVE policy binds %s by mode role %q to the write reach (reading %s): a Binding that reads a scope and may not write it is not confined here; protect the table again", verb.name, mode, gate.Settings.WriteReach)
 				}
 			}
 			for _, column := range fixed {
