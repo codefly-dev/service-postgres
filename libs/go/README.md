@@ -283,12 +283,10 @@ which is `NOINHERIT` and holds no table grant. Two things to know there:
   role's privileges and nothing bound — it reads zero rows instead of being
   refused. List first a role that holds nothing (`app_x_connect`, `NOLOGIN`,
   created by the same migration). The gate below fails otherwise.
-- The agent has no equivalent setting for the read-only login yet, which
-  therefore receives a direct `SELECT` on every table and no read role. Until
-  it does, a Store's reader is a second `runtime-logins` entry granted the read
-  roles, or the gate reports the read-only login. This is a gap in the agent,
-  not something to grant around — and not a reason to put the read roles on
-  the read-write login, which is the one thing the fence forbids.
+- Configure `runtime-read-only-roles` with the reader roles. The read-only
+  login explicitly selects one per transaction and receives no direct table
+  grants. An empty list grants no reader role. An agent version that predates
+  this setting requires a separate delegated login for Store reads.
 
 ### A store that has two roles
 

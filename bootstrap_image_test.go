@@ -273,7 +273,8 @@ func TestBootstrapMigrateSourceBuildGraph(t *testing.T) {
 			script = strings.ReplaceAll(script, "-o /managed-bootstrap", "-o "+filepath.Join(dir, "managed-bootstrap-"+arch))
 			command := exec.Command("sh", "-c", script)
 			command.Dir = filepath.Join(dir, "migrate")
-			command.Env = append(os.Environ(), "TARGETARCH="+arch)
+			// The staged image builds its own module outside the invoking workspace.
+			command.Env = append(os.Environ(), "GOWORK=off", "TARGETARCH="+arch)
 			log, err := command.CombinedOutput()
 			require.NoError(t, err, string(log))
 			info, err := buildinfo.ReadFile(output)

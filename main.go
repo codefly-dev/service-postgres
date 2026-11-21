@@ -107,6 +107,10 @@ type Settings struct {
 	// objects and never receive CREATE on these schemas.
 	RuntimeSchemas []string `yaml:"runtime-schemas"`
 
+	// RuntimeReadOnlyRoles selects exclusive reader delegation. Omitted keeps
+	// legacy direct SELECT. An explicit empty list grants no table access.
+	RuntimeReadOnlyRoles *[]string `yaml:"runtime-read-only-roles,omitempty"`
+
 	// RuntimeReadWriteRoles is the explicit allow-list of application-defined
 	// NOLOGIN roles that the managed read-write principal may assume with
 	// SET ROLE. When non-empty, these roles are the principal's exclusive source

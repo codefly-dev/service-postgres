@@ -49,13 +49,6 @@ func (s *Service) validateAuthMode() error {
 	}
 }
 
-type runtimeAccess struct {
-	readOnlyRole   string
-	readWriteRole  string
-	schemas        []string
-	readWriteRoles []string
-}
-
 // runtimeLogin is a declared read-write login principal resolved against the
 // database: its role, the keys its password and connection travel under, and
 // its exclusive delegated role set (see Settings.RuntimeLogins).
@@ -225,11 +218,7 @@ func (s *Service) runtimeAccess() (readOnlyRole, readWriteRole string, err error
 	if s.postgresUser == readOnlyRole || s.postgresUser == readWriteRole {
 		return "", "", fmt.Errorf("postgres owner user conflicts with a managed runtime role")
 	}
-	_, err = normalizedRuntimeSchemas(s.RuntimeSchemas)
-	if err != nil {
-		return "", "", err
-	}
-	if _, err = normalizedRuntimeReadWriteRoles(s.RuntimeReadWriteRoles, readOnlyRole, readWriteRole); err != nil {
+	if _, err := resolveSchemaAccess(s.Settings); err != nil {
 		return "", "", err
 	}
 	return readOnlyRole, readWriteRole, nil
@@ -367,24 +356,9 @@ func (s *Runtime) ensureRuntimeAccessLocked(ctx context.Context) error {
 		return s.Wool.NewError("self-hosted runtime cannot reconcile runtime access in external-identity mode: login principals are provisioned by the cloud identity provider")
 	}
 
-	schemas, err := normalizedRuntimeSchemas(s.Settings.RuntimeSchemas)
+	access, err := resolveSchemaAccess(s.Settings)
 	if err != nil {
 		return err
-	}
-	readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
-	readWriteRoles, err := normalizedRuntimeReadWriteRoles(
-		s.Settings.RuntimeReadWriteRoles,
-		readOnlyRole,
-		readWriteRole,
-	)
-	if err != nil {
-		return err
-	}
-	access := runtimeAccess{
-		readOnlyRole:   readOnlyRole,
-		readWriteRole:  readWriteRole,
-		schemas:        schemas,
-		readWriteRoles: readWriteRoles,
 	}
 
 	db, err := sql.Open("postgres", s.connection)
@@ -415,15 +389,17 @@ func (s *Runtime) ensureRuntimeAccessLocked(ctx context.Context) error {
 	// The same reconciliation the in-cluster bootstrap Job runs, so a local store
 	// and a deployed one grant exactly the same access.
 	if err := pgcontrol.ReconcilePasswordAccess(ctx, tx, pgcontrol.PasswordAccess{
-		Database:          s.DatabaseName,
-		OwnerRole:         s.postgresUser,
-		ReadOnlyRole:      access.readOnlyRole,
-		ReadOnlyPassword:  s.readOnlyPassword,
-		ReadWriteRole:     access.readWriteRole,
-		ReadWritePassword: s.readWritePassword,
-		Schemas:           access.schemas,
-		ReadWriteRoles:    access.readWriteRoles,
-		Logins:            declared,
+		Database:                         s.DatabaseName,
+		OwnerRole:                        s.postgresUser,
+		ReadOnlyRole:                     access.readOnlyRole,
+		ReadOnlyPassword:                 s.readOnlyPassword,
+		ReadOnlyRoles:                    access.readOnlyRoles,
+		ReconcileReadOnlyRoleMemberships: access.readOnlyRoles != nil,
+		ReadWriteRole:                    access.readWriteRole,
+		ReadWritePassword:                s.readWritePassword,
+		Schemas:                          access.schemas,
+		ReadWriteRoles:                   access.readWriteRoles,
+		Logins:                           declared,
 	}); err != nil {
 		return s.Wool.Wrapf(err, "cannot reconcile runtime access")
 	}
