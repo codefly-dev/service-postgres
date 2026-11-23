@@ -31,7 +31,7 @@ func TestClearDisownedPostmasterPid(t *testing.T) {
 	}
 
 	t.Run("missing file is a no-op", func(t *testing.T) {
-		if err := clearDisownedPostmasterPid(t.TempDir(), postmasterRecord{}, false); err != nil {
+		if err := clearDisownedPostmasterPid(t.TempDir()); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 	})
@@ -39,7 +39,7 @@ func TestClearDisownedPostmasterPid(t *testing.T) {
 	t.Run("empty file is removed", func(t *testing.T) {
 		dir := t.TempDir()
 		p := write(dir, "")
-		if err := clearDisownedPostmasterPid(dir, postmasterRecord{}, false); err != nil {
+		if err := clearDisownedPostmasterPid(dir); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 		if exists(p) {
@@ -51,7 +51,7 @@ func TestClearDisownedPostmasterPid(t *testing.T) {
 		dir := t.TempDir()
 		// PID 2^31-1 is not a live process on any sane host.
 		p := write(dir, "2147483646\n/data\n1700000000\n5432\n")
-		if err := clearDisownedPostmasterPid(dir, postmasterRecord{}, false); err != nil {
+		if err := clearDisownedPostmasterPid(dir); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 		if exists(p) {
@@ -64,7 +64,7 @@ func TestClearDisownedPostmasterPid(t *testing.T) {
 		// This test binary is alive and is certainly not a postgres server,
 		// so the lock file naming it is a leftover with a reused number.
 		p := write(dir, strconv.Itoa(os.Getpid())+"\n/data\n")
-		if err := clearDisownedPostmasterPid(dir, postmasterRecord{}, false); err != nil {
+		if err := clearDisownedPostmasterPid(dir); err != nil {
 			t.Fatalf("clear: %v", err)
 		}
 		if exists(p) {

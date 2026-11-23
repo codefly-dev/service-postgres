@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
+	runners "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/runners/dockerrun"
+	"github.com/codefly-dev/core/runners/runstate"
 )
 
 // Source validation launches this suite below the Go runner. Fixture
@@ -42,8 +47,12 @@ func stopEveryRunServer(servers string) {
 	entries, _ := os.ReadDir(servers)
 	for _, entry := range entries {
 		root := filepath.Join(servers, entry.Name())
-		if stopped, err := stopServer(root, filepath.Join(root, "pgdata")); err != nil || stopped {
-			fmt.Fprintf(os.Stderr, "run server %s outlived its test (stopped=%v err=%v)\n", entry.Name(), stopped, err)
+		left, err := runstate.Tracked(root)
+		for _, server := range left {
+			err = errors.Join(err, runners.SignalProcess(context.Background(), server, syscall.SIGINT))
+		}
+		if err != nil || len(left) > 0 {
+			fmt.Fprintf(os.Stderr, "run server %s outlived its test (stopped=%v err=%v)\n", entry.Name(), len(left) > 0, err)
 		}
 	}
 }

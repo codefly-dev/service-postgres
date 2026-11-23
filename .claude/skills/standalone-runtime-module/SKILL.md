@@ -73,7 +73,9 @@ them: `connection_profile_postgres_test.go` (`CONNECTION_PROFILE_TEST_DSN`), and
 `session_policy_test.go` and `connection_policy_postgres_test.go` (both
 `SESSION_POLICY_TEST_DSN`). The qualify script selects the last two by name, so a
 new DSN-gated test whose name matches neither `^TestRestrictedSession` nor
-`^TestConnectionPolicy` runs nowhere.
+`^TestConnectionPolicy` runs nowhere. The row-confinement tests (`^TestSpike`, `^TestRowScope`, tag
+`controlplaneintegration`, `ROW_SCOPE_TEST_DSN`) are selected the same way, across
+`.`, `./migrationtest` and `./rowscopetest`, and a skip among them fails the script.
 
 ## Consumer graph
 

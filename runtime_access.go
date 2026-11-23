@@ -11,7 +11,6 @@ import (
 	"unicode"
 
 	pgcontrol "github.com/codefly-dev/service-postgres/libs/go/controlplane"
-	"github.com/lib/pq"
 )
 
 const (
@@ -50,13 +49,6 @@ func (s *Service) validateAuthMode() error {
 	}
 }
 
-type runtimeAccess struct {
-	readOnlyRole   string
-	readWriteRole  string
-	schemas        []string
-	readWriteRoles []string
-}
-
 // runtimeLogin is a declared read-write login principal resolved against the
 // database: its role, the keys its password and connection travel under, and
 // its exclusive delegated role set (see Settings.RuntimeLogins).
@@ -73,8 +65,8 @@ type runtimeLogin struct {
 const maxRuntimeLoginNameLength = 16
 
 // reservedRuntimeLoginNames would collide with a managed key: the exported
-// owner-, read-only- and read-write-connection, and their passwords.
-var reservedRuntimeLoginNames = map[string]bool{"owner": true, "read-only": true, "read-write": true}
+// owner-, read-only-, read-write- and fixture-connection, and their passwords.
+var reservedRuntimeLoginNames = map[string]bool{"owner": true, "read-only": true, "read-write": true, "fixture": true}
 
 // resolveRuntimeLogins validates the declared logins and derives each one's
 // role and keys. Resolution fails on anything a render could not carry
@@ -199,6 +191,15 @@ func (s *Service) validateCredentials() error {
 		return err
 	}
 	used := map[string]string{s.postgresPassword: "owner", s.readOnlyPassword: "read-only", s.readWritePassword: "read-write"}
+	if s.fixturePassword != "" {
+		if s.externalIdentity() {
+			return fmt.Errorf("the fixture principal is a password login; external-identity mode provisions its logins outside this service: remove %s", fixturePasswordKey)
+		}
+		if other, taken := used[s.fixturePassword]; taken {
+			return fmt.Errorf("the fixture principal password must be distinct from the %s password", other)
+		}
+		used[s.fixturePassword] = "fixture principal"
+	}
 	for _, login := range logins {
 		password := s.loginPasswords[login.name]
 		if strings.TrimSpace(password) == "" {
@@ -217,11 +218,7 @@ func (s *Service) runtimeAccess() (readOnlyRole, readWriteRole string, err error
 	if s.postgresUser == readOnlyRole || s.postgresUser == readWriteRole {
 		return "", "", fmt.Errorf("postgres owner user conflicts with a managed runtime role")
 	}
-	_, err = normalizedRuntimeSchemas(s.RuntimeSchemas)
-	if err != nil {
-		return "", "", err
-	}
-	if _, err = normalizedRuntimeReadWriteRoles(s.RuntimeReadWriteRoles, readOnlyRole, readWriteRole); err != nil {
+	if _, err := resolveSchemaAccess(s.Settings); err != nil {
 		return "", "", err
 	}
 	return readOnlyRole, readWriteRole, nil
@@ -305,22 +302,6 @@ func normalizedRuntimeReadWriteRoles(configured []string, managedRoles ...string
 	return roles, nil
 }
 
-// defaultRuntimeReadWriteRole is the application role the managed read-write
-// principal selects on login: the FIRST configured runtime read-write role,
-// whatever else is configured alongside it. Keying it to the first entry rather
-// than to "there is exactly one" keeps the exported credential's behavior stable
-// when a second role is appended — otherwise adding `app_worker` next to
-// `app_documents` would silently drop every consumer back to "permission denied"
-// on its first write with no change on the consumer's side. Consumers that need
-// one of the other roles still SET ROLE; the default only decides where a
-// session starts.
-func defaultRuntimeReadWriteRole(roles []string) string {
-	if len(roles) == 0 {
-		return ""
-	}
-	return roles[0]
-}
-
 func validSQLIdentifier(value string) bool {
 	if value == "" {
 		return false
@@ -375,24 +356,9 @@ func (s *Runtime) ensureRuntimeAccessLocked(ctx context.Context) error {
 		return s.Wool.NewError("self-hosted runtime cannot reconcile runtime access in external-identity mode: login principals are provisioned by the cloud identity provider")
 	}
 
-	schemas, err := normalizedRuntimeSchemas(s.Settings.RuntimeSchemas)
+	access, err := resolveSchemaAccess(s.Settings)
 	if err != nil {
 		return err
-	}
-	readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
-	readWriteRoles, err := normalizedRuntimeReadWriteRoles(
-		s.Settings.RuntimeReadWriteRoles,
-		readOnlyRole,
-		readWriteRole,
-	)
-	if err != nil {
-		return err
-	}
-	access := runtimeAccess{
-		readOnlyRole:   readOnlyRole,
-		readWriteRole:  readWriteRole,
-		schemas:        schemas,
-		readWriteRoles: readWriteRoles,
 	}
 
 	db, err := sql.Open("postgres", s.connection)
@@ -412,134 +378,33 @@ func (s *Runtime) ensureRuntimeAccessLocked(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(`+runtimeAccessLockID+`)`); err != nil {
 		return s.Wool.Wrapf(err, "cannot lock runtime access reconciliation")
 	}
-	if err := ensureLoginRole(ctx, tx, access.readOnlyRole, s.readOnlyPassword, true); err != nil {
-		return s.Wool.Wrapf(err, "cannot provision read-only runtime role")
-	}
-	if err := ensureLoginRole(ctx, tx, access.readWriteRole, s.readWritePassword, false); err != nil {
-		return s.Wool.Wrapf(err, "cannot provision read-write runtime role")
-	}
-	if err := pgcontrol.ReconcileRuntimeAccess(ctx, tx, pgcontrol.RuntimeAccess{
-		Database:                          s.DatabaseName,
-		OwnerRole:                         s.postgresUser,
-		ReadOnlyRole:                      access.readOnlyRole,
-		ReadWriteRole:                     access.readWriteRole,
-		Schemas:                           access.schemas,
-		ReadWriteRoles:                    access.readWriteRoles,
-		ReconcileReadWriteRoleMemberships: true,
-	}); err != nil {
-		return s.Wool.Wrapf(err, "cannot reconcile runtime grants")
-	}
-	// Runs after ReconcileRuntimeAccess, in its transaction: the membership the
-	// default role depends on has just been proven and granted there, and a
-	// reconciliation that failed rolls this back with it, leaving the principal's
-	// prior default — and so its prior authority — untouched.
-	if err := ensureDefaultRole(ctx, tx, access.readWriteRole, defaultRuntimeReadWriteRole(access.readWriteRoles)); err != nil {
-		return s.Wool.Wrapf(err, "cannot set the read-write default role")
-	}
-	// Each declared login is reconciled exactly like the managed read-write
-	// login, in the same transaction and under the same lock, with its own
-	// delegated role set. Its memberships are its own: reconciling one login
-	// never touches another's.
 	logins, err := s.runtimeLogins()
 	if err != nil {
 		return err
 	}
+	declared := make([]pgcontrol.PasswordLogin, 0, len(logins))
 	for _, login := range logins {
-		if err := ensureLoginRole(ctx, tx, login.role, s.loginPasswords[login.name], false); err != nil {
-			return s.Wool.Wrapf(err, "cannot provision the %s runtime login", login.name)
-		}
-		if err := pgcontrol.ReconcileRuntimeAccess(ctx, tx, pgcontrol.RuntimeAccess{
-			Database:                          s.DatabaseName,
-			OwnerRole:                         s.postgresUser,
-			ReadOnlyRole:                      access.readOnlyRole,
-			ReadWriteRole:                     login.role,
-			Schemas:                           access.schemas,
-			ReadWriteRoles:                    login.readWriteRoles,
-			ReconcileReadWriteRoleMemberships: true,
-		}); err != nil {
-			return s.Wool.Wrapf(err, "cannot reconcile the %s login's grants", login.name)
-		}
-		if err := ensureDefaultRole(ctx, tx, login.role, defaultRuntimeReadWriteRole(login.readWriteRoles)); err != nil {
-			return s.Wool.Wrapf(err, "cannot set the %s login's default role", login.name)
-		}
+		declared = append(declared, pgcontrol.PasswordLogin{Role: login.role, Password: s.loginPasswords[login.name], ReadWriteRoles: login.readWriteRoles})
+	}
+	// The same reconciliation the in-cluster bootstrap Job runs, so a local store
+	// and a deployed one grant exactly the same access.
+	if err := pgcontrol.ReconcilePasswordAccess(ctx, tx, pgcontrol.PasswordAccess{
+		Database:                         s.DatabaseName,
+		OwnerRole:                        s.postgresUser,
+		ReadOnlyRole:                     access.readOnlyRole,
+		ReadOnlyPassword:                 s.readOnlyPassword,
+		ReadOnlyRoles:                    access.readOnlyRoles,
+		ReconcileReadOnlyRoleMemberships: access.readOnlyRoles != nil,
+		ReadWriteRole:                    access.readWriteRole,
+		ReadWritePassword:                s.readWritePassword,
+		Schemas:                          access.schemas,
+		ReadWriteRoles:                   access.readWriteRoles,
+		Logins:                           declared,
+	}); err != nil {
+		return s.Wool.Wrapf(err, "cannot reconcile runtime access")
 	}
 	if err := tx.Commit(); err != nil {
 		return s.Wool.Wrapf(err, "cannot commit runtime access transaction")
 	}
 	return nil
-}
-
-func ensureLoginRole(ctx context.Context, tx *sql.Tx, role, password string, readOnly bool) error {
-	var exists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, role).Scan(&exists); err != nil {
-		return err
-	}
-	quotedRole := pq.QuoteIdentifier(role)
-	if !exists {
-		if _, err := tx.ExecContext(ctx, `CREATE ROLE `+quotedRole); err != nil {
-			return err
-		}
-	}
-	// Only a superuser may even restate SUPERUSER, REPLICATION or BYPASSRLS, so
-	// a migration owner that is not one — the run's shared native server, a
-	// managed server — clears only the elevated attributes the role actually
-	// holds. A role holding one it cannot clear still fails, as it must.
-	var superuser, createDB, createRole, replication, bypassRLS bool
-	if err := tx.QueryRowContext(ctx, `
-		SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
-		FROM pg_roles WHERE rolname = $1`, role).Scan(&superuser, &createDB, &createRole, &replication, &bypassRLS); err != nil {
-		return err
-	}
-	attributes := []string{"LOGIN", "NOINHERIT"}
-	for _, attribute := range []struct {
-		set   bool
-		clear string
-	}{{superuser, "NOSUPERUSER"}, {createDB, "NOCREATEDB"}, {createRole, "NOCREATEROLE"}, {replication, "NOREPLICATION"}, {bypassRLS, "NOBYPASSRLS"}} {
-		if attribute.set {
-			attributes = append(attributes, attribute.clear)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` WITH `+strings.Join(attributes, " ")+` PASSWORD `+pq.QuoteLiteral(password)); err != nil {
-		return err
-	}
-	if readOnly {
-		_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` SET default_transaction_read_only = on`)
-		return err
-	}
-	_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedRole+` RESET default_transaction_read_only`)
-	return err
-}
-
-// ensureDefaultRole makes role the session default of a login principal, or
-// clears it when role is empty.
-//
-// With runtime-read-write-roles configured the principal is NOINHERIT and holds
-// no table privileges of its own — ReconcileRuntimeAccess revokes them and grants
-// only membership of the application role — so its write authority is reachable
-// only by selecting that role. Setting it as the login default is the same
-// server-side mechanism ensureLoginRole already uses for the read-only role's
-// default_transaction_read_only, and it reaches every consumer of the exported
-// credential whatever driver or DSN it uses, including the restricted deploy
-// profile whose connection strings this agent never authors (#94).
-//
-// It also degrades the way the DSN `options=-c role=<role>` form cannot: a role
-// the principal cannot assume — not yet granted, or dropped by a later migration
-// — logs `WARNING: permission denied to set role` and leaves the session as the
-// principal, so the connection still opens and only writes fail. The startup
-// parameter makes that same state a FATAL that refuses the connection, taking
-// reads and health checks down with it.
-//
-// The value is a GUC string, not an identifier, so it is quoted as a literal;
-// role has already passed validSQLIdentifier.
-func ensureDefaultRole(ctx context.Context, tx *sql.Tx, principal, role string) error {
-	quotedPrincipal := pq.QuoteIdentifier(principal)
-	if role == "" {
-		// Generic mode: the principal holds its DML grants directly. Clearing the
-		// default matters on the delegated -> generic transition, where a stale
-		// default would name a role the principal is no longer a member of.
-		_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedPrincipal+` RESET role`)
-		return err
-	}
-	_, err := tx.ExecContext(ctx, `ALTER ROLE `+quotedPrincipal+` SET role = `+pq.QuoteLiteral(role))
-	return err
 }

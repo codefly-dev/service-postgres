@@ -3,9 +3,9 @@ FROM --platform=$BUILDPLATFORM {{ .Bootstrap.Migrate.Toolchain }} AS migrate-bui
 ARG TARGETARCH
 WORKDIR /src
 COPY bootstrap/migrate/go.mod bootstrap/migrate/go.sum ./
-# The managed store's migration runner builds beside migrate, from the same
-# module graph and verified the same way: a managed render runs this image's
-# /usr/local/bin/managed-bootstrap.
+# The migration runner builds beside migrate, from the same module graph and
+# verified the same way. It is the image's one program, for a managed store
+# (Cloud SQL through the connector) and a self-hosted in-cluster one alike.
 COPY bootstrap/migrate/cmd ./cmd
 RUN set -eu; \
     printf '%s  go.mod\n%s  go.sum\n%s  cmd/managed-bootstrap/main.go\n' '{{ .Bootstrap.Migrate.GoModSHA256 }}' '{{ .Bootstrap.Migrate.GoSumSHA256 }}' '{{ .Bootstrap.Migrate.ManagedBootstrapSHA256 }}' | sha256sum -c -; \
@@ -20,9 +20,15 @@ RUN set -eu; \
 # The runtime contains neither Go nor module manifests: its SBOM describes the
 # compiled binary, not the parent's unused module graph.
 COPY bootstrap /bootstrap
-RUN rm -rf /bootstrap/migrate
+# COPY of a directory copies its contents, so /tmp travels inside a root
+# skeleton to keep its sticky, world-writable mode.
+RUN rm -rf /bootstrap/migrate && mkdir -p /scratch-root/tmp && chmod 1777 /scratch-root/tmp
 
-FROM {{ .Bootstrap.Base.Reference }}
+# Nothing but two static binaries and their inputs: no shell, no package
+# manager, no package index read at build time, so the image is the same bytes
+# whenever it is rendered. The CA bundle is the digest-pinned toolchain's: the
+# Cloud SQL connector verifies Google's APIs with it.
+FROM scratch
 
 ARG TARGETARCH
 
@@ -31,32 +37,24 @@ ARG TARGETARCH
 LABEL {{ range $index, $entry := .Bootstrap.Provenance }}{{ if $index }} \
       {{ end }}{{ $entry.Label }}="{{ $entry.Value }}"{{ end }}
 
-WORKDIR /app
-
-# apk resolves from the locked repositories alone, and every package is pinned to an
-# exact version: once upstream replaces one of them the build fails instead of
-# quietly installing different bytes. .github/scripts/update-bootstrap-lock.sh
-# moves the lock forward.
-RUN printf '%s\n' {{ .Bootstrap.Packages.RepositoryArguments }} >/etc/apk/repositories \
-    && apk add --no-cache {{ .Bootstrap.Packages.Specs }}
-
+COPY --from=migrate-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=migrate-builder /scratch-root/ /
 COPY --from=migrate-builder /migrate /usr/local/bin/migrate
 COPY --from=migrate-builder /managed-bootstrap /usr/local/bin/managed-bootstrap
 
-# Only the staged bootstrap artifact and the runtime-access program enter the
-# image. The build context is the whole service directory, which also holds
-# local configuration and secrets, so nothing is copied wholesale. The staged
-# tree carries only files matching the one migration-filename definition, so an
-# editor backup left beside a migration never reaches the image to be pruned.
+# Only the staged bootstrap artifact enters the image: the plan, its migration
+# sources and self-hosted.json. The build context is the whole service
+# directory, which also holds local configuration and secrets, so nothing is
+# copied wholesale, and the staged tree carries only files matching the one
+# migration-filename definition.
 COPY --from=migrate-builder /bootstrap /app/bootstrap
-COPY bootstrap.sql /app/bootstrap.sql
-COPY runtime-access.sql /app/runtime-access.sql
 
-# The bootstrap is ONE psql session over bootstrap.sql: it takes the
-# runtime-access advisory lock, runs `migrate up` as a child process while still
-# holding it, then includes runtime-access.sql for the grants. migrate used to
-# run here as its own process, which left the two steps in different lock
-# domains -- see bootstrap.sql for the collision that allowed between concurrent
-# bootstrap pods. bootstrap.sh gates that session on readiness and on verifying
-# the staged migration sources.
-CMD ["/bin/sh", "/app/bootstrap/bootstrap.sh"]
+# The Job's own non-root identity; the root filesystem can stay read-only, as
+# the runner writes only its staging copy under /tmp.
+USER 65534:65534
+
+# The runner verifies the staged sources against plan.json, waits for the
+# server, then holds the runtime-access lock across every migration and the
+# access reconciliation. A managed Job selects its mode with its binding; an
+# in-cluster Job runs this default.
+ENTRYPOINT ["/usr/local/bin/managed-bootstrap", "-package", "/app/bootstrap", "-migrate", "/usr/local/bin/migrate"]

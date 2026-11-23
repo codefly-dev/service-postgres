@@ -1,10 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -51,51 +48,6 @@ func TestNativeOwnerRoleIsTheDatabasesOwn(t *testing.T) {
 	require.Equal(t, owner, nativeOwnerRole("robin_sessions"))
 	require.NotEqual(t, owner, nativeOwnerRole("documents"))
 	require.True(t, strings.HasSuffix(owner, "_owner"))
-}
-
-func writeHolder(t *testing.T, root, name string, holder serverHolder) string {
-	t.Helper()
-	data, err := json.Marshal(holder)
-	require.NoError(t, err)
-	path := filepath.Join(root, "holders", name+".json")
-	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
-	require.NoError(t, os.WriteFile(path, data, 0o600))
-	return path
-}
-
-// TestPruneHoldersKeepsOnlyLiveRuns is what decides when a run's server stops:
-// an agent that is gone, or whose codefly run is gone, holds nothing.
-func TestPruneHoldersKeepsOnlyLiveRuns(t *testing.T) {
-	root := t.TempDir()
-	self, err := markProcess(os.Getpid())
-	require.NoError(t, err)
-	parent, err := markProcess(os.Getppid())
-	require.NoError(t, err)
-
-	exited := exec.Command("sleep", "60")
-	require.NoError(t, exited.Start())
-	gone, err := markProcess(exited.Process.Pid)
-	require.NoError(t, err)
-	require.NoError(t, exited.Process.Kill())
-	_ = exited.Wait()
-
-	reused := self
-	reused.StartID++ // the same PID, a different process
-
-	live := writeHolder(t, root, "live", serverHolder{Service: "mod/a", Agent: self, Run: &parent})
-	deadAgent := writeHolder(t, root, "dead-agent", serverHolder{Service: "mod/b", Agent: gone})
-	deadRun := writeHolder(t, root, "dead-run", serverHolder{Service: "mod/c", Agent: self, Run: &gone})
-	reusedPID := writeHolder(t, root, "reused", serverHolder{Service: "mod/d", Agent: reused})
-	garbage := filepath.Join(root, "holders", "garbage.json")
-	require.NoError(t, os.WriteFile(garbage, []byte("{"), 0o600))
-
-	count, err := pruneHolders(root)
-	require.NoError(t, err)
-	require.Equal(t, 1, count)
-	require.FileExists(t, live)
-	for _, path := range []string{deadAgent, deadRun, reusedPID, garbage} {
-		require.NoFileExists(t, path)
-	}
 }
 
 func TestReleaseOfAnUnattachedHandleStopsNothing(t *testing.T) {

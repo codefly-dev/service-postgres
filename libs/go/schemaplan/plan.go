@@ -13,6 +13,15 @@ const ContractVersion = "codefly.dev/postgres-schema-plan/v1"
 // ReaderRolesContractVersion opts into exclusive delegated reader authority.
 // V1 remains unchanged, including its content digest and direct SELECT grants.
 const ReaderRolesContractVersion = "codefly.dev/postgres-schema-plan/v2"
+
+// PasswordReaderRolesContractVersion requires an engine that enforces delegated
+// readers for password logins as well as external identities.
+const PasswordReaderRolesContractVersion = "codefly.dev/postgres-schema-plan/v3"
+
+func (p Plan) DelegatesReaders() bool {
+	return p.ContractVersion == ReaderRolesContractVersion || p.ContractVersion == PasswordReaderRolesContractVersion
+}
+
 const MigrationFileNamePattern = `^([0-9]+)_.+\.(up|down)\.[A-Za-z0-9]+$`
 
 type Plan struct {
@@ -66,7 +75,7 @@ func (p Plan) ContentDigest() string {
 	write(p.Access.ReadOnlyRole, p.Access.ReadWriteRole)
 	write(p.Access.Schemas...)
 	write(p.Access.ReadWriteRoles...)
-	if p.ContractVersion == ReaderRolesContractVersion {
+	if p.DelegatesReaders() {
 		write("read-only-roles", fmt.Sprint(len(p.Access.ReadOnlyRoles)))
 		write(p.Access.ReadOnlyRoles...)
 	}

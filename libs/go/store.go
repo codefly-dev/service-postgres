@@ -151,6 +151,10 @@ type WriteTx interface {
 type config struct {
 	tenantSetting        string
 	userSetting          string
+	reachSetting         string
+	principalSetting     string
+	actorSetting         string
+	writeReachSetting    string
 	operationTimeout     time.Duration
 	readIsolation        pgx.TxIsoLevel
 	accessTokenProvider  AccessTokenProvider
@@ -368,6 +372,9 @@ type transactionScope struct {
 	tenantID      string
 	userSetting   string
 	userID        string
+	// bound is set by a Store alone: the rest of a Binding and the role of its
+	// mode and access.
+	bound *boundScope
 }
 
 type transactionBeginner interface {
@@ -493,7 +500,11 @@ func runTransaction(
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx,
+	if scope.bound != nil {
+		if err := installBinding(ctx, tx, scope); err != nil {
+			return fmt.Errorf("install Postgres transaction binding: %w", err)
+		}
+	} else if _, err := tx.Exec(ctx,
 		`SELECT set_config($1, $2, true), set_config($3, $4, true)`,
 		scope.tenantSetting, scope.tenantID, scope.userSetting, scope.userID,
 	); err != nil {
@@ -510,8 +521,12 @@ func runTransaction(
 
 func configured(options ...Option) (config, error) {
 	configuration := config{
-		tenantSetting: "codefly.current_tenant_id",
-		userSetting:   "codefly.current_user_id",
+		tenantSetting:     "codefly.current_tenant_id",
+		userSetting:       "codefly.current_user_id",
+		reachSetting:      "codefly.current_scopes",
+		principalSetting:  "codefly.current_principal",
+		actorSetting:      "codefly.current_actor",
+		writeReachSetting: "codefly.current_write_scopes",
 	}
 	for _, option := range options {
 		if option == nil {

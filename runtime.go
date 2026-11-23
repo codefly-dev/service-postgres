@@ -13,6 +13,7 @@ import (
 
 	"github.com/codefly-dev/core/agents/services"
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	"github.com/codefly-dev/core/runners/runstate"
 	"github.com/codefly-dev/core/wool"
 
 	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
@@ -54,6 +55,11 @@ type Runtime struct {
 	// postgres server (nixpg.go), serving the same connection string and
 	// database.
 	nixRuntime *nixPostgres
+	// nativeRoot and nativeState are the run's native state directory and this
+	// agent's claim on it. They outlive nixRuntime, which Stop clears: the
+	// claim is withdrawn by Destroy (disposeNative).
+	nativeRoot  string
+	nativeState *runstate.Hold
 
 	// extensionAdmin is the connection extensions are created with. On the
 	// run's shared server that is the server's administrator in this service's
@@ -61,6 +67,10 @@ type Runtime struct {
 	// not a trusted extension — the way a managed server's provider creates
 	// them. Empty elsewhere: the owner connection creates them.
 	extensionAdmin string
+
+	// fixtureProvisioned records that this invocation gave its database the
+	// fixture principal (fixture.go), which goes when the service is released.
+	fixtureProvisioned bool
 
 	postgresPort uint16
 
@@ -190,6 +200,12 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 
 	configuration := req.GetConfiguration()
 
+	// A run that is not disposable is refused the fixture principal before
+	// anything is started or handed out.
+	if err := s.admitFixturePrincipal(ctx, configuration); err != nil {
+		return s.Runtime.InitError(err)
+	}
+
 	net, err := resources.FindNetworkMapping(ctx, s.NetworkMappings, s.TcpEndpoint)
 	if err != nil {
 		return s.Runtime.InitError(err)
@@ -224,6 +240,9 @@ func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtim
 		conf, errConn := s.CreateConnectionConfiguration(ctx, configuration, inst, false)
 		if errConn != nil {
 			return s.Runtime.InitError(errConn)
+		}
+		if s.fixtureRequested() {
+			s.withFixtureConnection(conf, inst)
 		}
 		w.Debug("adding configuration", wool.Field("config", resources.MakeConfigurationSummary(conf)), wool.Field("instance", inst))
 		s.Runtime.RuntimeConfigurations = append(s.Runtime.RuntimeConfigurations, conf)
@@ -361,7 +380,10 @@ func (s *Runtime) migrateOnInit(ctx context.Context) error {
 	if err := s.applySchema(ctx, prerequisites); err != nil {
 		return err
 	}
-	return s.ensureRuntimeAccessLocked(ctx)
+	if err := s.ensureRuntimeAccessLocked(ctx); err != nil {
+		return err
+	}
+	return s.reconcileFixturePrincipal(ctx)
 }
 
 // applySchema brings the database up to the resolved prerequisites: extensions
@@ -645,6 +667,10 @@ func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationReq
 //	Stop                  released                      retained
 //	Stop + keep-running   retained (docker only)        retained
 //	Destroy               released, container removed   retained
+//	Destroy, disposable   released                      removed (native only)
+//
+// The fixture principal of a disposable run (fixture.go) is not database state
+// a later run reads: Stop and Destroy both remove it.
 //
 // keep-running is the one row that is not backend-independent: reuse means the
 // next invocation reattaches to a live server, and only the container backend
@@ -655,11 +681,16 @@ func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationReq
 // later Init cannot end up running a second postmaster against the same data
 // directory.
 //
-// No operation deletes data. Dropping a database or a data directory requires
-// an explicit authorization proving that state is disposable and owned by the
-// caller; neither StopRequest nor DestroyRequest carries one, so an agent must
-// never infer the right to reset from the fact that it started the process
-// (codefly-dev/core#424).
+// No operation deletes data on its own. Dropping a database or a data
+// directory requires an explicit authorization proving that state is
+// disposable and owned by the caller; neither StopRequest nor DestroyRequest
+// carries one, so an agent must never infer the right to reset from the fact
+// that it started the process (codefly-dev/core#424).
+//
+// The authorization is the environment's: Environment.disposable, which the
+// invocation that generated the run's naming scope sets. Under it, Destroy of
+// the run's last native service removes the run's server directory
+// (disposeNative); Stop never does, because a service restarts inside a run.
 //
 // Stop releases only what THIS invocation holds a handle to: a runtime that
 // never ran Init owns no postmaster and no container, and stops nothing.
@@ -683,6 +714,10 @@ func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtim
 	// watcher is running. Under lifecycleMu because it writes s.watcherCancel,
 	// which Destroy also clears.
 	s.StopWatcher()
+
+	// While the server is still up, keep-running included: the fixture
+	// principal belongs to this invocation's run, not to the server.
+	s.retireFixturePrincipal(ctx)
 
 	// keep-running asks for a server the NEXT invocation reattaches to, and only
 	// the container backend has one per service: GetContainer adopts an
@@ -733,6 +768,7 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 	// A leaked watcher would keep firing EventHandler at a database that is
 	// being removed. Idempotent when Stop already ran.
 	s.StopWatcher()
+	s.retireFixturePrincipal(ctx)
 
 	if s.nixRuntime != nil {
 		action, err := s.releaseNative(ctx)
@@ -740,13 +776,13 @@ func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*
 			return s.Runtime.DestroyError(err)
 		}
 		s.reapHostResources(ctx)
-		return s.destroyResponse(action)
+		return s.destroyMessage(s.disposeNative(ctx, action))
 	}
 	// A nix invocation has no container to remove, and reaching for one would
 	// demand a docker daemon from a host that was very likely chosen for not
 	// having one.
 	if s.Runtime.IsNixRuntime() {
-		return s.destroyResponse("native postgres already stopped")
+		return s.destroyMessage(s.disposeNative(ctx, "native postgres already stopped"))
 	}
 
 	// Prefer the environment this invocation started: shutting that one down
@@ -803,9 +839,13 @@ func (s *Runtime) stopResponse(action string) (*runtimev0.StopResponse, error) {
 }
 
 func (s *Runtime) destroyResponse(action string) (*runtimev0.DestroyResponse, error) {
+	return s.destroyMessage(s.retentionSummary(action))
+}
+
+func (s *Runtime) destroyMessage(message string) (*runtimev0.DestroyResponse, error) {
 	return &runtimev0.DestroyResponse{Status: &runtimev0.DestroyStatus{
 		State:   runtimev0.DestroyStatus_SUCCESS,
-		Message: s.retentionSummary(action),
+		Message: message,
 	}}, nil
 }
 

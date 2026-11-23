@@ -51,6 +51,7 @@ type schemaFile struct {
 // schemaAccess carries the runtime-role grant inputs. Both the local reconciler
 // and the bootstrap image's runtime-access.sql are driven from these values.
 type schemaAccess struct {
+	readOnlyRoles  []string
 	readOnlyRole   string
 	readWriteRole  string
 	schemas        []string
@@ -197,26 +198,6 @@ func lineageDigest(l schemaLineage) string {
 	return artifact.ContentDigest()
 }
 
-// stagedChecksums renders the staged content as a sha256sum manifest, relative
-// to the staging root. The bootstrap program verifies it before applying
-// anything: the image is built from the service directory by a later, separate
-// process, so a staged tree that drifted or was only partly written would
-// otherwise apply fewer migrations and report success.
-func (p *schemaPlan) stagedChecksums() []byte {
-	var manifest strings.Builder
-	for _, lineage := range p.lineages {
-		for _, file := range lineage.files {
-			manifest.WriteString(strings.TrimPrefix(file.digest, "sha256:"))
-			manifest.WriteString("  sources/")
-			manifest.WriteString(lineage.stage)
-			manifest.WriteString("/")
-			manifest.WriteString(file.name)
-			manifest.WriteString("\n")
-		}
-	}
-	return []byte(manifest.String())
-}
-
 func resolveSchemaAccess(settings *Settings) (schemaAccess, error) {
 	readOnlyRole, readWriteRole := runtimeRoleNames(settings.DatabaseName)
 	schemas, err := normalizedRuntimeSchemas(settings.RuntimeSchemas)
@@ -227,8 +208,17 @@ func resolveSchemaAccess(settings *Settings) (schemaAccess, error) {
 	if err != nil {
 		return schemaAccess{}, err
 	}
+	var readOnlyRoles []string
+	if settings.RuntimeReadOnlyRoles != nil {
+		reserved := append([]string{readOnlyRole, readWriteRole}, readWriteRoles...)
+		readOnlyRoles, err = normalizedRuntimeReadWriteRoles(*settings.RuntimeReadOnlyRoles, reserved...)
+		if err != nil {
+			return schemaAccess{}, fmt.Errorf("runtime-read-only-roles: %w", err)
+		}
+	}
 	return schemaAccess{
 		readOnlyRole:   readOnlyRole,
+		readOnlyRoles:  readOnlyRoles,
 		readWriteRole:  readWriteRole,
 		schemas:        schemas,
 		readWriteRoles: readWriteRoles,
@@ -270,13 +260,18 @@ func (p *schemaPlan) artifactWithoutDigest() schemaPlanArtifact {
 			Files:  files,
 		})
 	}
+	version := schemaPlanContractVersion
+	if p.access.readOnlyRoles != nil {
+		version = schemaplan.PasswordReaderRolesContractVersion
+	}
 	return schemaPlanArtifact{
-		ContractVersion: schemaPlanContractVersion,
+		ContractVersion: version,
 		Database:        p.database,
 		Extensions:      extensions,
 		Lineages:        lineages,
 		Access: schemaAccessArtifact{
 			ReadOnlyRole:   p.access.readOnlyRole,
+			ReadOnlyRoles:  p.access.readOnlyRoles,
 			ReadWriteRole:  p.access.readWriteRole,
 			Schemas:        p.access.schemas,
 			ReadWriteRoles: p.access.readWriteRoles,

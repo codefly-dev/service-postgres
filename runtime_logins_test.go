@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	"github.com/codefly-dev/core/resources"
+	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
@@ -278,34 +280,6 @@ func requireJobSecretKeyRef(t *testing.T, manifest, environmentVariable, secret,
 	require.Failf(t, "missing secret reference", "bootstrap Job declares no %s", environmentVariable)
 }
 
-func TestRuntimeAccessTemplateProvisionsEachLoginWithItsOwnRoles(t *testing.T) {
-	parameters := testBootstrapTemplating()
-	parameters.Schemas = []string{"public"}
-	parameters.ReadWriteRoles = []string{"app_runtime_request"}
-	parameters.DefaultReadWriteRole = "app_runtime_request"
-	parameters.Logins = []BootstrapLogin{{
-		Role:             "codefly_app_maintenance",
-		PasswordVariable: "POSTGRES_MAINTENANCE_PASSWORD",
-		ReadWriteRoles:   []string{"app_runtime"},
-		DefaultRole:      "app_runtime",
-	}}
-	accessSQL := renderRuntimeAccessTemplate(t, parameters)
-	for _, required := range []string{
-		`\getenv login_0_password POSTGRES_MAINTENANCE_PASSWORD`,
-		`'codefly_app_maintenance', :'login_0_password'`,
-		`EXECUTE format('GRANT %I TO %I', 'app_runtime', 'codefly_app_maintenance');`,
-		`SELECT format('ALTER ROLE %I SET role = %L', 'codefly_app_maintenance', 'app_runtime')`,
-		`WHERE principal.rolname = 'codefly_app_maintenance'`,
-	} {
-		require.Contains(t, accessSQL, required)
-	}
-	// The login never receives the managed login's role, nor direct DML.
-	require.NotContains(t, accessSQL, `EXECUTE format('GRANT %I TO %I', 'app_runtime_request', 'codefly_app_maintenance');`)
-	require.NotContains(t, accessSQL, "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES")
-	// Everything runs inside the one locked transaction.
-	require.Less(t, strings.Index(accessSQL, "codefly_app_maintenance"), strings.LastIndex(accessSQL, "COMMIT;"))
-}
-
 // TestDeclaredRuntimeLoginIsSeparateFromTheReadWriteLoginDocker reconciles a
 // real server: the managed read-write login and a declared login each write
 // through their own delegated role by default, and neither can assume the
@@ -357,4 +331,25 @@ func TestDeclaredRuntimeLoginIsSeparateFromTheReadWriteLoginDocker(t *testing.T)
 		"the read-write login keeps its own default role")
 	require.Error(t, writer.AppendFixtureAsRole(ctx, maintenanceRole, relation, "20000000-0000-0000-0000-000000000004"),
 		"the read-write login must not assume the declared login's role")
+}
+
+// The in-cluster runner provisions each declared login from the staged
+// self-hosted.json: its role, its own delegated roles, and the variable its
+// password arrives on — never the password itself, which reaches the Job at
+// run time from the Secret.
+func TestBuildStagesEachDeclaredLoginForTheRunner(t *testing.T) {
+	builder := newBuildTestBuilder(t)
+	builder.Settings.RuntimeLogins = maintenanceLogin()
+	outputDirectory := t.TempDir()
+	response, err := builder.Build(context.Background(), buildRequest(outputDirectory))
+	require.NoError(t, err)
+	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+
+	var staged bootstrap.SelfHostedPackage
+	require.NoError(t, bootstrap.ReadJSON(filepath.Join(outputDirectory, "bootstrap", bootstrap.SelfHostedFile), &staged))
+	logins, err := builder.runtimeLogins()
+	require.NoError(t, err)
+	require.Len(t, logins, 1)
+	require.Equal(t, defaultBootstrapReadinessSeconds, staged.ReadinessSeconds)
+	require.Equal(t, []bootstrap.SelfHostedLogin{{Role: logins[0].role, PasswordVariable: logins[0].passwordKey, ReadWriteRoles: []string{"app_runtime"}}}, staged.Logins)
 }

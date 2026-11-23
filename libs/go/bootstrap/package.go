@@ -77,7 +77,7 @@ func decodeJSON(r io.Reader, target any) error {
 // attested bytes into a private directory. Migration execution cannot observe a
 // later edit to the input package. Neither staged directories nor files may be
 // symlinks. Unexpected files, duplicate versions and traversal fail closed.
-func snapshot(directory string, binding Binding) (schemaplan.Plan, string, error) {
+func snapshot(directory string, binding Binding, selfHosted bool) (schemaplan.Plan, string, error) {
 	var p schemaplan.Plan
 	fail := func(message string) (schemaplan.Plan, string, error) { return p, "", errors.New(message) }
 	data, readErr := os.ReadFile(filepath.Join(directory, "plan.json"))
@@ -91,12 +91,12 @@ func snapshot(directory string, binding Binding) (schemaplan.Plan, string, error
 	if err := decodeJSON(bytes.NewReader(data), &p); err != nil {
 		return p, "", err
 	}
-	if (p.ContractVersion != schemaplan.ContractVersion && p.ContractVersion != schemaplan.ReaderRolesContractVersion) ||
+	if (p.ContractVersion != schemaplan.ContractVersion && !p.DelegatesReaders()) ||
 		(p.ContractVersion == schemaplan.ContractVersion && p.Access.ReadOnlyRoles != nil) ||
 		p.Digest != p.ContentDigest() || p.Digest != binding.PlanDigest {
 		return fail("schema plan identity mismatch")
 	}
-	if err := validateBinding(p, binding); err != nil {
+	if err := validateBinding(p, binding, selfHosted); err != nil {
 		return p, "", err
 	}
 	root, err := os.OpenRoot(directory)
@@ -190,7 +190,7 @@ func identifier(s string) bool {
 	return strings.TrimSpace(s) != "" && len(s) <= 63 && !strings.ContainsRune(s, 0)
 }
 
-func validateBinding(p schemaplan.Plan, b Binding) error {
+func validateBinding(p schemaplan.Plan, b Binding, selfHosted bool) error {
 	if !identifier(p.Database) || !identifier(b.OwnerRole) || !identifier(p.Access.ReadOnlyRole) || !identifier(p.Access.ReadWriteRole) || len(p.Access.Schemas) == 0 {
 		return errors.New("database, owner, groups and schemas are required")
 	}
@@ -209,7 +209,11 @@ func validateBinding(p schemaplan.Plan, b Binding) error {
 			seen[r] = true
 		}
 	}
-	if len(b.ReadOnlyPrincipals)+len(b.ReadWritePrincipals) == 0 {
+	// Self-hosted access is the plan's own logins; external principals exist
+	// only on a managed server.
+	if principals := len(b.ReadOnlyPrincipals) + len(b.ReadWritePrincipals); selfHosted && principals != 0 {
+		return errors.New("self-hosted bootstrap binds no external principal")
+	} else if !selfHosted && principals == 0 {
 		return errors.New("at least one runtime principal is required")
 	}
 	schemas := append([]string(nil), p.Access.Schemas...)

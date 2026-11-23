@@ -289,6 +289,32 @@ func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
 	}
 	require.Error(t, err, "maintenance must not accept the migration owner")
 
+	// Exercise the stock read-only connection through both membership transitions.
+	const delegatedReader = "app_fixture_reader"
+	_, err = owner.db.ExecContext(ctx, "CREATE ROLE "+delegatedReader+" NOLOGIN")
+	require.NoError(t, err)
+	_, err = owner.db.ExecContext(ctx, "GRANT SELECT ON "+pq.QuoteIdentifier(serviceName)+" TO "+delegatedReader)
+	require.NoError(t, err)
+	runtime.RuntimeReadOnlyRoles = &[]string{delegatedReader}
+	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
+	_, err = reader.HasFixture(ctx, serviceName, fixtureID)
+	require.Error(t, err, "reader has no direct SELECT")
+	tx, err := reader.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, "SET LOCAL ROLE "+delegatedReader)
+	require.NoError(t, err)
+	var visible bool
+	err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM "+pq.QuoteIdentifier(serviceName)+" WHERE id=$1)", fixtureID).Scan(&visible)
+	require.NoError(t, err)
+	require.True(t, visible)
+	require.NoError(t, tx.Rollback())
+	runtime.RuntimeReadOnlyRoles = &[]string{}
+	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
+	require.Error(t, reader.AssumeRole(ctx, delegatedReader))
+	runtime.RuntimeReadOnlyRoles = nil
+	require.NoError(t, runtime.ensureRuntimeAccess(ctx))
+
 	// The external-identity reconciler is a deployment path; the local server
 	// stands in for the managed one, and its administrator for the provider's,
 	// which creates the cloud's login principals out-of-band.

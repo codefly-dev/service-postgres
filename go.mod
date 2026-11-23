@@ -4,9 +4,9 @@ go 1.27.4
 
 require (
 	cloud.google.com/go/cloudsqlconn v1.27.0
-	github.com/codefly-dev/core v0.19.20-0.20261109231633-701c09e0c6b4
+	github.com/codefly-dev/core v0.19.35
 	github.com/codefly-dev/gortk v0.2.0
-	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261112203454-4ff9d3c9d8d0
+	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261121162833-cda7c023eeee
 	github.com/gofrs/flock v0.13.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/jackc/pgx/v5 v5.12.0
@@ -29,7 +29,6 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.12.0 // indirect
-	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.8.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.60.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.62.0 // indirect
@@ -45,7 +44,6 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
-	github.com/containerd/log v0.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/docker v28.5.2+incompatible // indirect
@@ -98,6 +96,8 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-runewidth v0.0.28 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
+	github.com/moby/moby/api v1.57.0 // indirect
+	github.com/moby/moby/client v0.6.3 // indirect
 	github.com/moby/patternmatcher v0.6.1 // indirect
 	github.com/monochromegane/go-gitignore v0.0.0-20200626010858-205db1a8cc00 // indirect
 	github.com/oklog/ulid/v2 v2.1.2 // indirect
@@ -119,7 +119,6 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.72.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0 // indirect
 	go.opentelemetry.io/otel v1.47.0 // indirect
-	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.47.0 // indirect

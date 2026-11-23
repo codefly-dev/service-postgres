@@ -18,6 +18,7 @@ import (
 	"github.com/codefly-dev/service-postgres/libs/go/controlplane"
 	"github.com/codefly-dev/service-postgres/libs/go/schemaplan"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/lib/pq"
 )
@@ -54,6 +55,25 @@ type Options struct {
 	// ServerTrustAnchorPEM and any token are refused beside it, and
 	// ExternalIdentity must be the Cloud SQL issuer.
 	CloudSQLInstance string
+	// Password selects self-hosted (in-cluster) mode: the server is reached as
+	// its owner with the owner's password, and the runtime logins are password
+	// principals this run creates and sets (controlplane.ReconcilePasswordAccess),
+	// exactly as the local runtime does. Nil is managed mode: external
+	// principals reconciled into NOLOGIN groups. The owner password reaches the
+	// connection and the migrate child the way a token does, never the DSN.
+	Password *Password
+	// ReadinessTimeout bounds how long the first connection is retried while the
+	// server is still starting or unreachable. Zero tries once.
+	ReadinessTimeout time.Duration
+}
+
+// Password carries the self-hosted credentials: the owner's, the read-only and
+// read-write logins', and each declared login (with its delegated roles).
+type Password struct {
+	Owner     string
+	ReadOnly  string
+	ReadWrite string
+	Logins    []controlplane.PasswordLogin
 }
 
 type Result struct {
@@ -80,7 +100,13 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 	if e != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 		return result, errors.New("migrate executable is unavailable")
 	}
-	p, staged, e := snapshot(o.Directory, o.Binding)
+	if o.Password != nil && (o.Password.Owner == "" || o.CloudSQLInstance != "" || o.ExternalIdentity != "") {
+		return result, errors.New("self-hosted bootstrap requires the owner password and no cloud identity")
+	}
+	if o.ReadinessTimeout < 0 || o.ReadinessTimeout > o.Timeout {
+		return result, errors.New("invalid managed bootstrap time budgets")
+	}
+	p, staged, e := snapshot(o.Directory, o.Binding, o.Password != nil)
 	if e != nil {
 		return result, e
 	}
@@ -119,7 +145,15 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 		}
 	}
 	var credential postgres.AccessTokenProvider
-	if o.ExternalIdentity != "" {
+	if o.Password != nil {
+		owner := o.Password.Owner
+		credential = func(_ context.Context, user string) (string, error) {
+			if user != o.Binding.OwnerRole {
+				return "", errors.New("only the migration owner connects")
+			}
+			return owner, nil
+		}
+	} else if o.ExternalIdentity != "" {
 		if credential, e = postgres.ExternalIdentityProvider(ctx, o.ExternalIdentity); e != nil {
 			return result, fmt.Errorf("managed bootstrap identity: %w", e)
 		}
@@ -157,16 +191,16 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(0)
 	defer db.Close()
-	conn, e := db.Conn(ctx)
+	conn, e := awaitConnection(ctx, db, o.ReadinessTimeout)
 	if e != nil {
-		return result, errors.New("managed database connection failed")
+		return result, e
 	}
 	defer conn.Close()
 	var database, owner string
 	if e = conn.QueryRowContext(ctx, "SELECT current_database(),current_user").Scan(&database, &owner); e != nil || database != p.Database || owner != o.Binding.OwnerRole {
 		return result, errors.New("connected database or migration owner does not match binding")
 	}
-	if e = preflight(ctx, conn, p, o.Binding); e != nil {
+	if e = preflight(ctx, conn, p, o.Binding, o.Password != nil); e != nil {
 		return result, e
 	}
 	if _, e = conn.ExecContext(ctx, `SELECT pg_advisory_lock(hashtext('codefly-runtime-access:' || current_database()))`); e != nil {
@@ -229,12 +263,25 @@ func Run(ctx context.Context, o Options) (result Result, err error) {
 	defer tx.Rollback()
 	// Recheck under lock after migrations before the canonical engine can alter
 	// group attributes. A preexisting LOGIN role is not a managed group.
-	if e = preflight(ctx, tx, p, o.Binding); e != nil {
+	if e = preflight(ctx, tx, p, o.Binding, o.Password != nil); e != nil {
 		return result, e
+	}
+	if o.Password != nil {
+		if e = controlplane.ReconcilePasswordAccess(ctx, tx, controlplane.PasswordAccess{Database: p.Database, OwnerRole: o.Binding.OwnerRole,
+			ReadOnlyRole: p.Access.ReadOnlyRole, ReadOnlyPassword: o.Password.ReadOnly,
+			ReadOnlyRoles: p.Access.ReadOnlyRoles, ReconcileReadOnlyRoleMemberships: p.DelegatesReaders(), ReadWriteRole: p.Access.ReadWriteRole, ReadWritePassword: o.Password.ReadWrite,
+			Schemas: p.Access.Schemas, ReadWriteRoles: p.Access.ReadWriteRoles, Logins: o.Password.Logins}); e != nil {
+			return result, errors.New("runtime access reconciliation failed")
+		}
+		if e = tx.Commit(); e != nil {
+			return result, errors.New("runtime access commit failed; verify database state before retry")
+		}
+		result.AccessCommitted = true
+		return result, nil
 	}
 	a := controlplane.RuntimeAccess{Database: p.Database, OwnerRole: o.Binding.OwnerRole, ReadOnlyRole: p.Access.ReadOnlyRole, ReadWriteRole: p.Access.ReadWriteRole, Schemas: p.Access.Schemas, ReadWriteRoles: p.Access.ReadWriteRoles, ReconcileReadWriteRoleMemberships: true, AuthMode: controlplane.AuthModeExternalIdentity, ReadOnlyPrincipals: o.Binding.ReadOnlyPrincipals, ReadWritePrincipals: o.Binding.ReadWritePrincipals}
 	a.ReadOnlyRoles = p.Access.ReadOnlyRoles
-	a.ReconcileReadOnlyRoleMemberships = p.ContractVersion == schemaplan.ReaderRolesContractVersion
+	a.ReconcileReadOnlyRoleMemberships = p.DelegatesReaders()
 	if e = controlplane.ReconcileRuntimeAccess(ctx, tx, a); e != nil {
 		return result, errors.New("runtime access reconciliation failed")
 	}
@@ -249,7 +296,13 @@ type querier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func preflight(ctx context.Context, db querier, p schemaplan.Plan, b Binding) error {
+// preflight refuses a managed group that is a login. Self-hosted mode has no
+// groups: its read-only and read-write roles are the password logins, which
+// ReconcilePasswordAccess provisions and strips of elevated attributes itself.
+func preflight(ctx context.Context, db querier, p schemaplan.Plan, b Binding, selfHosted bool) error {
+	if selfHosted {
+		return nil
+	}
 	for _, group := range []string{p.Access.ReadOnlyRole, p.Access.ReadWriteRole} {
 		var login bool
 		e := db.QueryRowContext(ctx, "SELECT (rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls) FROM pg_roles WHERE rolname=$1", group).Scan(&login)
@@ -339,6 +392,38 @@ func withAnchorFile(dsn, path string) (string, error) {
 	q.Set("sslrootcert", path)
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// awaitConnection takes the run's one session, retrying while the server is
+// starting or unreachable until the readiness budget is spent. A server that
+// answered with anything but "starting up" (a refused credential, a missing
+// database) is final: retrying it only delays the same answer.
+func awaitConnection(ctx context.Context, db *sql.DB, budget time.Duration) (*sql.Conn, error) {
+	deadline := time.Now().Add(budget)
+	for {
+		conn, err := db.Conn(ctx)
+		if err == nil {
+			if err = conn.PingContext(ctx); err == nil {
+				return conn, nil
+			}
+			conn.Close()
+		}
+		var server *pgconn.PgError
+		if errors.As(err, &server) && server.Code != "57P03" {
+			return nil, errors.New("managed database connection refused by the server")
+		}
+		if !time.Now().Before(deadline) {
+			if budget > 0 {
+				return nil, fmt.Errorf("database did not accept connections within %s", budget)
+			}
+			return nil, errors.New("managed database connection failed")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, errors.New("managed bootstrap deadline or cancellation")
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func randomIdentity() [16]byte { var id [16]byte; rand.Read(id[:]); return id }

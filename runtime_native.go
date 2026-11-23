@@ -8,6 +8,8 @@ import (
 	"strconv"
 
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	"github.com/codefly-dev/core/runners/runstate"
+	"github.com/codefly-dev/core/wool"
 )
 
 // nativeOwnerRole is a database's migration owner on its run's shared server.
@@ -23,13 +25,19 @@ func nativeOwnerRole(database string) string {
 // there, publishes its endpoint, and migrates — the native half of Init. A
 // failure releases whatever it took, so a refused service holds no server.
 func (s *Runtime) initNative(ctx context.Context, instance *basev0.NetworkInstance) (initErr error) {
+	// A service that starts again in this agent claims the directory anew.
+	if s.nativeState != nil {
+		_ = s.nativeState.Release()
+		s.nativeState = nil
+	}
 	server, err := acquireRunServer(ctx,
-		runServerKey(s.Identity.WorkspacePath, s.Environment.NamingScope),
+		runstate.For(s.Identity.WorkspacePath, s.Environment),
 		s.Unique(), s.LogLevel, newPGLogWriter(s.Wool))
 	if err != nil {
 		return err
 	}
 	s.nixRuntime = server
+	s.nativeRoot, s.nativeState = server.root, server.state
 	defer func() {
 		if initErr != nil {
 			_, releaseErr := s.releaseNative(context.WithoutCancel(ctx))
@@ -67,6 +75,29 @@ func (s *Runtime) releaseNative(ctx context.Context) (string, error) {
 		return "stopped native postgres", nil
 	}
 	return "released this service's database; the run's native postgres server keeps serving its other services", nil
+}
+
+// disposeNative ends this agent's use of its run's state directory, which is
+// what Destroy means for it, and reports the outcome for the Destroy result:
+// the directory of a disposable run is removed once its last agent is
+// destroyed, every other directory is retained. A directory that could not be
+// collected now is reported as retained, which it is: the next agent to
+// initialize on this machine, or `codefly clear`, collects it.
+func (s *Runtime) disposeNative(ctx context.Context, action string) string {
+	state, root := s.nativeState, s.nativeRoot
+	if state == nil {
+		return s.retentionSummary(action)
+	}
+	s.nativeState = nil
+	removed, err := disposeRunState(ctx, root, state)
+	if err != nil {
+		s.Wool.Warn("cannot collect the run's native postgres directory", wool.ErrField(err))
+	}
+	if !removed {
+		return s.retentionSummary(action)
+	}
+	s.retainedDataPath = ""
+	return action + "; disposable database state removed from " + root
 }
 
 // extensionConnection is the connection extensions are created with.

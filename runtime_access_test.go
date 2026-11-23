@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"github.com/codefly-dev/service-postgres/libs/go/schemaplan"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 	"net/url"
 	"regexp"
 	"testing"
@@ -279,5 +282,30 @@ func assertConnectionIdentity(t *testing.T, connection, expectedUser, expectedPa
 	password, ok := parsed.User.Password()
 	if !ok || password != expectedPassword {
 		t.Fatal("connection password did not round trip")
+	}
+}
+
+func TestReaderRolePlanDistinguishesOmissionFromEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		configured *[]string
+		version    string
+	}{
+		{nil, schemaplan.ContractVersion},
+		{&[]string{}, schemaplan.PasswordReaderRolesContractVersion},
+		{&[]string{"request_reader"}, schemaplan.PasswordReaderRolesContractVersion},
+	} {
+		settings := Settings{DatabaseName: "app", RuntimeReadOnlyRoles: tc.configured}
+		data, err := yaml.Marshal(settings)
+		require.NoError(t, err)
+		var restored Settings
+		require.NoError(t, yaml.Unmarshal(data, &restored))
+		require.Equal(t, settings.RuntimeReadOnlyRoles, restored.RuntimeReadOnlyRoles)
+		access, err := resolveSchemaAccess(&restored)
+		require.NoError(t, err)
+		plan := (&schemaPlan{access: access}).artifact()
+		require.Equal(t, tc.version, plan.ContractVersion)
+		if tc.configured != nil {
+			require.Equal(t, *tc.configured, plan.Access.ReadOnlyRoles)
+		}
 	}
 }
