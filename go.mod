@@ -7,9 +7,9 @@ require (
 	github.com/codefly-dev/core v0.19.36
 	github.com/codefly-dev/gortk v0.2.0
 	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261121162833-cda7c023eeee
-	github.com/gofrs/flock v0.13.1
-	github.com/golang-migrate/migrate/v4 v4.19.1
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/gofrs/flock v0.13.2
+	github.com/golang-migrate/migrate/v4 v4.20.1
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/lib/pq v1.12.3
 	github.com/stretchr/testify v1.12.1
 	google.golang.org/grpc v1.85.0
@@ -46,7 +46,6 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.6.0 // indirect
-	github.com/docker/docker v28.5.2+incompatible // indirect
 	github.com/docker/go-connections v0.8.2 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
