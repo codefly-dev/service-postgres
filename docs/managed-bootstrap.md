@@ -158,9 +158,9 @@ backup/restore are outside this runner's responsibility.
 
 The managed bootstrap accepts both `codefly.dev/postgres-schema-plan/v1` and
 `codefly.dev/postgres-schema-plan/v2`. Existing v1 JSON, content digests and direct
-reader SELECT/default privileges remain unchanged. The service builder continues
-to emit v1 unless its owning package composition explicitly selects v2; no new
-service setting is implied by this library extension.
+reader SELECT/default privileges remain unchanged. The service builder emits v3 when the service settings declare
+`runtime-read-only-roles`, including an explicit empty list. Omitting that
+setting preserves the v1 plan.
 
 For a module with its own read-only role and RLS policy, its package composition
 sets the plan's contract version to v2 and declares, for example:
@@ -180,6 +180,14 @@ permissions. The canonical reconciler creates the managed group in external
 identity mode and reconciles its application-role memberships. Platform bindings
 still supply the pre-existing login principals. Packages must not reconstruct the
 primitive's role-name algorithm or create its managed groups in application SQL.
+
+Version 3 requires an engine that enforces delegation in both authentication
+modes. Earlier engines refuse v3 during plan validation. Builders use this
+version because older engines accepted v2 password plans with generic grants.
+
+For self-hosted password plans, the same v2 policy applies directly to the
+managed read-only login. The login explicitly selects its application reader
+role per transaction. Additional writer logins do not grant it direct SELECT.
 
 V2 reader delegation is exclusive: the group has CONNECT/USAGE, no direct table or
 sequence privileges, and no default SELECT. Sessions explicitly select the

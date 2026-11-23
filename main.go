@@ -107,6 +107,10 @@ type Settings struct {
 	// objects and never receive CREATE on these schemas.
 	RuntimeSchemas []string `yaml:"runtime-schemas"`
 
+	// RuntimeReadOnlyRoles selects exclusive reader delegation. Omitted keeps
+	// legacy direct SELECT. An explicit empty list grants no table access.
+	RuntimeReadOnlyRoles *[]string `yaml:"runtime-read-only-roles,omitempty"`
+
 	// RuntimeReadWriteRoles is the explicit allow-list of application-defined
 	// NOLOGIN roles that the managed read-write principal may assume with
 	// SET ROLE. When non-empty, these roles are the principal's exclusive source
@@ -350,6 +354,9 @@ type Service struct {
 	nativeOwner       string
 	readOnlyPassword  string
 	readWritePassword string
+	// fixturePassword, when set, is a run asking for the fixture principal
+	// (fixture.go): only a disposable run is given one.
+	fixturePassword string
 	// loginPasswords holds each declared runtime login's password by login name.
 	loginPasswords map[string]string
 	connectionKey  string
@@ -384,6 +391,9 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 					},
 					{
 						Name: readWriteConnectionKey, Description: "non-owner, read-write connection string",
+					},
+					{
+						Name: fixtureConnectionKey, Description: "test-fixture connection that bypasses row security; only in a disposable run that supplies " + fixturePasswordKey,
 					},
 				}},
 		},
@@ -445,6 +455,13 @@ func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configurat
 	if strings.TrimSpace(s.readWritePassword) == "" {
 		s.readWritePassword = deriveRuntimePassword(s.postgresPassword, s.DatabaseName, readWriteConnectionKey)
 	}
+	// Asking for the fixture principal is supplying its password; it is never
+	// derived, so a run that does not ask has none.
+	s.fixturePassword, err = resources.GetConfigurationValue(ctx, conf, "postgres", fixturePasswordKey)
+	if err != nil {
+		return s.Wool.Wrapf(err, "cannot get the fixture principal password")
+	}
+	s.fixturePassword = strings.TrimSpace(s.fixturePassword)
 	logins, err := s.runtimeLogins()
 	if err != nil {
 		return err

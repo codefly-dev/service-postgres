@@ -1,11 +1,14 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -422,7 +425,7 @@ func TestBootstrapImageRefusesDriftedStagedSources(t *testing.T) {
 		"--env", "POSTGRES_READ_WRITE_PASSWORD=read-write-secret",
 		tag).CombinedOutput()
 	require.Error(t, err, "the bootstrap applied drifted migration content instead of failing:\n%s", output)
-	require.Contains(t, string(output), "1_store.up.sql")
+	require.Contains(t, string(output), "migration content identity mismatch")
 
 	// Nothing may reach the database: not the drifted statement, not the
 	// migration it replaced.
@@ -478,16 +481,33 @@ func TestBootstrapImageBuildsTheWayTheCLIBuildsIt(t *testing.T) {
 	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", "--force", tag).Run() })
 	runDocker(t, "build", "--file", dockerfile, "--tag", tag, location)
 
-	listing := runDocker(t, "run", "--rm", "--entrypoint", "/bin/sh", tag,
-		"-c", "ls -A /app && ls -A /app/bootstrap")
-	require.Contains(t, listing, "runtime-access.sql")
-	require.Contains(t, listing, "sources.sha256")
-	require.NotContains(t, listing, "configurations")
+	// The image has no shell to list itself with, so its filesystem is exported.
+	// FROM scratch, the export is exactly what this build put there, so
+	// searching it is exhaustive for content the build could have leaked.
+	container := strings.TrimSpace(runDocker(t, "create", tag))
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "--force", container).Run() })
+	filesystem, err := exec.Command("docker", "export", container).Output()
+	require.NoError(t, err)
+	listing := tarEntries(t, filesystem)
+	require.Contains(t, listing, "app/bootstrap/plan.json")
+	require.Contains(t, listing, "app/bootstrap/self-hosted.json")
+	require.Contains(t, listing, "usr/local/bin/managed-bootstrap")
+	for _, entry := range listing {
+		require.NotContains(t, entry, "configurations")
+	}
+	require.NotContains(t, string(filesystem), "super-secret", "the image carries the service directory's local secret")
+}
 
-	// /app is the whole of what this build adds to the base image, so scanning it
-	// is exhaustive for content the build could have leaked. Scanning from / would
-	// descend into /proc and /dev and block on their pseudo-files.
-	secretSearch := runDocker(t, "run", "--rm", "--entrypoint", "/bin/sh", tag,
-		"-c", "grep -rl super-secret /app 2>/dev/null; exit 0")
-	require.Empty(t, strings.TrimSpace(secretSearch), "the image carries the service directory's local secret")
+func tarEntries(t *testing.T, archive []byte) []string {
+	t.Helper()
+	var entries []string
+	reader := tar.NewReader(bytes.NewReader(archive))
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			return entries
+		}
+		require.NoError(t, err)
+		entries = append(entries, header.Name)
+	}
 }

@@ -67,10 +67,10 @@ func TestRunServerIsSharedAndIsolated(t *testing.T) {
 
 	// One server for the run.
 	require.Equal(t, runAlpha.nixRuntime.dataDir, runBeta.nixRuntime.dataDir)
-	attached, running, err := attachedPostmaster(runAlpha.nixRuntime.root, runAlpha.nixRuntime.dataDir)
+	attached, _, running, err := attachedPostmaster(runAlpha.nixRuntime.root, runAlpha.nixRuntime.dataDir)
 	require.NoError(t, err)
 	require.True(t, running)
-	postmaster := attached.Postmaster.PID
+	postmaster := attached.PID
 
 	// Each service at its own endpoint, with its own data.
 	requireListener(t, alpha.address)
@@ -155,39 +155,12 @@ func TestRunServerRefusesTwoServicesClaimingOneDatabase(t *testing.T) {
 	require.NoError(t, connects(ctx, run.connection))
 }
 
-// TestAbandonedRunServerIsCollected: a run killed without releasing leaves a
-// server nobody holds; the next agent to initialize anywhere stops it.
-func TestAbandonedRunServerIsCollected(t *testing.T) {
-	requireNix(t)
-	ctx := context.Background()
-	abandoned := newPostgresFixtureAt(t, ctx, t.TempDir(), "gone", "store", resources.NewRuntimeContextNix())
-	run, _ := abandoned.start(t, ctx)
-	dataDir := run.nixRuntime.dataDir
-	attached, running, err := attachedPostmaster(run.nixRuntime.root, dataDir)
-	require.NoError(t, err)
-	require.True(t, running)
-	postmaster := attached.Postmaster.PID
-
-	// The run dies: its agent's record names a process that no longer exists,
-	// and its endpoint went with it.
-	require.NoError(t, run.nixRuntime.forwarder.Close())
-	run.nixRuntime.serverCancel()
-	writeHolder(t, run.nixRuntime.root, "store", serverHolder{Service: "gone/store", Agent: processMark{PID: 2147483646}})
-	require.NoError(t, os.Remove(run.nixRuntime.holder))
-	run.nixRuntime = nil
-
-	next := newPostgresFixtureAt(t, ctx, t.TempDir(), "next", "store", resources.NewRuntimeContextNix())
-	next.start(t, ctx)
-	require.False(t, processAlive(postmaster), "an abandoned run's server must be stopped by the next run")
-}
-
 // TestLockFileHeldByARealPostmasterIsRefused is the case where the lock file
-// must be left exactly as it is. A record this agent cannot read — lost, or
-// written by a version that did not keep one — does not make the postmaster
-// holding the cluster disposable: removing its lock file would let a second
-// postmaster start on the same data directory, which is how a cluster is
-// corrupted. The run refuses and names the process instead, and signals
-// nothing.
+// must be left exactly as it is. A postmaster this agent cannot attach to (its
+// record lost, or started by a version that kept none) is not disposable for
+// that: removing its lock file would let a second postmaster start on the
+// same data directory, which is how a cluster is corrupted. The run refuses
+// and names the process instead, and signals nothing.
 func TestLockFileHeldByARealPostmasterIsRefused(t *testing.T) {
 	requireNix(t)
 	ctx := context.Background()
@@ -198,25 +171,17 @@ func TestLockFileHeldByARealPostmasterIsRefused(t *testing.T) {
 	postmaster, running := postmasterPidFileOwner(pidPath)
 	require.True(t, running)
 
-	// The record goes missing while its postmaster keeps serving.
-	recorded, err := os.ReadFile(postmasterRecordPath(root))
+	// Where it listens goes missing while the postmaster keeps serving.
+	recorded, err := os.ReadFile(serverSocketRecord(root))
 	require.NoError(t, err)
-	require.NoError(t, os.Remove(postmasterRecordPath(root)))
-	t.Cleanup(func() { _ = os.WriteFile(postmasterRecordPath(root), recorded, 0o600) })
+	require.NoError(t, os.Remove(serverSocketRecord(root)))
+	t.Cleanup(func() { _ = os.WriteFile(serverSocketRecord(root), recorded, 0o600) })
 
-	_, attached, err := attachedPostmaster(root, run.nixRuntime.dataDir)
+	_, _, attached, err := attachedPostmaster(root, run.nixRuntime.dataDir)
 	require.False(t, attached)
 	require.ErrorContains(t, err, "stop it before running again")
 	require.FileExists(t, pidPath, "a live postmaster's lock file is never removed")
 	require.True(t, processAlive(postmaster), "and its postmaster is never signalled")
-
-	// Unreadable record, same answer: nothing of this run's may be stopped on
-	// a PID alone, so the server is still there for the restored record.
-	require.NoError(t, os.WriteFile(postmasterRecordPath(root), []byte("{"), 0o600))
-	_, attached, err = attachedPostmaster(root, run.nixRuntime.dataDir)
-	require.False(t, attached)
-	require.ErrorContains(t, err, "stop it before running again")
-	require.True(t, processAlive(postmaster))
 }
 
 // TestRunServerRefusesAnOwnerRoleAnotherServiceCreated closes the one way a

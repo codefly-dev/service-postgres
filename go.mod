@@ -6,7 +6,7 @@ require (
 	cloud.google.com/go/cloudsqlconn v1.27.0
 	github.com/codefly-dev/core v0.19.36-0.20261123200439-73d6f3af038f
 	github.com/codefly-dev/gortk v0.2.0
-	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261112203454-4ff9d3c9d8d0
+	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261121162833-cda7c023eeee
 	github.com/gofrs/flock v0.13.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/jackc/pgx/v5 v5.12.0

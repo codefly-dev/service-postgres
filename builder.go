@@ -27,6 +27,7 @@ import (
 	"github.com/codefly-dev/core/agents/services/upgrade"
 	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
 	"github.com/codefly-dev/core/shared"
+	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,9 +36,6 @@ const (
 	// context. It carries the generated bootstrap program, the plan identity, and
 	// one immutable copy of every packaged migration source.
 	bootstrapDirectory = "bootstrap"
-	// stagedChecksumFile is the sha256sum manifest the bootstrap program verifies
-	// before it applies anything.
-	stagedChecksumFile = "sources.sha256"
 	// bootstrapMarkerFile doubles as the staged tree's git ignore rule: the
 	// directory is regenerated on every build, so it must never be committed,
 	// and existing services get that for free without editing their own
@@ -46,9 +44,6 @@ const (
 	// bootstrapMarker identifies a bootstrap directory this agent generated and
 	// may therefore replace.
 	bootstrapMarker = "# codefly-generated postgres bootstrap"
-	// runtimeAccessFile is rendered at the build context root, beside the staged
-	// bootstrap tree, because the Dockerfile COPYs it root-relative.
-	runtimeAccessFile = "runtime-access.sql"
 	// bootstrapIgnoreFile keeps the build context down to what the image
 	// actually copies. The context is the whole service directory, which carries
 	// local configuration and secrets, and a context is transferred to the
@@ -215,27 +210,15 @@ func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*
 	return s.Builder.UpgradeResponse(res.Changes, res.LockfileDiff)
 }
 
-// DockerTemplating renders the bootstrap image: the Dockerfile, the generated
-// bootstrap program, and the SQL it applies. Every field is derived from the
-// schema plan, so the image can only carry what the plan declares.
+// DockerTemplating renders the bootstrap image: the Dockerfile and the staged
+// package's self-hosted.json. Every field is derived from the schema plan and
+// the service's declared logins, so the image can only carry what they declare.
 type DockerTemplating struct {
-	MigrationConnectionEnvironment string
-	// RuntimeAccessLockID is the advisory-lock expression the bootstrap script
-	// takes, shared verbatim with the agent so the two cannot drift apart.
-	RuntimeAccessLockID     string
 	ReadinessTimeoutSeconds int
-	ReadOnlyRole            string
-	ReadWriteRole           string
-	Schemas                 []string
-	ReadWriteRoles          []string
-	// DefaultReadWriteRole is the application role the managed read-write login
-	// selects on connect. See defaultRuntimeReadWriteRole.
-	DefaultReadWriteRole string
-	// Logins are the declared runtime login principals the bootstrap Job
-	// provisions beside the managed read-write login.
-	Logins     []BootstrapLogin
-	Extensions []BootstrapExtension
-	Lineages   []BootstrapLineage
+	// Logins are the declared runtime login principals the self-hosted run
+	// provisions beside the read-write login, each naming the variable its
+	// password arrives on.
+	Logins []bootstrap.SelfHostedLogin
 }
 
 // Bootstrap resolves the locked bootstrap inputs the Dockerfile renders from. A
@@ -245,65 +228,21 @@ func (DockerTemplating) Bootstrap() *bootstrapImageLock {
 	return bootstrapLock
 }
 
-// BootstrapLogin is one declared runtime login as runtime-access.sql sees it:
-// its role, the environment variable its password arrives on, its exclusive
-// delegated role set and the one it defaults to.
-type BootstrapLogin struct {
-	Role             string
-	PasswordVariable string
-	ReadWriteRoles   []string
-	DefaultRole      string
+// selfHostedPackage is self-hosted.json as the runner reads it.
+func (d DockerTemplating) selfHostedPackage() bootstrap.SelfHostedPackage {
+	logins := d.Logins
+	if logins == nil {
+		logins = []bootstrap.SelfHostedLogin{}
+	}
+	return bootstrap.SelfHostedPackage{ReadinessSeconds: d.ReadinessTimeoutSeconds, Logins: logins}
 }
 
-func bootstrapLogins(logins []runtimeLogin) []BootstrapLogin {
-	out := make([]BootstrapLogin, 0, len(logins))
+func bootstrapLogins(logins []runtimeLogin) []bootstrap.SelfHostedLogin {
+	out := make([]bootstrap.SelfHostedLogin, 0, len(logins))
 	for _, login := range logins {
-		out = append(out, BootstrapLogin{
-			Role:             login.role,
-			PasswordVariable: login.passwordKey,
-			ReadWriteRoles:   login.readWriteRoles,
-			DefaultRole:      defaultRuntimeReadWriteRole(login.readWriteRoles),
-		})
+		out = append(out, bootstrap.SelfHostedLogin{Role: login.role, PasswordVariable: login.passwordKey, ReadWriteRoles: login.readWriteRoles})
 	}
 	return out
-}
-
-// BootstrapLineage is one migration lineage as the generated bootstrap program
-// sees it: the staged directory inside the image and the ledger it owns.
-type BootstrapLineage struct {
-	Label  string
-	Stage  string
-	Ledger string
-}
-
-// bootstrapLineages projects the plan's lineages onto the staged layout the
-// image carries, in declared order.
-func bootstrapLineages(plan *schemaPlan) []BootstrapLineage {
-	lineages := make([]BootstrapLineage, 0, len(plan.lineages))
-	for _, lineage := range plan.lineages {
-		lineages = append(lineages, BootstrapLineage{
-			Label:  lineage.label(),
-			Stage:  lineage.stage,
-			Ledger: lineage.trackingTable(),
-		})
-	}
-	return lineages
-}
-
-// BootstrapExtension is one extension as the generated SQL sees it. A required
-// extension aborts the bootstrap when it cannot be created, exactly as it fails
-// the local runtime's readiness; an optional one is reported and skipped.
-type BootstrapExtension struct {
-	Name     string
-	Required bool
-}
-
-func bootstrapExtensions(plan *schemaPlan) []BootstrapExtension {
-	extensions := make([]BootstrapExtension, 0, len(plan.extensions))
-	for _, extension := range plan.extensions {
-		extensions = append(extensions, BootstrapExtension{Name: extension.name, Required: extension.required})
-	}
-	return extensions
 }
 
 func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*builderv0.BuildResponse, error) {
@@ -364,17 +303,8 @@ func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*buil
 	}
 	s.reportSchemaPrerequisites(prerequisites)
 	docker := DockerTemplating{
-		MigrationConnectionEnvironment: migrationConnectionEnvironmentKey,
-		RuntimeAccessLockID:            runtimeAccessLockID,
-		ReadinessTimeoutSeconds:        s.Settings.Timeouts.BootstrapReadinessSeconds(),
-		ReadOnlyRole:                   plan.access.readOnlyRole,
-		ReadWriteRole:                  plan.access.readWriteRole,
-		Schemas:                        plan.access.schemas,
-		ReadWriteRoles:                 plan.access.readWriteRoles,
-		DefaultReadWriteRole:           defaultRuntimeReadWriteRole(plan.access.readWriteRoles),
-		Logins:                         bootstrapLogins(logins),
-		Extensions:                     bootstrapExtensions(plan),
-		Lineages:                       bootstrapLineages(plan),
+		ReadinessTimeoutSeconds: s.Settings.Timeouts.BootstrapReadinessSeconds(),
+		Logins:                  bootstrapLogins(logins),
 	}
 
 	return s.buildRecipe(ctx, req.GetOutputDirectory(), img, plan, docker)
@@ -436,8 +366,8 @@ func (s *Builder) buildRecipe(
 }
 
 // stageBootstrapContext writes the complete bootstrap artifact into a build
-// context root: the generated bootstrap program and SQL, the plan identity, the
-// checksum manifest, and one immutable copy of every resolved migration source
+// context root: the migration runner's sources, the plan identity, the
+// self-hosted package file, and one immutable copy of every resolved migration source
 // under its own staged directory. Sibling sources live outside the build
 // context, so staging is what makes them reachable at all — a Dockerfile COPY
 // cannot leave its context.
@@ -481,7 +411,13 @@ func (s *Builder) stageBootstrapContext(
 	if err = os.WriteFile(filepath.Join(staging, "plan.json"), artifact, 0o644); err != nil {
 		return err
 	}
-	if err = os.WriteFile(filepath.Join(staging, stagedChecksumFile), plan.stagedChecksums(), 0o644); err != nil {
+	// The runner verifies every staged source against plan.json's digests
+	// before it connects, so the plan is the only manifest the image needs.
+	selfHosted, err := json.MarshalIndent(docker.selfHostedPackage(), "", "  ")
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(staging, bootstrap.SelfHostedFile), append(selfHosted, '\n'), 0o644); err != nil {
 		return err
 	}
 	// The recipe digest covers each file's mode and the bootstrap Job reads this
@@ -494,13 +430,7 @@ func (s *Builder) stageBootstrapContext(
 	if err = os.RemoveAll(root); err != nil {
 		return err
 	}
-	if err = os.Rename(staging, root); err != nil {
-		return err
-	}
-	if err = s.renderRuntimeAccess(ctx, docker, contextRoot); err != nil {
-		return err
-	}
-	return os.Chmod(filepath.Join(contextRoot, runtimeAccessFile), 0o644)
+	return os.Rename(staging, root)
 }
 
 // planArtifactBytes is plan.json exactly as the image carries it: the managed
@@ -569,13 +499,6 @@ func stageLineage(ctx context.Context, lineage schemaLineage, destination string
 		}
 	}
 	return nil
-}
-
-// renderRuntimeAccess renders runtime-access.sql into the build context root, the
-// directory docker builds from. The Dockerfile COPYs it from there, so it must
-// sit beside the staged bootstrap tree rather than under builder/.
-func (s *Builder) renderRuntimeAccess(ctx context.Context, docker DockerTemplating, contextRoot string) error {
-	return s.Templates(ctx, docker, services.WithTemplate(runtimeFS, "runtime", "").WithDestination("%s", contextRoot))
 }
 
 func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) (*builderv0.DeploymentResponse, error) {
@@ -996,9 +919,6 @@ var builderFS embed.FS
 //
 //go:embed all:templates/bootstrap
 var bootstrapFS embed.FS
-
-//go:embed templates/runtime
-var runtimeFS embed.FS
 
 //go:embed templates/deployment
 var deploymentFS embed.FS

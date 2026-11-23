@@ -15,7 +15,7 @@ rules:
   - id: PG-OPEN-001
     title: Open the database through postgres.Open, never a driver
     severity: warn
-    since: 0.0.151
+    since: 0.0.153
     rationale: >-
       A pool or connection opened with a driver carries no tenant or user
       identity, so row-level security either refuses every row or, on a role
@@ -55,7 +55,7 @@ rules:
   - id: PG-POOL-001
     title: Do not build a Factory or Maintenance from a pool you made
     severity: warn
-    since: 0.0.151
+    since: 0.0.153
     rationale: >-
       NewFactory, NewMaintenance and OpenPool exist for tests and for trusted
       compositions that already hold a qualified pool. None of them checks the
@@ -84,7 +84,7 @@ rules:
   - id: PG-MIGRATE-001
     title: Keep the migration owner's connection out of application code
     severity: warn
-    since: 0.0.151
+    since: 0.0.153
     rationale: >-
       The migration owner can create, alter and drop. The control plane in
       migrationtest takes that connection explicitly so a test can create and
@@ -108,7 +108,7 @@ rules:
   - id: PG-MAINT-001
     title: Keep Maintenance out of request handlers
     severity: warn
-    since: 0.0.151
+    since: 0.0.153
     rationale: >-
       Maintenance clears the tenant and user settings so background work can
       see across tenants where a migration's policy allows it. A request
@@ -125,7 +125,7 @@ rules:
   - id: PG-SCOPE-001
     title: Let the library set the tenant and user identity
     severity: warn
-    since: 0.0.151
+    since: 0.0.153
     rationale: >-
       The library installs the tenant and user as transaction-local settings
       from the authenticated principal, and row-level security reads them. A
@@ -144,7 +144,7 @@ rules:
   - id: PG-WRITE-001
     title: Take a Writer only for work that writes
     severity: warn
-    since: 0.0.151
+    since: 0.0.153
     rationale: >-
       A Reader runs on the read-only login in a read-only transaction, so a
       bug or an injected statement in a read path cannot change data. Taking

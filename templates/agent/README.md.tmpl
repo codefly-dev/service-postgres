@@ -3,6 +3,7 @@
 This service provisions Postgres as two explicit runtime capabilities:
 
 - `postgres.read-only-connection`: a non-owner `NOBYPASSRLS` role with query-only grants and a read-only transaction default.
+  Set `runtime-read-only-roles` to delegate reads to migration-owned roles selected with `SET LOCAL ROLE`. An empty list removes all table access from the reader. Omitting the setting uses legacy direct SELECT grants.
 - `postgres.read-write-connection`: a non-owner `NOBYPASSRLS` role with no schema creation, database creation, role management, or owner membership. By default it receives query and DML grants directly. When `runtime-read-write-roles` is configured, those explicit `NOLOGIN` roles are its exclusive application authority: the login principal itself holds no table grants and is `NOINHERIT`, so a session reaches them only by selecting one.
 
   The **first** role in `runtime-read-write-roles` is set as the login's session default, so a caller that uses the secret as-is writes without issuing anything. Appending further roles does not change that default — reorder the list to change it. A caller that needs one of the other roles selects it with `SET ROLE`. Two consequences worth knowing: `RESET ROLE` returns to the default role, not to the login principal, so use `SET ROLE NONE` to drop to the unprivileged principal; and if the default role cannot be assumed (a migration has not created it yet, or reconciliation failed), the connection still opens as the principal — the server logs `WARNING: permission denied to set role` and writes fail with `42501` until the next successful reconciliation.
@@ -39,7 +40,7 @@ On the Nix runtime every Postgres service of a run shares **one** Postgres serve
 - **Isolation.** Each database is closed to `PUBLIC`; only its own owner and runtime logins connect to it. No login of one service reaches another's database or the server's maintenance databases. Two services of one run declaring the same `database-name` are refused, naming both.
 - **Administration.** The server's bootstrap superuser exists only for the agent: it creates each database, its owner, and the declared extensions (pgvector is not a trusted extension). Its password is generated when the server is first initialized and is kept in an owner-only file beside the cluster; no service receives it.
 - **Endpoints.** The server listens on no TCP port, only on a private Unix socket. Each service's agent listens on the service's own allocated port, on loopback, and forwards every connection to that socket; authentication stays between the client and the server.
-- **Lifecycle.** The first service to start starts the server; each stop or destroy releases that service, and the last one stops the server, which frees its shared memory. A run killed without stopping leaves a server no live agent holds; the next service to start on the machine stops it. The cluster directory is retained per run, as each service's was.
+- **Lifecycle.** The first service to start starts the server; each stop or destroy releases that service, and the last one stops the server, which frees its shared memory. A run killed without stopping leaves its server running. When that run was disposable (below) and is gone, the next service to start on the machine, or `codefly clear`, stops the server and removes its directory: only the process the run's agents recorded there, checked against its recorded start before it is signalled. Any other killed run keeps its server, which is yours: the same run attaches to it when it starts again, and its next orderly stop stops it. The cluster directory is retained per run, as each service's was, unless the run is disposable.
 
 Native shutdown signals the recorded process birth through Core, so a reused PID is not a shutdown target.
 
@@ -56,8 +57,11 @@ Stop and destroy have one state-ownership contract, and it is the same on Docker
 | stop | released — the service's endpoint closes and, for the run's last service, the postmaster is terminated (Nix), or the container is stopped (Docker), freeing the published port | retained |
 | stop with `keep-running: true` (Docker only) | retained — the container stays up for the next invocation to reuse | retained |
 | destroy | released; the Docker container is also removed | retained |
+| destroy, in a disposable run (Nix) | released | removed with the run's last service |
 
-No operation deletes data. Dropping a database or a data directory needs an explicit authorization that the state is disposable and owned by the caller, which the stop and destroy calls do not carry — so a destroy is never read as permission to drop your database. A disposable reset arrives with the shared lifecycle contract in `codefly-dev/core#424`.
+No operation deletes your data. Dropping a database or a data directory needs an explicit authorization that the state is disposable and owned by the caller, which the stop and destroy calls do not carry — so a destroy is never read as permission to drop your database (`codefly-dev/core#424`).
+
+That authorization is the run's own: a **disposable run** — `codefly run --temporary-ports`, or a test's dependency stack, whose naming scope Codefly generated and nothing can run again — says so in the environment it hands the agent. Its Nix server directory (under the user cache directory, `codefly/postgres/run/`) is removed when the run ends: by the run itself once it has stopped its services, by the run's last service when it is destroyed, or, when the run was killed, by the next Postgres service to start on the machine or by `codefly clear`. A plain run, and a run under a naming scope you named, is never disposable: its data is retained through every operation.
 
 Stop releases only what the running invocation itself started. A session that never configured this service stops nothing.
 
@@ -73,6 +77,20 @@ spec:
 `keep-running` applies to the Docker runtime only. Reuse means the next invocation reattaches to a live server of this service's own, and only Docker has one — the Nix server belongs to the run and stops when the run's last service releases it. On Nix the setting is reported and ignored: the service is released and its data is retained.
 
 Test fixtures should own disposable state instead of depending on a warm server: give the fixture its own naming scope so its database is separate, and let stop retain it or discard the scope wholesale. Reading a sentinel row back after stop and re-init is the supported way to prove retention.
+
+## The fixture principal
+
+A suite that seeds rows for several tenants, empties tables between tests or asserts across tenants needs a login that bypasses row security: under `FORCE ROW LEVEL SECURITY` a table's own owner is bound by its policies. The owner connection is not that login. Whether it bypasses anything is an accident of the backend (a container's `POSTGRES_USER` is a superuser; the Nix run server's migration owner is `NOSUPERUSER NOBYPASSRLS`), so a suite that seeds through it passes on one backend and fails on the other.
+
+The capability is its own principal, the same on both backends, and a run gets it only by asking:
+
+- **Ask** by supplying its password, `POSTGRES_FIXTURE_PASSWORD`, in the service's `postgres` secret configuration, for that run only. From a Go test: `sdk.WithServiceSecret("<module>/<service>", "postgres", "POSTGRES_FIXTURE_PASSWORD", <any throwaway value>)` among the `WithDependencies` options. It is never derived and never has a default: a run that does not ask has no such role.
+- **Read** it as `postgres.fixture-connection`, beside `owner-connection`: `codefly.For(ctx).Service("<service>").Secret("postgres", "fixture-connection")`.
+- **Only a disposable run is given one**: a run whose naming scope its own invocation generated (a test's dependency stack, `codefly run service --temporary-ports`), whose state nothing can run again. Any other run that asks (no naming scope, a scope its caller named, a stack kept running) is refused at init, by name, before anything is started. Do not commit the key to a configuration profile: every plain `codefly run` of the service would then be refused.
+
+The principal is `<database role prefix>_fixture`: a `LOGIN` with `BYPASSRLS` and the migration owner's authority, no more. It is a member of the owner, so it holds the owner's rights on the owner's relations (DDL, `TRUNCATE`) and over the roles the owner's migrations created; it may create roles and databases as a migration suite does, and is a full member of the roles it creates. It is a superuser only where the owner already is one (a container's `POSTGRES_USER`, whose server is this service's alone): membership does not carry a superuser's authority. On the Nix run server, which every service of the run shares, it is not a superuser and reaches nothing of another service's database. Row security is bypassed for the principal itself: after `SET ROLE` to an application role, policies bind the session as they bind that role. It is removed when the service is stopped or destroyed, and an init that does not ask removes one an interrupted run left. It has no deployed form: no render exports it and the bootstrap Job never creates it.
+
+`owner-connection` keeps its meaning on both backends: the migration owner.
 ## Schema prerequisites
 
 The service applies migrations from its own `migrations/` directory plus every source declared in `migration-sources`, and creates every extension declared in `extensions`. Both are resolved and validated before a database connection is opened, so a typo fails the build and local startup instead of leaving the database with a partial schema.

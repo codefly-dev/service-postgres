@@ -31,15 +31,21 @@ RUN rm /usr/local/bin/gosu
 # zlib 1.3.2-r0, eighteen HIGHs in krb5-libs 1.22.2-r1 fixed in 1.22.3-r0, and
 # CVE-2026-87636 + CVE-2026-9947 in libxslt 1.1.43-r3 fixed in 1.1.43-r4):
 # the pinned base ships the vulnerable revisions and nothing else upgrades them.
+# libxml2 and xz-libs are libxslt's dependencies: --upgrade moves them with it,
+# so they are named too rather than left to float. The Alpine index keeps only
+# the newest -rN of a package, so a pin here stops resolving the day upstream
+# revises it (OpenSSL 3.5.9-r0 -> r1 did on 2026-11-23); move the pin and relock.
 RUN apk add --no-cache --upgrade \
     krb5-libs=1.22.3-r0 \
-    libcrypto3=3.5.9-r0 \
-    libssl3=3.5.9-r0 \
+    libcrypto3=3.5.9-r1 \
+    libssl3=3.5.9-r1 \
     libuuid=2.42.3-r1 \
+    libxml2=2.13.9-r3 \
     libxslt=1.1.43-r4 \
     musl=1.2.6-r3 \
     musl-utils=1.2.6-r3 \
     su-exec=0.3-r0 \
+    xz-libs=5.8.4-r0 \
     zlib=1.4-r0 && \
     ln -s /sbin/su-exec /usr/local/bin/gosu && \
     rm /var/log/apk.log

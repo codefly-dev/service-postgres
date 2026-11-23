@@ -26,27 +26,38 @@ The source-stage checksum check verifies both staged module files before
 `go build -mod=readonly`. The checksummed Go modules authenticate downloaded
 source. `GOTOOLCHAIN=local` prevents an implicit compiler download. Literal image
 labels and typed recipe arguments record the Go image digest, migrate version,
-driver set and both module-file SHA256 values alongside the existing base/apk
-provenance. Normal context hashing includes the staged source files. The build
+driver set and both module-file SHA256 values. Normal context hashing includes the staged source files. The build
 copies only the compiled executable and cleaned bootstrap artifacts into the
 runtime, so an SBOM describes shipped code rather than unused parent manifests.
 
-The bootstrap OS is maintained separately from the migrate executable and the
-PostgreSQL server image in `runtime-image.json`. The Alpine 3.21.9 bootstrap base
-updates libcrypto3/libssl3 to 3.3.7-r2, musl/musl-utils to 1.2.5-r12 and zlib to
-1.3.2-r1 on both architectures, addressing the fixable OS findings in the prior
-3.21.8 base. This stays on the same Alpine branch and PostgreSQL 17 client. Resolve
-the base with the full lock updater; do not add an unpinned `apk upgrade` to
-consumer Dockerfiles. Rebuilding with an older agent retains its embedded lock,
-so consumers must select the corrected source artifact or subsequent release.
-Package inspection of the base is not a scan of the final migration images.
+The image is `FROM scratch`: the migrate executable, the migration runner
+(`cmd/managed-bootstrap`, compiled static the same way), the toolchain image's CA
+bundle (the Cloud SQL connector verifies Google's APIs with it), an empty `/tmp`,
+and the staged `/app/bootstrap` tree. No shell, no package manager, and no
+package index is read when it is built: through v0.0.150 the image installed
+`postgresql17-client` at an exact `-rN` from the live Alpine index, which keeps
+only the newest revision, so every consumer's render failed the day Alpine moved
+it. It runs as 65534 on a read-only root filesystem.
+
+The runner (`libs/go/bootstrap.Run`) serves both store kinds. A managed store's
+Job passes its binding and reaches Cloud SQL through the connector as its own
+cloud identity. An in-cluster store's Job runs the image's default and is
+self-hosted: the owner connects with its password (supplied at connect time and
+to the migrate child's environment, never in a URL or argument), and the
+read-only, read-write and declared logins are provisioned with
+`controlplane.ReconcilePasswordAccess` — the same function the local runtime
+uses, so a local store and a deployed one grant identical access. Either way the
+runner verifies every staged source against `plan.json`, waits for the server
+(self-hosted), then holds the runtime-access lock across extensions, every
+lineage and the access reconciliation. `self-hosted.json` beside the plan names
+the declared logins and the variable each one's password arrives on.
 
 Use `.github/scripts/update-bootstrap-migrate.py` to resolve the migrate portion
 of the lock without Docker. It reads migrate's version from `go.mod`, retains the
 existing exact compiler tag, verifies the registry manifest digest and checks
 both target platforms. `MIGRATE_GO_IMAGE=golang:<patch>-alpine<release>` deliberately
-selects a newer compiler. The existing full `update-bootstrap-lock.sh` calls the
-same resolver while also refreshing Alpine/package pins on both architectures.
+selects a newer compiler. `update-bootstrap-lock.sh` calls the same resolver
+and also reports a newer upstream migrate release.
 No lock digest is manually authored. Dependency and toolchain changes require the
 same source-build tests; the strict binary dependency inventory intentionally
 fails if another module enters the binary and requires review.
@@ -64,6 +75,6 @@ Before rollout, run the Docker bootstrap tests for both architectures and the
 existing bootstrap parity tests in an allocated engine slot. Then build through
 the normal released/local agent recipe, record each resulting migration image's
 digest, and scan the actual images. A host binary inspection is source evidence;
-it does not establish scanner clearance for the Alpine packages or deployed
+it does not establish scanner clearance for the deployed
 images. Old agent releases continue to emit the old archive recipe, so consumers
 must adopt the corrected agent and rebuild all migration images before deployment.

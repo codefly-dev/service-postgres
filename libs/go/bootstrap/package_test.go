@@ -86,7 +86,7 @@ func TestPackageRejectsDriftAndAmbiguousInputs(t *testing.T) {
 				h := sha256.Sum256(data)
 				b.PlanSHA256 = hex.EncodeToString(h[:])
 			}
-			_, tmp, e := snapshot(dir, b)
+			_, tmp, e := snapshot(dir, b, false)
 			if tmp != "" {
 				os.RemoveAll(tmp)
 			}
@@ -107,7 +107,7 @@ func TestPackageRejectsDriftAndAmbiguousInputs(t *testing.T) {
 func TestPackageAcceptsABindingWithWritersOnly(t *testing.T) {
 	dir, _, b := packageFixture(t, "CREATE TABLE example(id integer);")
 	b.ReadOnlyPrincipals = nil
-	_, tmp, e := snapshot(dir, b)
+	_, tmp, e := snapshot(dir, b, false)
 	if tmp != "" {
 		os.RemoveAll(tmp)
 	}
@@ -115,7 +115,7 @@ func TestPackageAcceptsABindingWithWritersOnly(t *testing.T) {
 		t.Fatalf("a binding with a writer and no reader was refused: %v", e)
 	}
 	b.ReadOnlyPrincipals, b.ReadWritePrincipals = []string{"bootstrap_reader"}, nil
-	if _, tmp, e = snapshot(dir, b); e != nil {
+	if _, tmp, e = snapshot(dir, b, false); e != nil {
 		t.Fatalf("a binding with a reader and no writer was refused: %v", e)
 	} else if tmp != "" {
 		os.RemoveAll(tmp)
@@ -124,7 +124,7 @@ func TestPackageAcceptsABindingWithWritersOnly(t *testing.T) {
 
 func TestSnapshotRetainsVerifiedBytes(t *testing.T) {
 	dir, _, b := packageFixture(t, "SELECT 1;")
-	_, tmp, e := snapshot(dir, b)
+	_, tmp, e := snapshot(dir, b, false)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -137,17 +137,17 @@ func TestSnapshotRetainsVerifiedBytes(t *testing.T) {
 }
 
 func TestReaderRolePackageVersions(t *testing.T) {
-	for _, version := range []string{schemaplan.ContractVersion, schemaplan.ReaderRolesContractVersion, "codefly.dev/postgres-schema-plan/v3"} {
+	for _, version := range []string{schemaplan.ContractVersion, schemaplan.ReaderRolesContractVersion, schemaplan.PasswordReaderRolesContractVersion, "codefly.dev/postgres-schema-plan/future"} {
 		for _, roles := range [][]string{nil, {"app_reader"}, {"bootstrap_rw"}, {"app_reader", "app_reader"}} {
 			dir, p, b := packageFixture(t, "SELECT 1;")
 			p.ContractVersion, p.Access.ReadOnlyRoles = version, roles
 			writePlan(t, dir, p, &b)
-			_, tmp, err := snapshot(dir, b)
+			_, tmp, err := snapshot(dir, b, false)
 			if tmp != "" {
 				os.RemoveAll(tmp)
 			}
 			valid := (version == schemaplan.ContractVersion && roles == nil) ||
-				(version == schemaplan.ReaderRolesContractVersion && (roles == nil || len(roles) == 1 && roles[0] == "app_reader"))
+				((version == schemaplan.ReaderRolesContractVersion || version == schemaplan.PasswordReaderRolesContractVersion) && (roles == nil || len(roles) == 1 && roles[0] == "app_reader"))
 			if (err == nil) != valid {
 				t.Fatalf("version %s roles %v: %v", version, roles, err)
 			}
