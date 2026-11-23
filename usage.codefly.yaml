@@ -74,6 +74,9 @@ rules:
           - github.com/codefly-dev/service-postgres/libs/go.NewFactory
           - github.com/codefly-dev/service-postgres/libs/go.NewMaintenance
           - github.com/codefly-dev/service-postgres/libs/go.OpenPool
+        # The library's path ends in "go"; its package is postgres.
+        names:
+          github.com/codefly-dev/service-postgres/libs/go: postgres
     except-paths:
       - "**/*_test.go"
       - "**/testdata/**"
