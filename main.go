@@ -377,7 +377,8 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 			Nix:    true,
 			Docker: true,
 		},
-		ReadMe: readme,
+		ReadMe:        readme,
+		UsageContract: usageContract,
 		Config: []*agentv0.ConfigurationValueDetail{
 			{
 				Name: "postgres", Description: "capability-scoped Postgres workload bindings",
@@ -644,6 +645,14 @@ var infoFS embed.FS
 
 //go:embed templates/agent
 var readmeFS embed.FS
+
+// usageContract is what this agent tells the code that CONSUMES a Postgres
+// service it manages (usage.codefly.yaml, codefly/usage/v1). It is advertised
+// verbatim; usage_contract_test.go holds it to the contract's own rules and
+// to the library it describes.
+//
+//go:embed usage.codefly.yaml
+var usageContract string
 
 //go:embed runtime-image.json
 var runtimeImageLockJSON []byte

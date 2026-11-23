@@ -1,0 +1,159 @@
+# What the postgres agent tells the code that CONSUMES a Postgres service it
+# manages (codefly/usage/v1, read by codefly-dev/core contracts/usage). This is
+# not AGENTS.md: that file is for whoever changes this repository.
+#
+# Every rule starts as a warning. One becomes an error no sooner than the
+# release after the one that introduced it, so pinning a newer agent never
+# fails a consumer that had no release in which to hear about the rule.
+schema: codefly/usage/v1
+summary: >-
+  Reach Postgres only through the service library (libs/go, libs/rust). It
+  owns the non-privileged roles, the split between the read-only and the
+  read-write connection, and the tenant and user identity row-level security
+  reads. A connection you open yourself has none of that.
+rules:
+  - id: PG-OPEN-001
+    title: Open the database through postgres.Open, never a driver
+    severity: warn
+    since: 0.0.153
+    rationale: >-
+      A pool or connection opened with a driver carries no tenant or user
+      identity, so row-level security either refuses every row or, on a role
+      that bypasses it, returns every tenant's. It also ignores the split
+      between the read-only and the read-write login, and skips the role and
+      session checks the library runs on every new connection.
+    do: >-
+      Call postgres.Open with the read-only and the read-write connection and
+      your authenticator, keep the Factory it returns, and take a Reader or a
+      Writer from the request's context for each unit of work.
+    dont: >-
+      Call pgxpool.New, pgx.Connect or sql.Open, import another Postgres
+      driver, or read a connection string out of the environment to pass to
+      one.
+    docs: libs/go/README.md
+    detect:
+      - language: go
+        forbid-call:
+          - github.com/jackc/pgx/v5/pgxpool.New
+          - github.com/jackc/pgx/v5/pgxpool.NewWithConfig
+          - github.com/jackc/pgx/v5.Connect
+          - github.com/jackc/pgx/v5.ConnectConfig
+          - database/sql.Open
+          - database/sql.OpenDB
+        forbid-import:
+          - github.com/lib/pq
+      - language: rust
+        forbid-import:
+          - tokio_postgres
+          - deadpool_postgres
+          - sqlx
+    except-paths:
+      - "**/*_test.go"
+      - "**/testdata/**"
+      - "**/tests/**"
+
+  - id: PG-POOL-001
+    title: Do not build a Factory or Maintenance from a pool you made
+    severity: warn
+    since: 0.0.153
+    rationale: >-
+      NewFactory, NewMaintenance and OpenPool exist for tests and for trusted
+      compositions that already hold a qualified pool. None of them checks the
+      role behind the pool, and the restricted-session and connection-policy
+      options do not reach a pool the caller built, so its owner is the only
+      thing standing between it and a privileged login.
+    do: >-
+      Use postgres.Open for request work and postgres.OpenMaintenance for
+      background work. Both own their pools and qualify every connection.
+    dont: >-
+      Call NewFactory, NewMaintenance or OpenPool from application code.
+    docs: libs/go/README.md
+    detect:
+      - language: go
+        forbid-call:
+          - github.com/codefly-dev/service-postgres/libs/go.NewFactory
+          - github.com/codefly-dev/service-postgres/libs/go.NewMaintenance
+          - github.com/codefly-dev/service-postgres/libs/go.OpenPool
+        # The library's path ends in "go"; its package is postgres.
+        names:
+          github.com/codefly-dev/service-postgres/libs/go: postgres
+    except-paths:
+      - "**/*_test.go"
+      - "**/testdata/**"
+
+  - id: PG-MIGRATE-001
+    title: Keep the migration owner's connection out of application code
+    severity: warn
+    since: 0.0.153
+    rationale: >-
+      The migration owner can create, alter and drop. The control plane in
+      migrationtest takes that connection explicitly so a test can create and
+      clone databases; an application that opens it serves requests with the
+      authority to change the schema.
+    do: >-
+      Use migrationtest only from tests that qualify migrations. Application
+      code holds the authenticated Factory and nothing wider.
+    dont: >-
+      Call migrationtest.OpenControlPlane, or pass the owner connection to
+      anything, outside a test.
+    docs: libs/go/README.md
+    detect:
+      - language: go
+        forbid-call:
+          - github.com/codefly-dev/service-postgres/libs/go/migrationtest.OpenControlPlane
+    except-paths:
+      - "**/*_test.go"
+      - "**/testdata/**"
+
+  - id: PG-MAINT-001
+    title: Keep Maintenance out of request handlers
+    severity: warn
+    since: 0.0.153
+    rationale: >-
+      Maintenance clears the tenant and user settings so background work can
+      see across tenants where a migration's policy allows it. A request
+      handler holding it answers one tenant with another's reach.
+    do: >-
+      Hand request handlers the authenticated Factory only. Give Maintenance
+      to the cleanup, queue-discovery or reconciliation loop that needs it,
+      constructed where that loop is constructed.
+    dont: >-
+      Store a Maintenance on a handler, a server or anything a request can
+      reach.
+    docs: libs/go/README.md
+
+  - id: PG-SCOPE-001
+    title: Let the library set the tenant and user identity
+    severity: warn
+    since: 0.0.153
+    rationale: >-
+      The library installs the tenant and user as transaction-local settings
+      from the authenticated principal, and row-level security reads them. A
+      setting written by application SQL replaces an authenticated identity
+      with whatever the statement says.
+    do: >-
+      Return the right principal from your Authenticator, and use
+      Factory.RequireTenant or Factory.RequireUser when a handler must assert
+      who it is serving. Trusted background work for one tenant takes a
+      Workload from a WorkloadIssuer.
+    dont: >-
+      Run set_config, SET or SET LOCAL on the scope settings, or SET ROLE, in
+      application SQL.
+    docs: libs/go/README.md
+
+  - id: PG-WRITE-001
+    title: Take a Writer only for work that writes
+    severity: warn
+    since: 0.0.153
+    rationale: >-
+      A Reader runs on the read-only login in a read-only transaction, so a
+      bug or an injected statement in a read path cannot change data. Taking
+      a Writer for reads gives that protection up and sends reads to the
+      login that can write.
+    do: >-
+      Take a Reader for queries. Take a Writer for the unit of work that
+      changes data, and use WriteTx.ScopedAdvisoryLock to serialize one
+      logical resource inside the tenant.
+    dont: >-
+      Take a Writer by default, or hold one across reads that need no write.
+    docs: libs/go/README.md
