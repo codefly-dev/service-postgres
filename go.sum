@@ -84,6 +84,8 @@ github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 h1:aBangftG7EVZoUb69Os
 github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2/go.mod h1:qwXFYgsP6T7XnJtbKlf1HP8AjxZZyzxMmc+Lq5GjlU4=
 github.com/codefly-dev/core v0.19.35 h1:VudzLyUQR7FmZ3nYgU8i5WCY+Z8UNly5Qk4H2oyEECk=
 github.com/codefly-dev/core v0.19.35/go.mod h1:BoFWBVL/cCXxIKa9dgu8O2faT2QZXGH+OpNktPE6DVc=
+github.com/codefly-dev/core v0.19.36 h1:uDKNSo5Jrtre/UDj5YMyelKuGkJlNi3N58PqmBxGkuU=
+github.com/codefly-dev/core v0.19.36/go.mod h1:BoFWBVL/cCXxIKa9dgu8O2faT2QZXGH+OpNktPE6DVc=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
 github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261121162833-cda7c023eeee h1:9NT3IwK9Y3gokVn9IQDRDOla7dS45/ZYFbWpPcfMrD0=

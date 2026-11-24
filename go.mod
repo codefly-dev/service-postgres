@@ -4,7 +4,7 @@ go 1.27.4
 
 require (
 	cloud.google.com/go/cloudsqlconn v1.27.0
-	github.com/codefly-dev/core v0.19.35
+	github.com/codefly-dev/core v0.19.36
 	github.com/codefly-dev/gortk v0.2.0
 	github.com/codefly-dev/service-postgres/libs/go v0.0.0-20261121162833-cda7c023eeee
 	github.com/gofrs/flock v0.13.1
