@@ -108,7 +108,7 @@ type Settings struct {
 	RuntimeSchemas []string `yaml:"runtime-schemas"`
 
 	// RuntimeReadOnlyRoles selects exclusive reader delegation. Omitted keeps
-	// legacy direct SELECT. An explicit empty list grants no table access.
+	// direct SELECT. An explicit empty list grants no table access.
 	RuntimeReadOnlyRoles *[]string `yaml:"runtime-read-only-roles,omitempty"`
 
 	// RuntimeReadWriteRoles is the explicit allow-list of application-defined

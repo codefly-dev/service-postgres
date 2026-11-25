@@ -139,7 +139,7 @@ variables only the qualify script supplies.
 | `libs/go` | **separate module**: the Go client library, no core, no parent |
 | `libs/rust` | the Rust parity boundary for `libs/go` |
 | `cmd/managed-bootstrap` | the explicit migration-owner command |
-| `contracts/workload-attachment` | the sealed attachment envelope (v1, v2) |
+| `contracts/workload-attachment` | the sealed attachment envelope (one schema, v1) |
 
 ## Rules that bite
 

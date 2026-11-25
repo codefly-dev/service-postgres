@@ -36,7 +36,7 @@ any connection. For example, with entirely synthetic role names:
 ```
 
 Both identities are checked. The exact file SHA additionally binds field
-boundaries and inventory bytes; the v1 plan digest is retained for compatibility.
+boundaries and inventory bytes; the plan digest binds the plan's content.
 The plan supplies the database, NOLOGIN groups, schemas, delegated write roles,
 extensions and independently versioned migration ledgers. The deployment owner
 must review the exact plan and binding together. Group names are not inferred
@@ -60,7 +60,7 @@ rights. Managed-provider SQL permissions still need separate qualification.
 ## Build and run
 
 Build both executables from one reviewed, immutable checkout. The migration
-executable uses the existing version in `go.mod` (currently v4.19.1):
+executable uses the version pinned in `go.mod`.
 
 ```sh
 go build -trimpath -o /tmp/managed-bootstrap ./cmd/managed-bootstrap
@@ -154,19 +154,43 @@ provider qualification before use against a shared endpoint. Provider IAM,
 workload identity, secret/token refresh, application database clients and cloud
 backup/restore are outside this runner's responsibility.
 
-## Delegated reader roles (schema-plan v2)
+## Reader grants: direct or delegated
 
-The managed bootstrap accepts both `codefly.dev/postgres-schema-plan/v1` and
-`codefly.dev/postgres-schema-plan/v2`. Existing v1 JSON, content digests and direct
-reader SELECT/default privileges remain unchanged. The service builder emits v3 when the service settings declare
-`runtime-read-only-roles`, including an explicit empty list. Omitting that
-setting preserves the v1 plan.
+There is one plan contract, `codefly.dev/postgres-schema-plan/v1`. A plan states
+how its read-only group gets its authority in `access.reader-grants`, and an
+installation selects one of two:
+
+- `direct`: the group holds SELECT on the plan's schemas and default SELECT on
+  what the owner creates there. The service builder writes this when the service
+  settings omit `runtime-read-only-roles`. A direct plan names no
+  `read-only-roles`.
+- `delegated`: the group holds no table authority of its own and is a member of
+  exactly `access.read-only-roles`. The builder writes this when the settings
+  declare `runtime-read-only-roles`, including an explicit empty list.
+
+The two are alternatives, not generations, so the contract version does not
+choose between them. The engine refuses, by name and before comparing any
+identity:
+
+- a plan that does not state `access.reader-grants`, whatever contract version
+  it states. That is the format in which the label chose the grants (`v1` meant
+  direct, `v2` and `v3` delegated); reading it as either mode would grant or
+  withhold SELECT on a guess. Build the package again with a current builder.
+- a plan stating any contract version other than `v1`, telling its author to
+  state `v1`.
+- a `direct` plan that names `read-only-roles`, and a mode other than these two.
+
+The reader grants are part of the plan digest, so every plan written in the
+earlier format has a different digest once rebuilt, and its package metadata,
+binding (`plan-sha256`, `plan-digest`) and digest approval are produced again
+with it.
 
 For a module with its own read-only role and RLS policy, its package composition
-sets the plan's contract version to v2 and declares, for example:
+states delegated reader grants and declares, for example:
 
 ```json
 "access": {
+  "reader-grants": "delegated",
   "read-only-role": "managed_reader_group",
   "read-write-role": "managed_writer_group",
   "schemas": ["public"],
@@ -181,18 +205,18 @@ identity mode and reconciles its application-role memberships. Platform bindings
 still supply the pre-existing login principals. Packages must not reconstruct the
 primitive's role-name algorithm or create its managed groups in application SQL.
 
-Version 3 requires an engine that enforces delegation in both authentication
-modes. Earlier engines refuse v3 during plan validation. Builders use this
-version because older engines accepted v2 password plans with generic grants.
+Delegation holds in both authentication modes. An engine from before
+`access.reader-grants` refuses every plan that states it, as an unknown field,
+so no earlier engine applies a delegated password plan with generic grants.
 
-For self-hosted password plans, the same v2 policy applies directly to the
+For self-hosted password plans, the same delegated policy applies directly to the
 managed read-only login. The login explicitly selects its application reader
 role per transaction. Additional writer logins do not grant it direct SELECT.
 
-V2 reader delegation is exclusive: the group has CONNECT/USAGE, no direct table or
+Reader delegation is exclusive: the group has CONNECT/USAGE, no direct table or
 sequence privileges, and no default SELECT. Sessions explicitly select the
 application reader role, just as they select an application writer role. An empty
-or omitted v2 `read-only-roles` list removes all memberships held by the reader
+or omitted delegated `read-only-roles` list removes all memberships held by the reader
 group and provides no table authority; it never falls back to broad SELECT. Changes
 to this list change the plan digest, while leaving SQL lineage digests alone.
 
@@ -208,14 +232,14 @@ hold the existing per-database reconciliation lock and roll back on any error.
 Replacing or removing reader roles reconciles the whole reader group's inherited
 role set; only module-owned reader groups should opt in. Drain request sessions
 before changing grants and replace their connections afterward: revoking a role
-does not terminate a session that already selected it. Reapplying v1 is not a safe
-rollback of v2 access, because it deliberately restores legacy broad SELECT and
-does not own reader-membership cleanup. Use an explicitly reviewed v2 policy to
-reduce or remove access.
+does not terminate a session that already selected it. Reapplying a direct plan is
+not a safe rollback of delegated access, because it deliberately restores broad
+SELECT and does not own reader-membership cleanup. Use an explicitly reviewed
+delegated policy to reduce or remove access.
 
 Adoption requires a newly built/published managed-bootstrap engine and an image
-containing it, plus new package metadata and approval of the v2 plan digest. Older
-engines reject v2. A Go dependency bump alone does not update a pinned migration
+containing it, plus new package metadata and approval of the plan digest. Older
+engines reject a plan stating its reader grants. A Go dependency bump alone does not update a pinned migration
 image. The previous engine/image and previously executed SQL remain immutable.
 This contract does not rewrite migration ledgers, validate historical file hashes,
 or authorize changing previously applied migration bytes. Preserve the original

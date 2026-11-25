@@ -12,8 +12,8 @@ import (
 	"strings"
 )
 
-// schemaPlanContractVersion identifies the bootstrap artifact's plan format. A
-// consumer reading bootstrap/plan.json checks it before interpreting the fields.
+// schemaPlanContractVersion names the bootstrap artifact's plan contract. There
+// is one; how the reader gets its authority is the plan's access.reader-grants.
 const schemaPlanContractVersion = schemaplan.ContractVersion
 
 // schemaPlan is the packaged form of the resolved schema prerequisites: what the
@@ -260,16 +260,17 @@ func (p *schemaPlan) artifactWithoutDigest() schemaPlanArtifact {
 			Files:  files,
 		})
 	}
-	version := schemaPlanContractVersion
+	readerGrants := schemaplan.ReaderGrantsDirect
 	if p.access.readOnlyRoles != nil {
-		version = schemaplan.PasswordReaderRolesContractVersion
+		readerGrants = schemaplan.ReaderGrantsDelegated
 	}
 	return schemaPlanArtifact{
-		ContractVersion: version,
+		ContractVersion: schemaPlanContractVersion,
 		Database:        p.database,
 		Extensions:      extensions,
 		Lineages:        lineages,
 		Access: schemaAccessArtifact{
+			ReaderGrants:   readerGrants,
 			ReadOnlyRole:   p.access.readOnlyRole,
 			ReadOnlyRoles:  p.access.readOnlyRoles,
 			ReadWriteRole:  p.access.readWriteRole,

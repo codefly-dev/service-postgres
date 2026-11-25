@@ -15,8 +15,8 @@ ownership stay with their existing callers; this packaging change adds no SQL
 migrations or deployment settings.
 
 The initial published runtime version is
-`v0.0.0-20260915032422-272301033aed`. The parent agent explicitly requires this
-version and retains Core for its own tooling. Local child edits do not override
+`v0.0.0-20260915032422-272301033aed`. The parent agent pins the reviewed runtime
+version in its own `go.mod` and retains Core for its tooling. Local child edits do not override
 that requirement: build the child independently, publish it, then update the
 parent to the version returned by Go. Release tags for this child, when used,
 must have the `libs/go/` prefix.

@@ -288,11 +288,11 @@ func assertConnectionIdentity(t *testing.T, connection, expectedUser, expectedPa
 func TestReaderRolePlanDistinguishesOmissionFromEmpty(t *testing.T) {
 	for _, tc := range []struct {
 		configured *[]string
-		version    string
+		grants     string
 	}{
-		{nil, schemaplan.ContractVersion},
-		{&[]string{}, schemaplan.PasswordReaderRolesContractVersion},
-		{&[]string{"request_reader"}, schemaplan.PasswordReaderRolesContractVersion},
+		{nil, schemaplan.ReaderGrantsDirect},
+		{&[]string{}, schemaplan.ReaderGrantsDelegated},
+		{&[]string{"request_reader"}, schemaplan.ReaderGrantsDelegated},
 	} {
 		settings := Settings{DatabaseName: "app", RuntimeReadOnlyRoles: tc.configured}
 		data, err := yaml.Marshal(settings)
@@ -303,7 +303,9 @@ func TestReaderRolePlanDistinguishesOmissionFromEmpty(t *testing.T) {
 		access, err := resolveSchemaAccess(&restored)
 		require.NoError(t, err)
 		plan := (&schemaPlan{access: access}).artifact()
-		require.Equal(t, tc.version, plan.ContractVersion)
+		require.Equal(t, schemaplan.ContractVersion, plan.ContractVersion)
+		require.Equal(t, tc.grants, plan.Access.ReaderGrants)
+		require.NoError(t, plan.Validate())
 		if tc.configured != nil {
 			require.Equal(t, *tc.configured, plan.Access.ReadOnlyRoles)
 		}
