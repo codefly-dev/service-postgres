@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -15,9 +16,13 @@ func fixture(t *testing.T) []byte {
 	}
 	return data
 }
-func pooledFixture(t *testing.T) []byte {
+
+// proxyOnlyFixture is an attachment as the format before the transaction pool
+// wrote it, under the seal it had then: the workload on the identity proxy's
+// own socket, no pooling contract, no startup probe.
+func proxyOnlyFixture(t *testing.T) []byte {
 	t.Helper()
-	data, err := os.ReadFile("testdata/pooled.json")
+	data, err := os.ReadFile("testdata/proxy-only.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,24 +49,10 @@ func TestPublicFixtureAndCanonicalSeal(t *testing.T) {
 		t.Fatal("validation mutated attachment")
 	}
 }
-func TestPooledFixtureAndCanonicalSeal(t *testing.T) {
-	a, err := Parse(pooledFixture(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	original := a.Digest
-	if err = a.Seal(); err != nil {
-		t.Fatal(err)
-	}
-	if a.Digest != original {
-		t.Fatal("Python/Go canonical digests diverge")
-	}
-}
-
 func TestPooledConnectionFailsClosed(t *testing.T) {
 	cases := []func(*Attachment){
-		func(a *Attachment) { a.SchemaVersion = Version },
 		func(a *Attachment) { a.Binding.Connection.Kind = "local-identity-proxy" },
+		func(a *Attachment) { a.Binding.Connection.Kind = "local-session-pool" },
 		func(a *Attachment) { a.Binding.Connection.PoolMode = "session" },
 		func(a *Attachment) { a.Binding.Connection.SessionState = "session-persistent" },
 		func(a *Attachment) { a.Binding.Connection.ConnectionLimitScope = "server" },
@@ -76,7 +67,7 @@ func TestPooledConnectionFailsClosed(t *testing.T) {
 		func(a *Attachment) { a.InitContainers[1].Args[4] += "\runsafe" },
 	}
 	for i, change := range cases {
-		a, err := Parse(pooledFixture(t))
+		a, err := Parse(fixture(t))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -124,14 +115,19 @@ func TestSecurityAndReferencesFailClosed(t *testing.T) {
 }
 func TestAnotherTargetIsOnlyData(t *testing.T) {
 	a, _ := Parse(fixture(t))
+	const instance, database, user = "example-west:us-west1:customer-db", "inference_west", "writer-west@example-west.iam"
 	a.Namespace = "inference-west"
 	a.ServiceAccount = "runtime-west"
 	a.Binding.ID = "customer-west/inference/writer-v1"
-	a.Binding.Database = "inference_west"
-	a.Binding.User = "writer-west@example-west.iam"
-	a.Binding.Connection.SocketDirectory = "/cloudsql/example-west:us-west1:customer-db"
-	a.InitContainers[0].Args[0] = "--impersonate-service-account=writer-west@example-west.iam.gserviceaccount.com"
-	a.InitContainers[0].Args[len(a.InitContainers[0].Args)-1] = "example-west:us-west1:customer-db"
+	a.Binding.Database = database
+	a.Binding.User = user
+	a.Binding.Connection.MaxDBConnections = 40
+	proxy, pooler := &a.InitContainers[0], &a.InitContainers[1]
+	proxy.Args[0] = "--impersonate-service-account=" + user + ".gserviceaccount.com"
+	proxy.Args[len(proxy.Args)-1] = instance
+	pooler.Args[4] = "[databases]\n" + database + " = host=/cloudsql/" + instance + " port=5432 dbname=" + database + " user=" + user + " max_db_connections=40\n[pgbouncer]\nunix_socket_dir = /pooler\npool_mode = transaction"
+	probe := pooler.StartupProbe.Exec.Command
+	probe[9], probe[11] = database, user
 	if err := a.Seal(); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +138,12 @@ func TestAnotherTargetIsOnlyData(t *testing.T) {
 
 func TestMountPathsMustNotOverlap(t *testing.T) {
 	for _, consumer := range []bool{true, false} {
-		for _, path := range []string{"/cloudsql", "/cloudsql/nested", "/"} {
+		// The workload mounts the pool's socket; the proxy sidecar its own.
+		mounted := "/cloudsql"
+		if consumer {
+			mounted = "/pooler"
+		}
+		for _, path := range []string{mounted, mounted + "/nested", "/"} {
 			a, _ := Parse(fixture(t))
 			volume := a.Volumes[0]
 			volume.Name = "second-socket"
@@ -160,7 +161,7 @@ func TestMountPathsMustNotOverlap(t *testing.T) {
 			}
 		}
 	}
-	a, err := Parse(pooledFixture(t))
+	a, err := Parse(fixture(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,8 +179,8 @@ func TestKubernetesNamesMustEndInAlphanumeric(t *testing.T) {
 		func(a *Attachment) { a.InitContainers[0].Name = "invalid-" },
 		func(a *Attachment) {
 			a.Volumes[0].Name = "invalid-"
-			a.VolumeMounts[0].Name = "invalid-"
 			a.InitContainers[0].VolumeMounts[0].Name = "invalid-"
+			a.InitContainers[1].VolumeMounts[0].Name = "invalid-"
 		},
 	} {
 		a, _ := Parse(fixture(t))
@@ -198,7 +199,7 @@ func TestUTF8SealMatchesPythonAndKeepsLiteralEscapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	// hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
-	if a.Digest != "sha256:8d9c1c8a27bccfce0d09e06a2eceb90078c6ea546aa2886034780022ccd6e190" {
+	if a.Digest != "sha256:643c8a49e32407b20d5ee52192bde0e91b63fef77fd68b2bc4d312d07786556f" {
 		t.Fatal("UTF-8 canonical digest diverges from Python")
 	}
 	if err := a.Validate(); err != nil {
@@ -255,5 +256,72 @@ func TestParseUnicodeIsLossless(t *testing.T) {
 	data = bytes.Replace(data, []byte("\U0001f512"), []byte(`\ud83d\udd12`), 1)
 	if _, err := Parse(data); err != nil {
 		t.Fatal("valid surrogate pair or literal escape rejected:", err)
+	}
+}
+
+// There is one schema, v1, and it is the current format: a transaction pool in
+// front of the identity proxy. An attachment as it was once written, on the
+// proxy's own socket, is refused for that connection whatever schema it states,
+// so it is never admitted as a pool and never refused for its label alone. An
+// attachment in the current format stating any other schema (the v2 this format
+// was once called) is refused as unknown, telling its producer to state v1.
+func TestThereIsOneSchema(t *testing.T) {
+	if Version != "codefly.dev/postgres-workload-attachment/v1" {
+		t.Fatalf("the schema is %s", Version)
+	}
+	// Stated only to be refused: the schema this format was once called, and
+	// one that never was.
+	const (
+		onceV2      = "codefly.dev/postgres-workload-attachment/v2"                // version-guard:allow refused by name
+		neverIssued = "codefly.dev/postgres-workload-attachment/v999-not-a-schema" // version-guard:allow refused by name
+	)
+	others := []string{onceV2, neverIssued, ""}
+
+	// The old format stated v1 too, under a seal that still verifies.
+	_, err := Parse(proxyOnlyFixture(t))
+	const proxyOnly = "binding.connection.kind is local-identity-proxy: this attachment is in the format before the transaction pool"
+	if err == nil || !strings.Contains(err.Error(), proxyOnly) || !strings.Contains(err.Error(), "export it again") {
+		t.Fatalf("a v1 attachment in the format before the pool: %v", err)
+	}
+	for _, label := range append(others, Version) {
+		var old Attachment
+		if err := json.Unmarshal(proxyOnlyFixture(t), &old); err != nil {
+			t.Fatal(err)
+		}
+		old.SchemaVersion = label
+		if err := old.Seal(); err != nil {
+			t.Fatal(err)
+		}
+		if err := old.Validate(); err == nil || !strings.Contains(err.Error(), proxyOnly) {
+			t.Fatalf("that format stating %q: %v", label, err)
+		}
+		// Nor is it a pool for having been given one's fields and a probe.
+		current, _ := Parse(fixture(t))
+		current.Binding.Connection.Kind = old.Binding.Connection.Kind
+		current.SchemaVersion = label
+		_ = current.Seal()
+		if err := current.Validate(); err == nil || !strings.Contains(err.Error(), proxyOnly) {
+			t.Fatalf("a proxy-only connection with a pool's fields stating %q: %v", label, err)
+		}
+	}
+
+	current, err := Parse(fixture(t))
+	if err != nil || current.SchemaVersion != Version || current.Binding.Connection.Kind != "local-transaction-pool" {
+		t.Fatalf("a v1 attachment in the current format: %v", err)
+	}
+	for _, label := range others {
+		a, _ := Parse(fixture(t))
+		a.SchemaVersion = label
+		if err := a.Seal(); err != nil {
+			t.Fatal(err)
+		}
+		err := a.Validate()
+		if err == nil || !strings.Contains(err.Error(), "which is unknown") || !strings.Contains(err.Error(), "state the schema as codefly.dev/postgres-workload-attachment/v1") {
+			t.Fatalf("schema %q: %v", label, err)
+		}
+		data, _ := json.Marshal(a)
+		if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), "state the schema as codefly.dev/postgres-workload-attachment/v1") {
+			t.Fatalf("schema %q, parsed: %v", label, err)
+		}
 	}
 }

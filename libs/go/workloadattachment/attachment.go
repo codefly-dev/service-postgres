@@ -19,10 +19,18 @@ import (
 	"unicode/utf8"
 )
 
-const (
-	Version   = "codefly.dev/postgres-workload-attachment/v1"
-	VersionV2 = "codefly.dev/postgres-workload-attachment/v2"
-)
+// Version names the attachment. There is one schema: an attachment stating any
+// other is refused (Validate).
+const Version = "codefly.dev/postgres-workload-attachment/v1"
+
+// The connection an attachment describes is a pod-local transaction pool in
+// front of the local identity proxy.
+const connectionKind = "local-transaction-pool"
+
+// proxyOnlyConnectionKind is the connection of the format before the pool: the
+// workload reached the identity proxy's socket directly, with no connection
+// ceiling, no pooling contract and no startup probe. It is refused by name.
+const proxyOnlyConnectionKind = "local-identity-proxy"
 
 type Connection struct {
 	Kind                 string   `json:"kind"`
@@ -300,7 +308,16 @@ func (a *Attachment) computedDigest() (string, error) {
 // argument semantics and approved identity matching belong to its platform producer.
 func (a *Attachment) Validate() error {
 	fail := func() error { return fmt.Errorf("invalid PostgreSQL workload attachment") }
-	if (a.SchemaVersion != Version && a.SchemaVersion != VersionV2) || !namePattern.MatchString(a.Namespace) || !namePattern.MatchString(a.ServiceAccount) {
+	// The format first, whatever schema the attachment states: a proxy-only
+	// attachment is refused saying so, never for its label alone, and never
+	// read as a pool that happens to be invalid.
+	if a.Binding.Connection.Kind == proxyOnlyConnectionKind {
+		return fmt.Errorf("binding.connection.kind is %s: this attachment is in the format before the transaction pool; export it again with a current producer, which states %s and the schema as %s", proxyOnlyConnectionKind, connectionKind, Version)
+	}
+	if a.SchemaVersion != Version {
+		return fmt.Errorf("schema_version is %q, which is unknown; this contract reads %s and no other: state the schema as %s", a.SchemaVersion, Version, Version)
+	}
+	if !namePattern.MatchString(a.Namespace) || !namePattern.MatchString(a.ServiceAccount) {
 		return fail()
 	}
 	b := a.Binding
@@ -308,9 +325,8 @@ func (a *Attachment) Validate() error {
 		return fail()
 	}
 	connection := b.Connection
-	legacyConnection := connection.Kind == "local-identity-proxy" && connection.PoolMode == "" && connection.SessionState == "" && connection.ConnectionLimitScope == "" && connection.MaxDBConnections == 0 && connection.StartupParameters == nil
-	pooledConnection := connection.Kind == "local-transaction-pool" && connection.PoolMode == "transaction" && connection.SessionState == "transaction-local-only" && connection.ConnectionLimitScope == "pod" && connection.MaxDBConnections > 0 && connection.MaxDBConnections <= 100 && reflect.DeepEqual(connection.StartupParameters, []string{"application_name", "client_encoding", "datestyle", "standard_conforming_strings", "timezone"})
-	if (a.SchemaVersion == Version && !legacyConnection) || (a.SchemaVersion == VersionV2 && !pooledConnection) {
+	pooledConnection := connection.Kind == connectionKind && connection.PoolMode == "transaction" && connection.SessionState == "transaction-local-only" && connection.ConnectionLimitScope == "pod" && connection.MaxDBConnections > 0 && connection.MaxDBConnections <= 100 && reflect.DeepEqual(connection.StartupParameters, []string{"application_name", "client_encoding", "datestyle", "standard_conforming_strings", "timezone"})
+	if !pooledConnection {
 		return fail()
 	}
 	p := a.PodSecurityContext
@@ -359,7 +375,7 @@ func (a *Attachment) Validate() error {
 	containers := map[string]bool{}
 	startupProbes := 0
 	for _, c := range a.InitContainers {
-		if !namePattern.MatchString(c.Name) || containers[c.Name] || !imagePattern.MatchString(c.Image) || c.RestartPolicy != "Always" || len(c.Args) == 0 || len(c.Args) > 16 || !checkMounts(c.VolumeMounts, false, a.SchemaVersion == VersionV2) {
+		if !namePattern.MatchString(c.Name) || containers[c.Name] || !imagePattern.MatchString(c.Image) || c.RestartPolicy != "Always" || len(c.Args) == 0 || len(c.Args) > 16 || !checkMounts(c.VolumeMounts, false, true) {
 			return fail()
 		}
 		containers[c.Name] = true
@@ -368,7 +384,7 @@ func (a *Attachment) Validate() error {
 			return fail()
 		}
 		for _, argument := range c.Args {
-			if len(argument) == 0 || len(argument) > 1024 || strings.ContainsAny(argument, "\x00\r") || a.SchemaVersion == Version && strings.Contains(argument, "\n") {
+			if len(argument) == 0 || len(argument) > 1024 || strings.ContainsAny(argument, "\x00\r") {
 				return fail()
 			}
 		}
@@ -390,7 +406,7 @@ func (a *Attachment) Validate() error {
 			}
 		}
 	}
-	if (a.SchemaVersion == Version && startupProbes != 0) || (a.SchemaVersion == VersionV2 && startupProbes != 1) {
+	if startupProbes != 1 {
 		return fail()
 	}
 	digest, err := a.computedDigest()

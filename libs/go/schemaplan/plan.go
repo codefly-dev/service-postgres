@@ -8,18 +8,49 @@ import (
 	"fmt"
 )
 
+// ContractVersion names the plan. There is one contract: a plan stating any
+// other is refused (Validate).
 const ContractVersion = "codefly.dev/postgres-schema-plan/v1"
 
-// ReaderRolesContractVersion opts into exclusive delegated reader authority.
-// V1 remains unchanged, including its content digest and direct SELECT grants.
-const ReaderRolesContractVersion = "codefly.dev/postgres-schema-plan/v2"
-
-// PasswordReaderRolesContractVersion requires an engine that enforces delegated
-// readers for password logins as well as external identities.
-const PasswordReaderRolesContractVersion = "codefly.dev/postgres-schema-plan/v3"
+// A plan states how the read-only group gets its authority. The two are
+// alternatives an installation selects between, not generations of one format,
+// so the choice is a field of the plan and never read from its label.
+const (
+	// ReaderGrantsDirect gives the read-only group SELECT on the plan's schemas
+	// and default SELECT on what the owner creates there.
+	ReaderGrantsDirect = "direct"
+	// ReaderGrantsDelegated gives the read-only group no table authority of its
+	// own: it is a member of exactly Access.ReadOnlyRoles, and a session selects
+	// one of them. It holds for password logins and external identities alike.
+	// An empty list is no table authority at all, never a fall back to SELECT.
+	ReaderGrantsDelegated = "delegated"
+)
 
 func (p Plan) DelegatesReaders() bool {
-	return p.ContractVersion == ReaderRolesContractVersion || p.ContractVersion == PasswordReaderRolesContractVersion
+	return p.Access.ReaderGrants == ReaderGrantsDelegated
+}
+
+// Validate refuses a plan this contract does not describe. The format first,
+// whatever contract version the plan states: a plan that does not state its
+// reader grants was written when the label chose them, and reading it as either
+// mode would grant or withhold SELECT on a guess. Then the label: there is one.
+// It does not check Digest; a reader compares that with ContentDigest itself.
+func (p Plan) Validate() error {
+	switch p.Access.ReaderGrants {
+	case "":
+		return fmt.Errorf("access.reader-grants is not stated: this plan is in the format before a plan stated its reader grants; build it again with a current builder, or state access.reader-grants as %q or %q and the contract version as %s", ReaderGrantsDirect, ReaderGrantsDelegated, ContractVersion)
+	case ReaderGrantsDirect:
+		if p.Access.ReadOnlyRoles != nil {
+			return fmt.Errorf("access.read-only-roles is stated with access.reader-grants %q: only a %q plan names reader roles", ReaderGrantsDirect, ReaderGrantsDelegated)
+		}
+	case ReaderGrantsDelegated:
+	default:
+		return fmt.Errorf("access.reader-grants is %q; it is %q or %q", p.Access.ReaderGrants, ReaderGrantsDirect, ReaderGrantsDelegated)
+	}
+	if p.ContractVersion != ContractVersion {
+		return fmt.Errorf("contract-version is %q, which is unknown; this engine reads %s and no other: state the contract version as %s", p.ContractVersion, ContractVersion, ContractVersion)
+	}
+	return nil
 }
 
 const MigrationFileNamePattern = `^([0-9]+)_.+\.(up|down)\.[A-Za-z0-9]+$`
@@ -52,6 +83,7 @@ type File struct {
 }
 
 type Access struct {
+	ReaderGrants   string   `json:"reader-grants"`
 	ReadOnlyRole   string   `json:"read-only-role"`
 	ReadWriteRole  string   `json:"read-write-role"`
 	Schemas        []string `json:"schemas"`
@@ -59,7 +91,8 @@ type Access struct {
 	ReadOnlyRoles  []string `json:"read-only-roles,omitempty"`
 }
 
-// ContentDigest preserves the v1 builder's deterministic identity.
+// ContentDigest is the plan's deterministic identity. The reader grants are
+// part of it, so two plans that differ only in mode never share a digest.
 func (p Plan) ContentDigest() string {
 	h := sha256.New()
 	write := func(values ...string) {
@@ -75,6 +108,7 @@ func (p Plan) ContentDigest() string {
 	write(p.Access.ReadOnlyRole, p.Access.ReadWriteRole)
 	write(p.Access.Schemas...)
 	write(p.Access.ReadWriteRoles...)
+	write("reader-grants", p.Access.ReaderGrants)
 	if p.DelegatesReaders() {
 		write("read-only-roles", fmt.Sprint(len(p.Access.ReadOnlyRoles)))
 		write(p.Access.ReadOnlyRoles...)

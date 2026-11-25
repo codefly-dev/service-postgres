@@ -20,7 +20,7 @@ func packageFixture(t *testing.T, sql string) (string, schemaplan.Plan, Binding)
 	h := sha256.Sum256([]byte(sql))
 	l := schemaplan.Lineage{Label: "application", Ledger: "schema_migrations_application", Stage: "00-application", Files: []schemaplan.File{{Name: "001_table.up.sql", Digest: "sha256:" + hex.EncodeToString(h[:])}}}
 	l.Digest = l.ContentDigest()
-	p := schemaplan.Plan{ContractVersion: schemaplan.ContractVersion, Database: "bootstrap_proof", Lineages: []schemaplan.Lineage{l}, Access: schemaplan.Access{ReadOnlyRole: "bootstrap_ro", ReadWriteRole: "bootstrap_rw", Schemas: []string{"public"}}}
+	p := schemaplan.Plan{ContractVersion: schemaplan.ContractVersion, Database: "bootstrap_proof", Lineages: []schemaplan.Lineage{l}, Access: schemaplan.Access{ReaderGrants: schemaplan.ReaderGrantsDirect, ReadOnlyRole: "bootstrap_ro", ReadWriteRole: "bootstrap_rw", Schemas: []string{"public"}}}
 	p.Digest = p.ContentDigest()
 	b := Binding{OwnerRole: "bootstrap_owner", ReadOnlyPrincipals: []string{"bootstrap_reader"}, ReadWritePrincipals: []string{"bootstrap_writer"}}
 	os.MkdirAll(filepath.Join(dir, "sources", l.Stage), 0700)
@@ -136,20 +136,44 @@ func TestSnapshotRetainsVerifiedBytes(t *testing.T) {
 	}
 }
 
-func TestReaderRolePackageVersions(t *testing.T) {
-	for _, version := range []string{schemaplan.ContractVersion, schemaplan.ReaderRolesContractVersion, schemaplan.PasswordReaderRolesContractVersion, "codefly.dev/postgres-schema-plan/future"} {
-		for _, roles := range [][]string{nil, {"app_reader"}, {"bootstrap_rw"}, {"app_reader", "app_reader"}} {
-			dir, p, b := packageFixture(t, "SELECT 1;")
-			p.ContractVersion, p.Access.ReadOnlyRoles = version, roles
-			writePlan(t, dir, p, &b)
-			_, tmp, err := snapshot(dir, b, false)
-			if tmp != "" {
-				os.RemoveAll(tmp)
-			}
-			valid := (version == schemaplan.ContractVersion && roles == nil) ||
-				((version == schemaplan.ReaderRolesContractVersion || version == schemaplan.PasswordReaderRolesContractVersion) && (roles == nil || len(roles) == 1 && roles[0] == "app_reader"))
-			if (err == nil) != valid {
-				t.Fatalf("version %s roles %v: %v", version, roles, err)
+// A package is read by what its plan states: direct grants name no reader
+// role, a delegation names roles the binding does not already hold, and a plan
+// stating neither mode, or another contract version, is refused by name before
+// any identity is compared.
+func TestReaderGrantsPackages(t *testing.T) {
+	// Stated only to be refused: the two versions this contract once also had,
+	// and one it never did.
+	const (
+		onceV2      = "codefly.dev/postgres-schema-plan/v2"                  // version-guard:allow refused by name
+		onceV3      = "codefly.dev/postgres-schema-plan/v3"                  // version-guard:allow refused by name
+		neverIssued = "codefly.dev/postgres-schema-plan/v999-not-a-contract" // version-guard:allow refused by name
+	)
+	for _, version := range []string{schemaplan.ContractVersion, onceV2, onceV3, neverIssued} {
+		for _, grants := range []string{schemaplan.ReaderGrantsDirect, schemaplan.ReaderGrantsDelegated, "", "unknown"} {
+			for _, roles := range [][]string{nil, {"app_reader"}, {"bootstrap_rw"}, {"app_reader", "app_reader"}} {
+				dir, p, b := packageFixture(t, "SELECT 1;")
+				p.ContractVersion, p.Access.ReaderGrants, p.Access.ReadOnlyRoles = version, grants, roles
+				writePlan(t, dir, p, &b)
+				_, tmp, err := snapshot(dir, b, false)
+				if tmp != "" {
+					os.RemoveAll(tmp)
+				}
+				valid := version == schemaplan.ContractVersion &&
+					((grants == schemaplan.ReaderGrantsDirect && roles == nil) ||
+						(grants == schemaplan.ReaderGrantsDelegated && (roles == nil || len(roles) == 1 && roles[0] == "app_reader")))
+				if (err == nil) != valid {
+					t.Fatalf("version %s grants %q roles %v: %v", version, grants, roles, err)
+				}
+				switch {
+				case grants == "":
+					if !strings.Contains(err.Error(), "access.reader-grants is not stated") {
+						t.Fatalf("version %s, the format before reader grants were stated: %v", version, err)
+					}
+				case version != schemaplan.ContractVersion && grants != "unknown" && !(grants == schemaplan.ReaderGrantsDirect && roles != nil):
+					if !strings.Contains(err.Error(), "state the contract version as "+schemaplan.ContractVersion) {
+						t.Fatalf("version %s grants %q: %v", version, grants, err)
+					}
+				}
 			}
 		}
 	}

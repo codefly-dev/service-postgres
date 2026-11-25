@@ -22,7 +22,21 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
-              "const": "local-identity-proxy"
+              "const": "local-transaction-pool"
+            },
+            "pool_mode": {
+              "const": "transaction"
+            },
+            "session_state": {
+              "const": "transaction-local-only"
+            },
+            "connection_limit_scope": {
+              "const": "pod"
+            },
+            "max_db_connections": {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
             },
             "port": {
               "maximum": 65535,
@@ -32,12 +46,26 @@
             "socket_directory": {
               "pattern": "^/[^\\s]+$",
               "type": "string"
+            },
+            "startup_parameters": {
+              "const": [
+                "application_name",
+                "client_encoding",
+                "datestyle",
+                "standard_conforming_strings",
+                "timezone"
+              ]
             }
           },
           "required": [
             "kind",
             "socket_directory",
-            "port"
+            "port",
+            "pool_mode",
+            "session_state",
+            "connection_limit_scope",
+            "max_db_connections",
+            "startup_parameters"
           ],
           "type": "object"
         },
@@ -172,6 +200,46 @@
               "allowPrivilegeEscalation",
               "readOnlyRootFilesystem",
               "capabilities"
+            ],
+            "type": "object"
+          },
+          "startupProbe": {
+            "additionalProperties": false,
+            "properties": {
+              "exec": {
+                "additionalProperties": false,
+                "properties": {
+                  "command": {
+                    "items": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 16,
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "command"
+                ],
+                "type": "object"
+              },
+              "failureThreshold": {
+                "maximum": 60,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "periodSeconds": {
+                "maximum": 60,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "exec",
+              "failureThreshold",
+              "periodSeconds"
             ],
             "type": "object"
           },
@@ -344,6 +412,6 @@
     "volume_mounts",
     "digest"
   ],
-  "title": "PostgreSQL local identity proxy workload attachment",
+  "title": "PostgreSQL local transaction pool workload attachment",
   "type": "object"
 }

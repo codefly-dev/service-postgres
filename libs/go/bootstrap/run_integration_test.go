@@ -271,7 +271,7 @@ func TestManagedBootstrapDelegatedReaderPlan(t *testing.T) {
  GRANT USAGE ON SCHEMA public TO delegated_app_reader;
  GRANT SELECT ON receipts TO delegated_app_reader;
  `)
-	p.ContractVersion = schemaplan.ReaderRolesContractVersion
+	p.Access.ReaderGrants = schemaplan.ReaderGrantsDelegated
 	p.Database = "delegated_proof"
 	p.Access.ReadOnlyRole, p.Access.ReadWriteRole = "delegated_ro", "delegated_rw"
 	p.Access.ReadOnlyRoles = []string{"delegated_app_reader"}
