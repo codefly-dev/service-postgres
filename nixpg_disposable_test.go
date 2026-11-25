@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/runners/runstate"
 	"github.com/stretchr/testify/require"
@@ -35,27 +35,27 @@ func TestDisposableRunStateIsRemovedWhenTheRunDestroysIt(t *testing.T) {
 	require.Equal(t, root, runBeta.nixRuntime.root)
 	writeSentinel(t, ctx, runBeta.connection, beta.serviceName, "00000000-0000-0000-0000-0000000000b1")
 
-	stopped, err := runAlpha.Stop(ctx, &runtimev0.StopRequest{})
+	stopped, err := runAlpha.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
 	require.DirExists(t, filepath.Join(root, "pgdata"), "stop is not the end of a run")
 
-	destroyed, err := runAlpha.Destroy(ctx, &runtimev0.DestroyRequest{})
+	destroyed, err := runAlpha.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
 	require.Contains(t, destroyed.GetStatus().GetMessage(), "database state retained",
 		"the run's other service still uses the server")
 	require.True(t, hasSentinel(t, ctx, runBeta.connection, beta.serviceName, "00000000-0000-0000-0000-0000000000b1"))
 
-	destroyed, err = runBeta.Destroy(ctx, &runtimev0.DestroyRequest{})
+	destroyed, err = runBeta.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
 	require.Contains(t, destroyed.GetStatus().GetMessage(), "disposable database state removed from "+root)
 	require.NoDirExists(t, root, "a disposable run must not leave its server directory behind")
 
-	again, err := runBeta.Destroy(ctx, &runtimev0.DestroyRequest{})
+	again, err := runBeta.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, again.GetStatus().GetState(), again.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.DestroyStatus_SUCCESS, again.GetStatus().GetState(), again.GetStatus().GetMessage())
 }
 
 const claimHelperDir = "CFPG_TEST_CLAIM_DIR"

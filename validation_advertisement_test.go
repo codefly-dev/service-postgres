@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/codefly-dev/core/ciinputs"
-	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	agentv1 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -20,7 +20,7 @@ import (
 // turns a passing test phase into a failing one for every service this agent
 // serves. Leaving the advertisement absent keeps callers probing the RPCs.
 func TestAgentRemainsLegacyUntilTestsAreSchedulable(t *testing.T) {
-	information, err := NewService().GetAgentInformation(t.Context(), &agentv0.AgentInformationRequest{})
+	information, err := NewService().GetAgentInformation(t.Context(), &agentv1.AgentInformationRequest{})
 	require.NoError(t, err)
 
 	test := validationCapabilities().GetTest()
@@ -69,32 +69,32 @@ func TestAdvertisedValidationMatchesImplementedOperations(t *testing.T) {
 		// Runtime.Lint and Runtime.Build carry no UNSUPPORTED status, so
 		// Unimplemented is the only way they can decline.
 		{"lint", capabilities.GetLint().GetSupported(), "Runtime.Lint", func(ctx context.Context) bool {
-			_, err := runtime.Lint(ctx, &runtimev0.LintRequest{})
+			_, err := runtime.Lint(ctx, &runtimev1.LintRequest{})
 			return answered(err, false)
 		}},
 		{"compile", capabilities.GetCompile().GetSupported(), "Runtime.Build", func(ctx context.Context) bool {
-			_, err := runtime.Build(ctx, &runtimev0.BuildRequest{})
+			_, err := runtime.Build(ctx, &runtimev1.BuildRequest{})
 			return answered(err, false)
 		}},
 		{"audit", capabilities.GetAudit().GetSupported(), "Builder.Audit", func(ctx context.Context) bool {
-			response, err := builder.Audit(ctx, &builderv0.AuditRequest{})
-			return answered(err, response.GetState().GetState() == builderv0.AuditStatus_UNSUPPORTED)
+			response, err := builder.Audit(ctx, &builderv1.AuditRequest{})
+			return answered(err, response.GetState().GetState() == builderv1.AuditStatus_UNSUPPORTED)
 		}},
 		{"artifact_build", capabilities.GetArtifactBuild().GetSupported(), "Builder.Build", func(ctx context.Context) bool {
-			_, err := builder.Build(ctx, &builderv0.BuildRequest{})
+			_, err := builder.Build(ctx, &builderv1.BuildRequest{})
 			return answered(err, false)
 		}},
 		{"sbom", capabilities.GetSbom().GetSupported(), "Builder.SBOM", func(ctx context.Context) bool {
-			response, err := builder.SBOM(ctx, &builderv0.SBOMRequest{})
-			return answered(err, response.GetState().GetState() == builderv0.SBOMStatus_UNSUPPORTED)
+			response, err := builder.SBOM(ctx, &builderv1.SBOMRequest{})
+			return answered(err, response.GetState().GetState() == builderv1.SBOMStatus_UNSUPPORTED)
 		}},
 		{"sync", capabilities.GetSync().GetSupported(), "Builder.Sync", func(ctx context.Context) bool {
-			response, err := builder.Sync(ctx, &builderv0.SyncRequest{})
-			return answered(err, response.GetState().GetState() == builderv0.SyncStatus_UNSUPPORTED)
+			response, err := builder.Sync(ctx, &builderv1.SyncRequest{})
+			return answered(err, response.GetState().GetState() == builderv1.SyncStatus_UNSUPPORTED)
 		}},
 		{"source_package", capabilities.GetSourcePackage().GetSupported(), "Builder.Package", func(ctx context.Context) bool {
-			response, err := builder.Package(ctx, &builderv0.PackageRequest{})
-			return answered(err, response.GetState().GetState() == builderv0.PackageStatus_UNSUPPORTED)
+			response, err := builder.Package(ctx, &builderv1.PackageRequest{})
+			return answered(err, response.GetState().GetState() == builderv1.PackageStatus_UNSUPPORTED)
 		}},
 	} {
 		t.Run(operation.name, func(t *testing.T) {
@@ -127,7 +127,7 @@ func TestAdvertisedPhasesAreSchedulable(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, required)
 
-	_, err = ciinputs.Evaluate(nil, &agentv0.GetEffectiveInputsRequest{
+	_, err = ciinputs.Evaluate(nil, &agentv1.GetEffectiveInputsRequest{
 		SchemaVersion: ciinputs.Version,
 		Snapshot:      "advertisement",
 	}, required)
@@ -143,9 +143,9 @@ func TestSyncProvesNoDriftInDryRun(t *testing.T) {
 	require.True(t, validationCapabilities().GetSync().GetSupported())
 
 	builder := newBuildTestBuilder(t)
-	response, err := builder.Sync(t.Context(), &builderv0.SyncRequest{DryRun: true})
+	response, err := builder.Sync(t.Context(), &builderv1.SyncRequest{DryRun: true})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SyncStatus_SUCCESS, response.GetState().GetState(),
+	require.Equal(t, builderv1.SyncStatus_SUCCESS, response.GetState().GetState(),
 		response.GetState().GetMessage())
 	require.Empty(t, response.GetChangedFiles())
 }

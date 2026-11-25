@@ -1,6 +1,6 @@
 package main
 
-import agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
+import agentv1 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v1"
 
 // validationCapabilities is the contract this agent will advertise, held back
 // from AgentInformation until a caller can schedule it without regressing.
@@ -27,8 +27,8 @@ import agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/
 // TestAgentRemainsLegacyUntilTestsAreSchedulable fails if this message is
 // advertised while test is unsupported, and TestAdvertisedPhasesAreSchedulable
 // fails if a declared phase cannot survive the core in use.
-func validationCapabilities() *agentv0.ValidationCapabilities {
-	return &agentv0.ValidationCapabilities{
+func validationCapabilities() *agentv1.ValidationCapabilities {
+	return &agentv1.ValidationCapabilities{
 		Audit:         workspaceOperation(),
 		ArtifactBuild: workspaceOperation(),
 		Sbom:          workspaceOperation(),
@@ -43,9 +43,9 @@ func validationCapabilities() *agentv0.ValidationCapabilities {
 // workspaceOperation validates the whole service tree. Postgres owns migrations
 // and its service manifest, not language packages or independently checkable
 // files, so no narrower scope has a meaning this agent could honour.
-func workspaceOperation() *agentv0.ValidationOperationCapability {
-	return &agentv0.ValidationOperationCapability{
+func workspaceOperation() *agentv1.ValidationOperationCapability {
+	return &agentv1.ValidationOperationCapability{
 		Supported: true,
-		Scopes:    []agentv0.ValidationScope{agentv0.ValidationScope_VALIDATION_SCOPE_WORKSPACE},
+		Scopes:    []agentv1.ValidationScope{agentv1.ValidationScope_VALIDATION_SCOPE_WORKSPACE},
 	}
 }

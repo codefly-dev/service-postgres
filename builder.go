@@ -18,14 +18,14 @@ import (
 	"github.com/codefly-dev/core/agents/communicate"
 	dockerhelpers "github.com/codefly-dev/core/agents/helpers/docker"
 	"github.com/codefly-dev/core/agents/services/sbom"
-	v0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	v0 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/standards"
 	"github.com/codefly-dev/core/wool"
 
 	"github.com/codefly-dev/core/agents/services"
 	"github.com/codefly-dev/core/agents/services/upgrade"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/shared"
 	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
 	"gopkg.in/yaml.v3"
@@ -65,7 +65,7 @@ func NewBuilder() *Builder {
 	}
 }
 
-func (s *Builder) Load(ctx context.Context, req *builderv0.LoadRequest) (*builderv0.LoadResponse, error) {
+func (s *Builder) Load(ctx context.Context, req *builderv1.LoadRequest) (*builderv1.LoadResponse, error) {
 	defer s.Wool.Catch()
 
 	return s.Builder.LoadService(ctx, req, services.BuilderLoad{
@@ -84,19 +84,19 @@ func (s *Builder) Load(ctx context.Context, req *builderv0.LoadRequest) (*builde
 	})
 }
 
-func (s *Builder) Init(ctx context.Context, req *builderv0.InitRequest) (*builderv0.InitResponse, error) {
+func (s *Builder) Init(ctx context.Context, req *builderv1.InitRequest) (*builderv1.InitResponse, error) {
 	defer s.Wool.Catch()
 
 	return s.Builder.InitResponse()
 }
 
-func (s *Builder) Update(ctx context.Context, req *builderv0.UpdateRequest) (*builderv0.UpdateResponse, error) {
+func (s *Builder) Update(ctx context.Context, req *builderv1.UpdateRequest) (*builderv1.UpdateResponse, error) {
 	defer s.Wool.Catch()
 
-	return &builderv0.UpdateResponse{}, nil
+	return &builderv1.UpdateResponse{}, nil
 }
 
-func (s *Builder) Sync(ctx context.Context, req *builderv0.SyncRequest) (*builderv0.SyncResponse, error) {
+func (s *Builder) Sync(ctx context.Context, req *builderv1.SyncRequest) (*builderv1.SyncResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
@@ -104,7 +104,7 @@ func (s *Builder) Sync(ctx context.Context, req *builderv0.SyncRequest) (*builde
 }
 
 // Audit scans the configured postgres image for known HIGH/CRITICAL CVEs.
-func (s *Builder) Audit(ctx context.Context, req *builderv0.AuditRequest) (*builderv0.AuditResponse, error) {
+func (s *Builder) Audit(ctx context.Context, req *builderv1.AuditRequest) (*builderv1.AuditResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 	return s.Builder.AuditContainer(ctx, req, s.dockerImage().FullName())
@@ -113,10 +113,10 @@ func (s *Builder) Audit(ctx context.Context, req *builderv0.AuditRequest) (*buil
 // SBOM inventories the service's software. Source scope keeps the package-level
 // scan of the configured postgres image; image scope serves evidence bound to
 // the digest and platform each shipped image was actually scanned from.
-func (s *Builder) SBOM(ctx context.Context, req *builderv0.SBOMRequest) (*builderv0.SBOMResponse, error) {
+func (s *Builder) SBOM(ctx context.Context, req *builderv1.SBOMRequest) (*builderv1.SBOMResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
-	if req.GetScope() != builderv0.SBOMScope_SBOM_SCOPE_IMAGE {
+	if req.GetScope() != builderv1.SBOMScope_SBOM_SCOPE_IMAGE {
 		return s.Builder.SBOMContainer(ctx, s.dockerImage().FullName())
 	}
 	// The bootstrap image is built by the caller from the emitted recipe, so its
@@ -140,9 +140,9 @@ func (s *Builder) SBOM(ctx context.Context, req *builderv0.SBOMRequest) (*builde
 // subject costs a full image scan, and a repeated one carries no association
 // the first does not already have. Subjects that differ in service or role are
 // kept: that is how one digest still names every service it covers.
-func distinctSubjects(groups ...[]*builderv0.ImageSubject) []*builderv0.ImageSubject {
+func distinctSubjects(groups ...[]*builderv1.ImageSubject) []*builderv1.ImageSubject {
 	seen := map[string]bool{}
-	var subjects []*builderv0.ImageSubject
+	var subjects []*builderv1.ImageSubject
 	for _, group := range groups {
 		for _, subject := range group {
 			key := strings.Join([]string{
@@ -168,7 +168,7 @@ func distinctSubjects(groups ...[]*builderv0.ImageSubject) []*builderv0.ImageSub
 // would never be inventoried. The pin rides in the reference rather than in the
 // digest field: evidence binds to the platform's child manifest, which is what
 // each subject's scan resolves out of the manifest list the deployment names.
-func (s *Service) runtimeImageSubjects() ([]*builderv0.ImageSubject, error) {
+func (s *Service) runtimeImageSubjects() ([]*builderv1.ImageSubject, error) {
 	configured := s.dockerImage()
 	if configured == nil {
 		return nil, fmt.Errorf("docker-image %q is not a name:tag reference", s.Settings.Image)
@@ -197,7 +197,7 @@ func (s *Service) runtimeImageSubjects() ([]*builderv0.ImageSubject, error) {
 }
 
 // Upgrade reports an available tag bump for the managed postgres image.
-func (s *Builder) Upgrade(ctx context.Context, req *builderv0.UpgradeRequest) (*builderv0.UpgradeResponse, error) {
+func (s *Builder) Upgrade(ctx context.Context, req *builderv1.UpgradeRequest) (*builderv1.UpgradeResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 	res, err := upgrade.Docker(ctx, image.FullName(), upgrade.Options{
@@ -245,7 +245,7 @@ func bootstrapLogins(logins []runtimeLogin) []bootstrap.SelfHostedLogin {
 	return out
 }
 
-func (s *Builder) Build(ctx context.Context, req *builderv0.BuildRequest) (*builderv0.BuildResponse, error) {
+func (s *Builder) Build(ctx context.Context, req *builderv1.BuildRequest) (*builderv1.BuildResponse, error) {
 	defer s.Wool.Catch()
 
 	s.Wool.Debug("building database bootstrap image")
@@ -325,7 +325,7 @@ func (s *Builder) buildRecipe(
 	img *resources.DockerImage,
 	plan *schemaPlan,
 	docker DockerTemplating,
-) (*builderv0.BuildResponse, error) {
+) (*builderv1.BuildResponse, error) {
 	// The build plan inventories the whole output directory and the recipe
 	// context is its root, so any pre-existing content the caller left here
 	// would be digested into the plan and copied into the image. Empty the
@@ -345,7 +345,7 @@ func (s *Builder) buildRecipe(
 		}
 	}
 
-	buildPlan, err := services.BuildDockerBuildPlan(outputDirectory, []*builderv0.DockerBuildRecipe{{
+	buildPlan, err := services.BuildDockerBuildPlan(outputDirectory, []*builderv1.DockerBuildRecipe{{
 		Name:         "bootstrap",
 		Dockerfile:   "builder/Dockerfile",
 		Context:      ".",
@@ -501,7 +501,7 @@ func stageLineage(ctx context.Context, lineage schemaLineage, destination string
 	return nil
 }
 
-func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) (*builderv0.DeploymentResponse, error) {
+func (s *Builder) Deploy(ctx context.Context, req *builderv1.DeploymentRequest) (*builderv1.DeploymentResponse, error) {
 	defer s.Wool.Catch()
 
 	if err := s.Settings.Timeouts.validate(); err != nil {
@@ -547,7 +547,7 @@ func (s *Builder) Deploy(ctx context.Context, req *builderv0.DeploymentRequest) 
 		},
 	})
 	if err != nil ||
-		response.GetState().GetState() != builderv0.DeploymentStatus_SUCCESS ||
+		response.GetState().GetState() != builderv1.DeploymentStatus_SUCCESS ||
 		restrictedConfiguration == nil {
 		return response, err
 	}
@@ -700,12 +700,12 @@ func (s *Builder) prepareDeployment(
 const deployedServerNegotiatesTLS = false
 
 type promotableWorkloadSecretReferences struct {
-	StatefulSet  map[string]*builderv0.KubernetesSecretKeyReference
-	BootstrapJob map[string]*builderv0.KubernetesSecretKeyReference
+	StatefulSet  map[string]*builderv1.KubernetesSecretKeyReference
+	BootstrapJob map[string]*builderv1.KubernetesSecretKeyReference
 }
 
 func (s *Builder) selectPromotableSecretReferences(
-	configured map[string]*builderv0.KubernetesSecretKeyReference,
+	configured map[string]*builderv1.KubernetesSecretKeyReference,
 	logins []runtimeLogin,
 ) (*promotableWorkloadSecretReferences, error) {
 	// The restricted deploy build never loads runtime credentials, so this is
@@ -719,8 +719,8 @@ func (s *Builder) selectPromotableSecretReferences(
 	// db-auth stack.
 	if s.externalIdentity() {
 		return &promotableWorkloadSecretReferences{
-			StatefulSet:  map[string]*builderv0.KubernetesSecretKeyReference{},
-			BootstrapJob: map[string]*builderv0.KubernetesSecretKeyReference{},
+			StatefulSet:  map[string]*builderv1.KubernetesSecretKeyReference{},
+			BootstrapJob: map[string]*builderv1.KubernetesSecretKeyReference{},
 		}, nil
 	}
 	statefulSetEnvironmentVariables := []string{
@@ -738,7 +738,7 @@ func (s *Builder) selectPromotableSecretReferences(
 	// is the point. They are taken from the set BuildCapabilities declares, so
 	// a host that asked before building was told exactly what this refuses on.
 	primitives := s.requiredSecretConfigurationKeys()
-	selected := make(map[string]*builderv0.KubernetesSecretKeyReference, len(primitives)+len(logins)+2)
+	selected := make(map[string]*builderv1.KubernetesSecretKeyReference, len(primitives)+len(logins)+2)
 	secretName := ""
 	for _, environmentVariable := range primitives {
 		configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(
@@ -780,8 +780,8 @@ func (s *Builder) selectPromotableSecretReferences(
 	selected["PGUSER"] = selected["POSTGRES_USER"]
 	selected["PGPASSWORD"] = selected["POSTGRES_PASSWORD"]
 	bootstrapJobEnvironmentVariables = append(bootstrapJobEnvironmentVariables, "PGUSER", "PGPASSWORD")
-	selectForWorkload := func(environmentVariables []string) map[string]*builderv0.KubernetesSecretKeyReference {
-		workloadReferences := make(map[string]*builderv0.KubernetesSecretKeyReference, len(environmentVariables))
+	selectForWorkload := func(environmentVariables []string) map[string]*builderv1.KubernetesSecretKeyReference {
+		workloadReferences := make(map[string]*builderv1.KubernetesSecretKeyReference, len(environmentVariables))
 		for _, environmentVariable := range environmentVariables {
 			workloadReferences[environmentVariable] = selected[environmentVariable]
 		}
@@ -816,10 +816,10 @@ func (s *Builder) selectPromotableSecretReferences(
 // the primitive keeps that reference — and is held to the same invariants as
 // the managed primitives: never optional, always the one Secret.
 func (s *Builder) loginPasswordSecretReference(
-	configured map[string]*builderv0.KubernetesSecretKeyReference,
+	configured map[string]*builderv1.KubernetesSecretKeyReference,
 	secretName string,
 	login runtimeLogin,
-) (*builderv0.KubernetesSecretKeyReference, error) {
+) (*builderv1.KubernetesSecretKeyReference, error) {
 	configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(
 		s.Unique(),
 		postgresSecretConfiguration,
@@ -827,7 +827,7 @@ func (s *Builder) loginPasswordSecretReference(
 	)
 	reference := configured[configurationKey]
 	if reference == nil || reference.GetName() == "" || reference.GetKey() == "" {
-		return &builderv0.KubernetesSecretKeyReference{Name: secretName, Key: configurationKey}, nil
+		return &builderv1.KubernetesSecretKeyReference{Name: secretName, Key: configurationKey}, nil
 	}
 	if reference.GetOptional() {
 		return nil, fmt.Errorf("%s Kubernetes Secret reference must not be optional", configurationKey)
@@ -843,7 +843,7 @@ type create struct {
 	TableName    string
 }
 
-func (s *Builder) Create(ctx context.Context, req *builderv0.CreateRequest) (*builderv0.CreateResponse, error) {
+func (s *Builder) Create(ctx context.Context, req *builderv1.CreateRequest) (*builderv1.CreateResponse, error) {
 	defer s.Wool.Catch()
 
 	// Use defaults
@@ -875,7 +875,7 @@ func (s *Builder) Create(ctx context.Context, req *builderv0.CreateRequest) (*bu
 // now an ERROR rather than silently "not restricted", and it is read as
 // RESTRICTED here -- the other direction would hand a restricted render the
 // secrets it exists to refuse.
-func restrictedOutput(profile builderv0.KubernetesOutputProfile) bool {
+func restrictedOutput(profile builderv1.KubernetesOutputProfile) bool {
 	parsed, err := services.ParseOutputProfile(profile)
 	if err != nil {
 		return true
@@ -899,7 +899,7 @@ func (s *Builder) CreateEndpoints(ctx context.Context) error {
 	return nil
 }
 
-func (s *Builder) Communicate(stream builderv0.Builder_CommunicateServer) error {
+func (s *Builder) Communicate(stream builderv1.Builder_CommunicateServer) error {
 	asker := communicate.NewQuestionAsker(stream)
 	_, err := asker.RunSequence(nil)
 	return err

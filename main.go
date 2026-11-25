@@ -12,9 +12,9 @@ import (
 	"github.com/codefly-dev/core/agents/contract"
 	"github.com/codefly-dev/core/agents/services"
 	"github.com/codefly-dev/core/builders"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	agentv1 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/resources"
 	runnersbase "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/shared"
@@ -295,8 +295,8 @@ type DeploymentTemplateParameters struct {
 	BootstrapJobName             string
 	DatabaseName                 string
 	BootstrapJobDeadlineSeconds  int
-	StatefulSetSecretReferences  map[string]*builderv0.KubernetesSecretKeyReference
-	BootstrapJobSecretReferences map[string]*builderv0.KubernetesSecretKeyReference
+	StatefulSetSecretReferences  map[string]*builderv1.KubernetesSecretKeyReference
+	BootstrapJobSecretReferences map[string]*builderv1.KubernetesSecretKeyReference
 	// ServicePort is the in-cluster port core allocated to the tcp endpoint and
 	// handed to every consumer in its network mapping. The Service publishes it
 	// and folds it onto 5432, the port the container listens on. Zero leaves the
@@ -362,10 +362,10 @@ type Service struct {
 	connectionKey  string
 	connection     string
 
-	TcpEndpoint *basev0.Endpoint
+	TcpEndpoint *basev1.Endpoint
 }
 
-func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInformationRequest) (*agentv0.AgentInformation, error) {
+func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv1.AgentInformationRequest) (*agentv1.AgentInformation, error) {
 
 	readme, err := templates.ApplyTemplateFrom(ctx, shared.Embed(readmeFS), "templates/agent/README.md", s.Information)
 	if err != nil {
@@ -378,10 +378,10 @@ func (s *Service) GetAgentInformation(ctx context.Context, _ *agentv0.AgentInfor
 			Docker: true,
 		},
 		ReadMe: readme,
-		Config: []*agentv0.ConfigurationValueDetail{
+		Config: []*agentv1.ConfigurationValueDetail{
 			{
 				Name: "postgres", Description: "capability-scoped Postgres workload bindings",
-				Fields: []*agentv0.ConfigurationValueInformation{
+				Fields: []*agentv1.ConfigurationValueInformation{
 					{
 						Name: ownerConnectionKey, Description: "local migration-owner connection; never a toolbox binding or normal runtime credential",
 					},
@@ -421,7 +421,7 @@ func NewService() *Service {
 	return service
 }
 
-func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configuration) error {
+func (s *Service) LoadConfiguration(ctx context.Context, conf *basev1.Configuration) error {
 	var err error
 	s.postgresUser, err = resources.GetConfigurationValue(ctx, conf, "postgres", "POSTGRES_USER")
 	if err != nil {
@@ -479,7 +479,7 @@ func (s *Service) LoadConfiguration(ctx context.Context, conf *basev0.Configurat
 	return s.validateCredentials()
 }
 
-func (s *Service) createOwnerConnectionString(ctx context.Context, conf *basev0.Configuration, address string, withSSL bool) (string, error) {
+func (s *Service) createOwnerConnectionString(ctx context.Context, conf *basev1.Configuration, address string, withSSL bool) (string, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
@@ -491,7 +491,7 @@ func (s *Service) createOwnerConnectionString(ctx context.Context, conf *basev0.
 	return postgresConnectionString(address, s.DatabaseName, s.postgresUser, s.postgresPassword, withSSL, s.externalIdentity()), nil
 }
 
-func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev0.Configuration, instance *basev0.NetworkInstance, withSSL bool) (*basev0.Configuration, error) {
+func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev1.Configuration, instance *basev1.NetworkInstance, withSSL bool) (*basev1.Configuration, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 	if err := s.LoadConfiguration(ctx, conf); err != nil {
@@ -510,7 +510,7 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 	// make a role the principal cannot yet assume a FATAL that refuses the
 	// connection outright, and would never reach the restricted deploy profile,
 	// which exports these keys without values.
-	values := []*basev0.ConfigurationValue{
+	values := []*basev1.ConfigurationValue{
 		{Key: ownerConnectionKey, Value: ownerConnection, Secret: true},
 		{Key: readOnlyConnectionKey, Value: readOnlyConnection, Secret: true},
 		{Key: readWriteConnectionKey, Value: readWriteConnection, Secret: true},
@@ -521,12 +521,12 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 	}
 	for _, login := range logins {
 		connection := postgresConnectionString(instance.Address, s.DatabaseName, login.role, s.loginPasswords[login.name], withSSL, passwordless)
-		values = append(values, &basev0.ConfigurationValue{Key: login.connectionKey, Value: connection, Secret: true})
+		values = append(values, &basev1.ConfigurationValue{Key: login.connectionKey, Value: connection, Secret: true})
 	}
-	outputConf := &basev0.Configuration{
+	outputConf := &basev1.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
-		Infos: []*basev0.ConfigurationInformation{
+		Infos: []*basev1.ConfigurationInformation{
 			{Name: "postgres", ConfigurationValues: values},
 		},
 	}
@@ -546,9 +546,9 @@ func (s *Service) CreateConnectionConfiguration(ctx context.Context, conf *basev
 //
 // External-identity mode holds no password, so there is nothing to assemble a
 // value from: its connections stay keys without values, as before.
-func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInstance, withSSL bool) *basev0.Configuration {
-	readOnly := &basev0.ConfigurationValue{Key: readOnlyConnectionKey, Secret: true}
-	readWrite := &basev0.ConfigurationValue{Key: readWriteConnectionKey, Secret: true}
+func (s *Service) promotableConnectionConfiguration(instance *basev1.NetworkInstance, withSSL bool) *basev1.Configuration {
+	readOnly := &basev1.ConfigurationValue{Key: readOnlyConnectionKey, Secret: true}
+	readWrite := &basev1.ConfigurationValue{Key: readWriteConnectionKey, Secret: true}
 	if !s.externalIdentity() {
 		readOnlyRole, readWriteRole := runtimeRoleNames(s.DatabaseName)
 		readOnly.Template = postgresConnectionTemplate(
@@ -558,21 +558,21 @@ func (s *Service) promotableConnectionConfiguration(instance *basev0.NetworkInst
 			instance.Address, s.DatabaseName, readWriteRole, "POSTGRES_READ_WRITE_PASSWORD", withSSL,
 		)
 	}
-	values := []*basev0.ConfigurationValue{readOnly, readWrite}
+	values := []*basev1.ConfigurationValue{readOnly, readWrite}
 	// Settings were validated before any render reached here, so a resolution
 	// error cannot occur; an empty set renders no login.
 	logins, _ := s.runtimeLogins()
 	for _, login := range logins {
-		value := &basev0.ConfigurationValue{Key: login.connectionKey, Secret: true}
+		value := &basev1.ConfigurationValue{Key: login.connectionKey, Secret: true}
 		if !s.externalIdentity() {
 			value.Template = postgresConnectionTemplate(instance.Address, s.DatabaseName, login.role, login.passwordKey, withSSL)
 		}
 		values = append(values, value)
 	}
-	return &basev0.Configuration{
+	return &basev1.Configuration{
 		Origin:         s.Unique(),
 		RuntimeContext: resources.RuntimeContextFromInstance(instance),
-		Infos: []*basev0.ConfigurationInformation{
+		Infos: []*basev1.ConfigurationInformation{
 			{Name: "postgres", ConfigurationValues: values},
 		},
 	}
@@ -614,19 +614,19 @@ func postgresConnectionString(address, database, user, password string, withSSL,
 // configuration. Every other part is built by the same url.URL encoding, so the
 // assembled value addresses the same role, host, database and sslmode as the
 // value this agent renders when it holds the password itself.
-func postgresConnectionTemplate(address, database, user, passwordKey string, withSSL bool) *basev0.ConfigurationValueTemplate {
+func postgresConnectionTemplate(address, database, user, passwordKey string, withSSL bool) *basev1.ConfigurationValueTemplate {
 	withoutPassword := postgresConnectionString(address, database, user, "", withSSL, true)
 	// withoutPassword is "postgresql://<user>@<host>/<database>[?query]"; the
 	// escaped user never contains "@", so the first one separates the userinfo.
 	userinfo, target, _ := strings.Cut(withoutPassword, "@")
-	return &basev0.ConfigurationValueTemplate{Segments: []*basev0.ConfigurationValueTemplateSegment{
-		{Content: &basev0.ConfigurationValueTemplateSegment_Literal{Literal: userinfo + ":"}},
-		{Content: &basev0.ConfigurationValueTemplateSegment_Reference{Reference: &basev0.ConfigurationValueReference{
+	return &basev1.ConfigurationValueTemplate{Segments: []*basev1.ConfigurationValueTemplateSegment{
+		{Content: &basev1.ConfigurationValueTemplateSegment_Literal{Literal: userinfo + ":"}},
+		{Content: &basev1.ConfigurationValueTemplateSegment_Reference{Reference: &basev1.ConfigurationValueReference{
 			Configuration: "postgres",
 			Key:           passwordKey,
-			Escape:        basev0.ConfigurationValueEscape_CONFIGURATION_VALUE_ESCAPE_URL_USERINFO,
+			Escape:        basev1.ConfigurationValueEscape_CONFIGURATION_VALUE_ESCAPE_URL_USERINFO,
 		}}},
-		{Content: &basev0.ConfigurationValueTemplateSegment_Literal{Literal: "@" + target}},
+		{Content: &basev1.ConfigurationValueTemplateSegment_Literal{Literal: "@" + target}},
 	}}
 }
 

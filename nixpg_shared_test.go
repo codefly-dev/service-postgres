@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/resources"
 	runners "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/shared"
@@ -102,14 +102,14 @@ func TestRunServerIsSharedAndIsolated(t *testing.T) {
 	}
 
 	// Releasing one service leaves the run's server serving the other.
-	stopped, err := runAlpha.Stop(ctx, &runtimev0.StopRequest{})
+	stopped, err := runAlpha.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
 	require.Contains(t, stopped.GetStatus().GetMessage(), "keeps serving its other services")
 	requireNoListener(t, alpha.address)
 	require.True(t, hasSentinel(t, ctx, runBeta.connection, beta.serviceName, "00000000-0000-0000-0000-0000000000b1"))
 
 	// The last release stops it.
-	stopped, err = runBeta.Stop(ctx, &runtimev0.StopRequest{})
+	stopped, err = runBeta.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
 	require.Contains(t, stopped.GetStatus().GetMessage(), "stopped native postgres")
 	requireNoListener(t, beta.address)
@@ -137,15 +137,15 @@ func TestRunServerRefusesTwoServicesClaimingOneDatabase(t *testing.T) {
 	run, _ := first.start(t, ctx)
 
 	refused := NewRuntime()
-	_, err := refused.Load(ctx, &runtimev0.LoadRequest{Identity: second.identity, Environment: shared.Must(second.environment.Proto()), DisableCatch: true})
+	_, err := refused.Load(ctx, &runtimev1.LoadRequest{Identity: second.identity, Environment: shared.Must(second.environment.Proto()), DisableCatch: true})
 	require.NoError(t, err)
-	init, err := refused.Init(ctx, &runtimev0.InitRequest{
+	init, err := refused.Init(ctx, &runtimev1.InitRequest{
 		RuntimeContext:          second.runtimeContext,
 		Configuration:           second.configuration,
 		ProposedNetworkMappings: second.networkMappings,
 	})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.InitStatus_ERROR, init.GetStatus().GetState())
+	require.Equal(t, runtimev1.InitStatus_ERROR, init.GetStatus().GetState())
 	require.Contains(t, init.GetStatus().GetMessage(),
 		`database "shared" on this run's postgres server belongs to shared/first, not shared/second`)
 	require.Nil(t, refused.nixRuntime, "a refused service holds no server")
@@ -210,17 +210,17 @@ func TestRunServerRefusesAnOwnerRoleAnotherServiceCreated(t *testing.T) {
 	require.NoError(t, err, "a migration owner may create roles")
 
 	refused := NewRuntime()
-	_, err = refused.Load(ctx, &runtimev0.LoadRequest{
+	_, err = refused.Load(ctx, &runtimev1.LoadRequest{
 		Identity: victim.identity, Environment: shared.Must(victim.environment.Proto()), DisableCatch: true,
 	})
 	require.NoError(t, err)
-	init, err := refused.Init(ctx, &runtimev0.InitRequest{
+	init, err := refused.Init(ctx, &runtimev1.InitRequest{
 		RuntimeContext:          victim.runtimeContext,
 		Configuration:           victim.configuration,
 		ProposedNetworkMappings: victim.networkMappings,
 	})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.InitStatus_ERROR, init.GetStatus().GetState())
+	require.Equal(t, runtimev1.InitStatus_ERROR, init.GetStatus().GetState())
 	require.Contains(t, init.GetStatus().GetMessage(), "was not created for victim/store")
 	require.Nil(t, refused.nixRuntime, "a refused service holds no server")
 }

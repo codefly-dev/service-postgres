@@ -8,9 +8,9 @@ import (
 	"testing"
 
 	"github.com/codefly-dev/core/agents/services/sbom"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	agentv1 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,18 +44,18 @@ func TestImageSBOMCoversEveryShippedImageAndPlatform(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, expected, 2, "the bootstrap recipe ships two platforms")
 
-	sbomResponse, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope:    builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
+	sbomResponse, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope:    builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
 		Subjects: expected,
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_COMPLETE, sbomResponse.GetState().GetState(),
+	require.Equal(t, builderv1.SBOMStatus_COMPLETE, sbomResponse.GetState().GetState(),
 		sbomResponse.GetState().GetMessage())
-	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, sbomResponse.GetScope())
-	require.Equal(t, builderv0.NoImageReason_NO_IMAGE_REASON_UNSPECIFIED, sbomResponse.GetNoImageReason())
+	require.Equal(t, builderv1.SBOMScope_SBOM_SCOPE_IMAGE, sbomResponse.GetScope())
+	require.Equal(t, builderv1.NoImageReason_NO_IMAGE_REASON_UNSPECIFIED, sbomResponse.GetNoImageReason())
 	require.NoError(t, sbom.ValidateCoverage(builder.Unique(), expected, sbomResponse))
 
-	covered := map[string]*builderv0.ImageSBOM{}
+	covered := map[string]*builderv1.ImageSBOM{}
 	for _, evidence := range sbomResponse.GetImages() {
 		require.NotEmpty(t, evidence.GetSha256(), "evidence must carry its own document checksum")
 		covered[evidence.GetDigest()] = evidence
@@ -101,19 +101,19 @@ func TestImageSBOMWithoutSubjectsRefusesToClaimCoverage(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 	log := stubScanner(t, scanner{})
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope: builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
-	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
-	require.Equal(t, basev0.FailureCode_FAILURE_CODE_PRECONDITION_FAILED,
+	require.Equal(t, builderv1.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Equal(t, basev1.FailureCode_FAILURE_CODE_PRECONDITION_FAILED,
 		response.GetState().GetFailure().GetCode())
 	require.Empty(t, response.GetImages())
-	require.Equal(t, builderv0.NoImageReason_NO_IMAGE_REASON_UNSPECIFIED, response.GetNoImageReason(),
+	require.Equal(t, builderv1.NoImageReason_NO_IMAGE_REASON_UNSPECIFIED, response.GetNoImageReason(),
 		"a service that does ship images must never claim a no-image reason")
 	require.ErrorContains(t,
-		sbom.ValidateCoverage(builder.Unique(), []*builderv0.ImageSubject{{
+		sbom.ValidateCoverage(builder.Unique(), []*builderv1.ImageSubject{{
 			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}}, response),
 		"does not build its own images")
@@ -126,15 +126,15 @@ func TestImageSBOMReportsAFailedScanRatherThanPartialCoverage(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 	stubScanner(t, scanner{failure: "syft exited 1: no space left on device"})
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
-		Subjects: []*builderv0.ImageSubject{{
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope: builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv1.ImageSubject{{
 			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
-	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Equal(t, builderv1.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
 	require.Empty(t, response.GetImages())
 	require.Contains(t, response.GetState().GetMessage(), "no space left on device")
 }
@@ -146,19 +146,19 @@ func TestImageSBOMReportsAFailedScanRatherThanPartialCoverage(t *testing.T) {
 func TestImageSBOMReportsASharedDigestOnceAndKeepsEverySubject(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 	log := stubScanner(t, scanner{})
-	neighbour := &builderv0.ImageSubject{
+	neighbour := &builderv1.ImageSubject{
 		Reference: image.FullName(),
 		Platform:  "linux/amd64",
 		Role:      runtimeImageRole,
 		Service:   "module/other-postgres",
 	}
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope:    builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
-		Subjects: []*builderv0.ImageSubject{neighbour},
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope:    builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv1.ImageSubject{neighbour},
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_COMPLETE, response.GetState().GetState(),
+	require.Equal(t, builderv1.SBOMStatus_COMPLETE, response.GetState().GetState(),
 		response.GetState().GetMessage())
 
 	require.Len(t, response.GetImages(), 2, "the shared digest is reported once, not once per subject")
@@ -174,19 +174,19 @@ func TestImageSBOMReportsASharedDigestOnceAndKeepsEverySubject(t *testing.T) {
 func TestImageSBOMScansAnIdenticalSubjectOnlyOnce(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 	log := stubScanner(t, scanner{})
-	duplicate := &builderv0.ImageSubject{
+	duplicate := &builderv1.ImageSubject{
 		Reference: image.FullName(),
 		Platform:  "linux/amd64",
 		Role:      runtimeImageRole,
 		Service:   builder.Unique(),
 	}
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope:    builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
-		Subjects: []*builderv0.ImageSubject{duplicate},
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope:    builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv1.ImageSubject{duplicate},
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_COMPLETE, response.GetState().GetState(),
+	require.Equal(t, builderv1.SBOMStatus_COMPLETE, response.GetState().GetState(),
 		response.GetState().GetMessage())
 	require.Len(t, scans(t, log), 2, "the repeated subject is dropped before it is scanned")
 	require.Len(t, evidenceFor(t, response, runtimeAMD64Digest).GetSubjects(), 1)
@@ -201,14 +201,14 @@ func TestImageSBOMCoversEveryDeclaredPlatformOfAnOverride(t *testing.T) {
 	builder.Settings.ImagePlatforms = []string{"linux/amd64", "linux/arm64"}
 	log := stubScanner(t, scanner{overrideImage: "postgres"})
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
-		Subjects: []*builderv0.ImageSubject{{
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope: builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv1.ImageSubject{{
 			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_COMPLETE, response.GetState().GetState(),
+	require.Equal(t, builderv1.SBOMStatus_COMPLETE, response.GetState().GetState(),
 		response.GetState().GetMessage())
 
 	require.Equal(t, []string{"linux/amd64", "linux/arm64"},
@@ -228,15 +228,15 @@ func TestImageSBOMFailsOnAnUndeclaredMultiPlatformOverride(t *testing.T) {
 	builder.Settings.Image = pinnedOverrideImage
 	stubScanner(t, scanner{overrideImage: "postgres"})
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
-		Subjects: []*builderv0.ImageSubject{{
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope: builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv1.ImageSubject{{
 			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
-	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Equal(t, builderv1.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
 	require.Contains(t, response.GetState().GetMessage(), "name the platform to scan")
 }
 
@@ -248,15 +248,15 @@ func TestImageSBOMRefusesAnUnpinnedOverride(t *testing.T) {
 	builder.Settings.Image = "postgres:17-alpine"
 	log := stubScanner(t, scanner{overrideImage: "postgres"})
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
-		Subjects: []*builderv0.ImageSubject{{
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope: builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv1.ImageSubject{{
 			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
-	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Equal(t, builderv1.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
 	require.Contains(t, response.GetState().GetMessage(), "is not pinned to a sha256 digest")
 	require.NoFileExists(t, log, "nothing may be scanned once the configuration is rejected")
 }
@@ -268,15 +268,15 @@ func TestImageSBOMRejectsAnUnreadableOverrideReference(t *testing.T) {
 	builder.Settings.Image = "registry.internal:5000/pg:17"
 	log := stubScanner(t, scanner{})
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{
-		Scope: builderv0.SBOMScope_SBOM_SCOPE_IMAGE,
-		Subjects: []*builderv0.ImageSubject{{
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{
+		Scope: builderv1.SBOMScope_SBOM_SCOPE_IMAGE,
+		Subjects: []*builderv1.ImageSubject{{
 			Reference: pinnedBootstrapImage, Platform: "linux/amd64", Role: "bootstrap", Service: builder.Unique(),
 		}},
 	})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_ERROR, response.GetState().GetState())
-	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
+	require.Equal(t, builderv1.SBOMStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.SBOMScope_SBOM_SCOPE_IMAGE, response.GetScope())
 	require.Contains(t, response.GetState().GetMessage(), "is not a name:tag reference")
 	require.NoFileExists(t, log, "nothing may be scanned once the configuration is rejected")
 }
@@ -287,14 +287,14 @@ func TestSourceScopeStillInventoriesTheConfiguredImage(t *testing.T) {
 	builder := newBuildTestBuilder(t)
 	log := stubScanner(t, scanner{})
 
-	response, err := builder.SBOM(t.Context(), &builderv0.SBOMRequest{})
+	response, err := builder.SBOM(t.Context(), &builderv1.SBOMRequest{})
 	require.NoError(t, err)
-	require.Equal(t, builderv0.SBOMStatus_COMPLETE, response.GetState().GetState(),
+	require.Equal(t, builderv1.SBOMStatus_COMPLETE, response.GetState().GetState(),
 		response.GetState().GetMessage())
-	require.Equal(t, builderv0.SBOMScope_SBOM_SCOPE_SOURCE, response.GetScope())
+	require.Equal(t, builderv1.SBOMScope_SBOM_SCOPE_SOURCE, response.GetScope())
 	require.Equal(t, []string{"registry:" + image.FullName()}, scans(t, log))
 	require.ErrorContains(t,
-		sbom.ValidateCoverage(builder.Unique(), []*builderv0.ImageSubject{{
+		sbom.ValidateCoverage(builder.Unique(), []*builderv1.ImageSubject{{
 			Reference: image.FullName(), Role: runtimeImageRole, Service: builder.Unique(),
 		}}, response),
 		"not image coverage")
@@ -460,7 +460,7 @@ func sortedScans(t *testing.T, log string) []string {
 	return targets
 }
 
-func sortedKeys(evidence map[string]*builderv0.ImageSBOM) []string {
+func sortedKeys(evidence map[string]*builderv1.ImageSBOM) []string {
 	keys := make([]string, 0, len(evidence))
 	for key := range evidence {
 		keys = append(keys, key)
@@ -469,7 +469,7 @@ func sortedKeys(evidence map[string]*builderv0.ImageSBOM) []string {
 	return keys
 }
 
-func evidenceFor(t *testing.T, response *builderv0.SBOMResponse, digest string) *builderv0.ImageSBOM {
+func evidenceFor(t *testing.T, response *builderv1.SBOMResponse, digest string) *builderv1.ImageSBOM {
 	t.Helper()
 	for _, evidence := range response.GetImages() {
 		if evidence.GetDigest() == digest {
@@ -480,7 +480,7 @@ func evidenceFor(t *testing.T, response *builderv0.SBOMResponse, digest string) 
 	return nil
 }
 
-func subjectServices(evidence *builderv0.ImageSBOM) []string {
+func subjectServices(evidence *builderv1.ImageSBOM) []string {
 	var names []string
 	for _, subject := range evidence.GetSubjects() {
 		names = append(names, subject.GetService())
@@ -488,7 +488,7 @@ func subjectServices(evidence *builderv0.ImageSBOM) []string {
 	return names
 }
 
-func purls(bom *agentv0.Bom) []string {
+func purls(bom *agentv1.Bom) []string {
 	var values []string
 	for _, component := range bom.GetComponents() {
 		values = append(values, component.GetPurl())

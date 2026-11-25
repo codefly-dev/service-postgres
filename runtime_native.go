@@ -7,7 +7,7 @@ import (
 	"net"
 	"strconv"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
 	"github.com/codefly-dev/core/runners/runstate"
 	"github.com/codefly-dev/core/wool"
 )
@@ -24,7 +24,7 @@ func nativeOwnerRole(database string) string {
 // initNative attaches this service to its run's server, gives it its database
 // there, publishes its endpoint, and migrates — the native half of Init. A
 // failure releases whatever it took, so a refused service holds no server.
-func (s *Runtime) initNative(ctx context.Context, instance *basev0.NetworkInstance) (initErr error) {
+func (s *Runtime) initNative(ctx context.Context, instance *basev1.NetworkInstance) (initErr error) {
 	// A service that starts again in this agent claims the directory anew.
 	if s.nativeState != nil {
 		_ = s.nativeState.Release()

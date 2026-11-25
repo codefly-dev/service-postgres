@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/agents/services"
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 )
 
 // awaitCallback returns the error Supervise reported, or (nil,false) if nothing
@@ -95,11 +95,11 @@ func TestSuperviseNilChannelIsNoop(t *testing.T) {
 
 // startStatusState reads the observable StartStatus the same way the
 // Information RPC does — through the RuntimeWrapper's lock.
-func startStatusState(rt *services.RuntimeWrapper) runtimev0.StartStatus_Status {
+func startStatusState(rt *services.RuntimeWrapper) runtimev1.StartStatus_Status {
 	rt.RLock()
 	defer rt.RUnlock()
 	if rt.StartStatus == nil {
-		return runtimev0.StartStatus_UNKNOWN
+		return runtimev1.StartStatus_UNKNOWN
 	}
 	return rt.StartStatus.State
 }
@@ -154,7 +154,7 @@ func TestStartTailReportsDeathBufferedBeforeStartResponse(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("supervisor never reported the buffered death")
 		}
-		if got := startStatusState(rt); got != runtimev0.StartStatus_ERROR {
+		if got := startStatusState(rt); got != runtimev1.StartStatus_ERROR {
 			t.Fatalf("final StartStatus = %v, want ERROR (buffered death must not be masked)", got)
 		}
 	})
@@ -174,7 +174,7 @@ func TestStartTailReportsDeathBufferedBeforeStartResponse(t *testing.T) {
 		if _, err := rt.StartResponse(); err != nil {
 			t.Fatalf("StartResponse: %v", err)
 		}
-		if got := startStatusState(rt); got != runtimev0.StartStatus_STARTED {
+		if got := startStatusState(rt); got != runtimev1.StartStatus_STARTED {
 			t.Fatalf("final StartStatus = %v, want STARTED (demonstrates the masking)", got)
 		}
 	})

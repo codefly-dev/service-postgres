@@ -12,11 +12,11 @@ import (
 	"github.com/codefly-dev/core/agents/helpers/code"
 
 	"github.com/codefly-dev/core/agents/services"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
 	"github.com/codefly-dev/core/runners/runstate"
 	"github.com/codefly-dev/core/wool"
 
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/resources"
 	dockerrun "github.com/codefly-dev/core/runners/dockerrun"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
@@ -152,13 +152,13 @@ func NewRuntime() *Runtime {
 	}
 }
 
-func (s *Runtime) Load(ctx context.Context, req *runtimev0.LoadRequest) (*runtimev0.LoadResponse, error) {
+func (s *Runtime) Load(ctx context.Context, req *runtimev1.LoadRequest) (*runtimev1.LoadResponse, error) {
 	defer s.Wool.Catch()
 
 	response, err := s.Runtime.LoadService(ctx, req, services.RuntimeLoad{
 		Settings:     s.Settings,
 		Requirements: requirements,
-		ResolveEndpoints: func(ctx context.Context, endpoints []*basev0.Endpoint) error {
+		ResolveEndpoints: func(ctx context.Context, endpoints []*basev1.Endpoint) error {
 			s.Wool.Debug("endpoints", wool.Field("endpoints", resources.MakeManyEndpointSummary(endpoints)))
 			endpoint, err := resources.FindTCPEndpoint(ctx, endpoints)
 			if err != nil {
@@ -177,7 +177,7 @@ func (s *Runtime) Load(ctx context.Context, req *runtimev0.LoadRequest) (*runtim
 	return response, nil
 }
 
-func (s *Runtime) Init(ctx context.Context, req *runtimev0.InitRequest) (*runtimev0.InitResponse, error) {
+func (s *Runtime) Init(ctx context.Context, req *runtimev1.InitRequest) (*runtimev1.InitResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
@@ -550,7 +550,7 @@ func (s *Runtime) readinessFailure(ctx context.Context, budget time.Duration, en
 	return s.Wool.NewError("%s (last probe: %v)", phase, lastProbeErr)
 }
 
-func (s *Runtime) Start(ctx context.Context, req *runtimev0.StartRequest) (*runtimev0.StartResponse, error) {
+func (s *Runtime) Start(ctx context.Context, req *runtimev1.StartRequest) (*runtimev1.StartResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
@@ -656,7 +656,7 @@ func (s *Runtime) reapHostResources(ctx context.Context) {
 	}
 }
 
-func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationRequest) (*runtimev0.InformationResponse, error) {
+func (s *Runtime) Information(ctx context.Context, req *runtimev1.InformationRequest) (*runtimev1.InformationResponse, error) {
 	return s.Runtime.InformationResponse(ctx, req)
 }
 
@@ -694,7 +694,7 @@ func (s *Runtime) Information(ctx context.Context, req *runtimev0.InformationReq
 //
 // Stop releases only what THIS invocation holds a handle to: a runtime that
 // never ran Init owns no postmaster and no container, and stops nothing.
-func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtimev0.StopResponse, error) {
+func (s *Runtime) Stop(ctx context.Context, req *runtimev1.StopRequest) (*runtimev1.StopResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
@@ -756,7 +756,7 @@ func (s *Runtime) Stop(ctx context.Context, req *runtimev0.StopRequest) (*runtim
 	return s.stopResponse("no postgres owned by this invocation")
 }
 
-func (s *Runtime) Destroy(ctx context.Context, req *runtimev0.DestroyRequest) (*runtimev0.DestroyResponse, error) {
+func (s *Runtime) Destroy(ctx context.Context, req *runtimev1.DestroyRequest) (*runtimev1.DestroyResponse, error) {
 	defer s.Wool.Catch()
 	ctx = s.Wool.Inject(ctx)
 
@@ -831,20 +831,20 @@ func (s *Runtime) stopContainer(ctx context.Context) error {
 // operation released and where the state it kept now lives, so a caller learns
 // the retention outcome from the result instead of by inspecting the backend.
 // Only paths are reported, never a credential or a connection string.
-func (s *Runtime) stopResponse(action string) (*runtimev0.StopResponse, error) {
-	return &runtimev0.StopResponse{Status: &runtimev0.StopStatus{
-		State:   runtimev0.StopStatus_SUCCESS,
+func (s *Runtime) stopResponse(action string) (*runtimev1.StopResponse, error) {
+	return &runtimev1.StopResponse{Status: &runtimev1.StopStatus{
+		State:   runtimev1.StopStatus_SUCCESS,
 		Message: s.retentionSummary(action),
 	}}, nil
 }
 
-func (s *Runtime) destroyResponse(action string) (*runtimev0.DestroyResponse, error) {
+func (s *Runtime) destroyResponse(action string) (*runtimev1.DestroyResponse, error) {
 	return s.destroyMessage(s.retentionSummary(action))
 }
 
-func (s *Runtime) destroyMessage(message string) (*runtimev0.DestroyResponse, error) {
-	return &runtimev0.DestroyResponse{Status: &runtimev0.DestroyStatus{
-		State:   runtimev0.DestroyStatus_SUCCESS,
+func (s *Runtime) destroyMessage(message string) (*runtimev1.DestroyResponse, error) {
+	return &runtimev1.DestroyResponse{Status: &runtimev1.DestroyStatus{
+		State:   runtimev1.DestroyStatus_SUCCESS,
 		Message: message,
 	}}, nil
 }
@@ -856,7 +856,7 @@ func (s *Runtime) retentionSummary(action string) string {
 	return action + "; database state retained at " + s.retainedDataPath
 }
 
-func (s *Runtime) Test(ctx context.Context, req *runtimev0.TestRequest) (*runtimev0.TestResponse, error) {
+func (s *Runtime) Test(ctx context.Context, req *runtimev1.TestRequest) (*runtimev1.TestResponse, error) {
 	// A RUN-LEVEL verdict, stated. This agent ships no tests of its own -- it
 	// runs a datastore -- so the honest run is zero tests and zero failures,
 	// which is what the status-only answer always meant. It has to be said:
@@ -867,8 +867,8 @@ func (s *Runtime) Test(ctx context.Context, req *runtimev0.TestRequest) (*runtim
 	if err != nil {
 		return nil, err
 	}
-	response.Result = &runtimev0.TestRunResult{
-		State:   runtimev0.TestRunResult_PASSED,
+	response.Result = &runtimev1.TestRunResult{
+		State:   runtimev1.TestRunResult_PASSED,
 		Message: "this agent ships no tests of its own: zero run, zero failed",
 	}
 	return response, nil

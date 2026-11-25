@@ -11,8 +11,8 @@ import (
 
 	"github.com/codefly-dev/core/agents/helpers/code"
 	"github.com/codefly-dev/core/agents/services"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,7 +22,7 @@ import (
 func watcherTestRuntime(t *testing.T) (*Runtime, string) {
 	t.Helper()
 	runtime := NewRuntime()
-	require.NoError(t, runtime.HeadlessLoad(context.Background(), &basev0.ServiceIdentity{
+	require.NoError(t, runtime.HeadlessLoad(context.Background(), &basev1.ServiceIdentity{
 		Workspace: "workspace",
 		Module:    "module",
 		Name:      "postgres",
@@ -87,7 +87,7 @@ func TestStopTearsDownHotReloadWatcher(t *testing.T) {
 	settle()
 	before := calls.Load()
 
-	_, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+	_, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
 
 	// Whatever Stop left behind must be inert: a save now must reach nobody.
@@ -119,7 +119,7 @@ func TestDestroyTearsDownHotReloadWatcher(t *testing.T) {
 	settle()
 	before := calls.Load()
 
-	_, _ = runtime.Destroy(ctx, &runtimev0.DestroyRequest{})
+	_, _ = runtime.Destroy(ctx, &runtimev1.DestroyRequest{})
 
 	touchMigration(t, migration, 2)
 	require.EqualValues(t, before, calls.Load(), "no watcher may survive Destroy")

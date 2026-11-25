@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/codefly-dev/core/agents/contract"
-	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
+	agentv1 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v1"
 )
 
 // TestAdvertisementAdoptsDeploymentCompositionProvenance: the host requires the
@@ -15,7 +15,7 @@ import (
 // deployment path here is core's DeployKustomize, which does; the
 // advertisement must say so, and keep the base contract it extends.
 func TestAdvertisementAdoptsDeploymentCompositionProvenance(t *testing.T) {
-	info, err := NewService().GetAgentInformation(context.Background(), &agentv0.AgentInformationRequest{})
+	info, err := NewService().GetAgentInformation(context.Background(), &agentv1.AgentInformationRequest{})
 	if err != nil {
 		t.Fatalf("GetAgentInformation: %v", err)
 	}

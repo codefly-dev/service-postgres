@@ -10,8 +10,8 @@ import (
 
 	"github.com/codefly-dev/core/agents/services"
 	agenttesting "github.com/codefly-dev/core/agents/testing"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
@@ -62,9 +62,9 @@ func TestDeployedServicePublishesAllocatedPort(t *testing.T) {
 	builder, _ := newDeploymentTestBuilder(t)
 	allocated := resources.NewNetworkInstance("postgres.codefly-test.svc.cluster.local", 80)
 	allocated.Access = resources.NewPublicNetworkAccess()
-	networkMappings := []*basev0.NetworkMapping{{
+	networkMappings := []*basev1.NetworkMapping{{
 		Endpoint:  builder.TcpEndpoint,
-		Instances: []*basev0.NetworkInstance{allocated},
+		Instances: []*basev1.NetworkInstance{allocated},
 	}}
 	destination := t.TempDir()
 
@@ -74,7 +74,7 @@ func TestDeployedServicePublishesAllocatedPort(t *testing.T) {
 		promotablePostgresSecretReferences(),
 	))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	service := parseRenderedService(t, destination)
 	require.Equal(t, []renderedServicePort{{Name: "postgres", Port: 80, TargetPort: 5432}}, service.Spec.Ports)
@@ -94,7 +94,7 @@ func TestNativePortDeploymentRendersUnchangedService(t *testing.T) {
 		promotablePostgresSecretReferences(),
 	))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	want := `
 apiVersion: v1
@@ -148,7 +148,7 @@ func TestDeploymentTemplatesWithoutBootstrap(t *testing.T) {
 func TestPromotableDeploymentUsesTypedSecretReferencesWithoutValues(t *testing.T) {
 	ctx := context.Background()
 	builder := NewBuilder()
-	identity := &basev0.ServiceIdentity{
+	identity := &basev1.ServiceIdentity{
 		Workspace: "workspace",
 		Module:    "module",
 		Name:      "store",
@@ -162,7 +162,7 @@ func TestPromotableDeploymentUsesTypedSecretReferencesWithoutValues(t *testing.T
 		Service: resources.ToServiceWithCase(builder.Identity),
 		Module:  resources.ToModuleWithCase(builder.Identity),
 	}
-	builder.TcpEndpoint = &basev0.Endpoint{
+	builder.TcpEndpoint = &basev1.Endpoint{
 		Name:    "tcp",
 		Module:  identity.Module,
 		Service: identity.Name,
@@ -170,7 +170,7 @@ func TestPromotableDeploymentUsesTypedSecretReferencesWithoutValues(t *testing.T
 	}
 	instance := resources.NewNetworkInstance("store.platform.svc.cluster.local", 5432)
 	instance.Access = resources.NewPublicNetworkAccess()
-	secretReferences := make(map[string]*builderv0.KubernetesSecretKeyReference)
+	secretReferences := make(map[string]*builderv1.KubernetesSecretKeyReference)
 	for _, key := range []string{
 		"POSTGRES_USER",
 		"POSTGRES_PASSWORD",
@@ -178,27 +178,27 @@ func TestPromotableDeploymentUsesTypedSecretReferencesWithoutValues(t *testing.T
 		"POSTGRES_READ_WRITE_PASSWORD",
 	} {
 		configurationKey := resources.ServiceSecretConfigurationKeyFromUnique(builder.Unique(), "postgres", key)
-		secretReferences[configurationKey] = &builderv0.KubernetesSecretKeyReference{
+		secretReferences[configurationKey] = &builderv1.KubernetesSecretKeyReference{
 			Name: "store-secrets",
 			Key:  configurationKey,
 		}
 	}
 	destination := t.TempDir()
 
-	response, err := builder.Deploy(ctx, &builderv0.DeploymentRequest{
-		Environment:   &basev0.Environment{Name: "local"},
+	response, err := builder.Deploy(ctx, &builderv1.DeploymentRequest{
+		Environment:   &basev1.Environment{Name: "local"},
 		Configuration: inClusterServiceConfiguration(),
-		NetworkMappings: []*basev0.NetworkMapping{{
+		NetworkMappings: []*basev1.NetworkMapping{{
 			Endpoint:  builder.TcpEndpoint,
-			Instances: []*basev0.NetworkInstance{instance},
+			Instances: []*basev1.NetworkInstance{instance},
 		}},
-		Deployment: &builderv0.Deployment{Kind: &builderv0.Deployment_Kubernetes{
-			Kubernetes: &builderv0.KubernetesDeployment{
+		Deployment: &builderv1.Deployment{Kind: &builderv1.Deployment_Kubernetes{
+			Kubernetes: &builderv1.KubernetesDeployment{
 				Namespace:        "platform",
 				Destination:      destination,
-				Profile:          builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1,
+				Profile:          builderv1.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1,
 				SecretReferences: secretReferences,
-				BuildContext: &builderv0.DockerBuildContext{
+				BuildContext: &builderv1.DockerBuildContext{
 					DockerRepository: "registry.example.com",
 					ImageDigest:      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				},
@@ -208,7 +208,7 @@ func TestPromotableDeploymentUsesTypedSecretReferencesWithoutValues(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.GetState().GetState() != builderv0.DeploymentStatus_SUCCESS {
+	if response.GetState().GetState() != builderv1.DeploymentStatus_SUCCESS {
 		t.Fatalf("deployment failed: %s", response.GetState().GetMessage())
 	}
 	if !response.GetDeployment().GetKubernetes().GetValidation().GetRestricted() {
@@ -256,14 +256,14 @@ func TestEphemeralDeploymentRetainsValueBasedConfigurationAndSecret(t *testing.T
 	builder.DatabaseName = "accounts"
 	destination := t.TempDir()
 	request := promotableDeploymentRequest(destination, networkMappings, nil)
-	request.GetDeployment().GetKubernetes().Profile = builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_EPHEMERAL_LOCAL_APPLY_V1
+	request.GetDeployment().GetKubernetes().Profile = builderv1.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_EPHEMERAL_LOCAL_APPLY_V1
 	request.GetDeployment().GetKubernetes().BuildContext.ImageDigest = ""
 	request.Configuration = testPostgresConfiguration("migration-owner", "owner-secret", "reader-secret", "writer-secret")
 	request.Configuration.Infos = append(request.Configuration.Infos, inClusterServiceConfiguration().Infos...)
 
 	response, err := builder.Deploy(context.Background(), request)
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	require.False(t, response.GetDeployment().GetKubernetes().GetValidation().GetRestricted())
 	require.NotEmpty(t, configurationValue(t, response.GetConfiguration(), ownerConnectionKey))
 
@@ -325,13 +325,13 @@ func TestPromotableGitOpsDeploymentReturnsReferenceOnlyConfigurationAndScopesSec
 		promotablePostgresSecretReferences(),
 	))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	output := response.GetDeployment().GetKubernetes()
-	require.Equal(t, builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1, output.GetProfile())
+	require.Equal(t, builderv1.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1, output.GetProfile())
 	require.Equal(t, services.KubernetesManifestContractVersion, output.GetContractVersion())
-	require.Equal(t, builderv0.KubernetesManifestValidation_STATUS_PASSED, output.GetValidation().GetStaticValidation())
-	require.Equal(t, builderv0.KubernetesManifestValidation_STATUS_NOT_RUN, output.GetValidation().GetServerSideValidation())
+	require.Equal(t, builderv1.KubernetesManifestValidation_STATUS_PASSED, output.GetValidation().GetStaticValidation())
+	require.Equal(t, builderv1.KubernetesManifestValidation_STATUS_NOT_RUN, output.GetValidation().GetServerSideValidation())
 	require.True(t, output.GetValidation().GetRestricted())
 
 	configuration := response.GetConfiguration()
@@ -342,7 +342,7 @@ func TestPromotableGitOpsDeploymentReturnsReferenceOnlyConfigurationAndScopesSec
 	values := configuration.GetInfos()[0].GetConfigurationValues()
 	require.Len(t, values, 2)
 	for _, key := range []string{readOnlyConnectionKey, readWriteConnectionKey} {
-		var matched *basev0.ConfigurationValue
+		var matched *basev1.ConfigurationValue
 		for _, value := range values {
 			if value.GetKey() == key {
 				matched = value
@@ -441,7 +441,7 @@ func TestPromotableBootstrapJobIdentityChangesWithImageDigest(t *testing.T) {
 
 		response, err := builder.Deploy(context.Background(), request)
 		require.NoError(t, err)
-		require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 		return readDeploymentFile(t, destination, "base", "job.yaml")
 	}
 
@@ -451,7 +451,7 @@ func TestPromotableBootstrapJobIdentityChangesWithImageDigest(t *testing.T) {
 }
 
 func TestPromotableBootstrapJobIdentityChangesWithImmutablePodTemplate(t *testing.T) {
-	render := func(configure func(*Builder, *builderv0.DeploymentRequest)) string {
+	render := func(configure func(*Builder, *builderv1.DeploymentRequest)) string {
 		t.Helper()
 		builder, networkMappings := newDeploymentTestBuilder(t)
 		destination := t.TempDir()
@@ -461,24 +461,24 @@ func TestPromotableBootstrapJobIdentityChangesWithImmutablePodTemplate(t *testin
 		}
 		response, err := builder.Deploy(context.Background(), request)
 		require.NoError(t, err)
-		require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 		return readDeploymentFile(t, destination, "base", "job.yaml")
 	}
 
 	baseline := bootstrapJobResourceName(t, render(nil))
 	require.Equal(t, baseline, bootstrapJobResourceName(t, render(nil)))
-	for name, configure := range map[string]func(*Builder, *builderv0.DeploymentRequest){
-		"image repository": func(_ *Builder, request *builderv0.DeploymentRequest) {
+	for name, configure := range map[string]func(*Builder, *builderv1.DeploymentRequest){
+		"image repository": func(_ *Builder, request *builderv1.DeploymentRequest) {
 			request.GetDeployment().GetKubernetes().BuildContext.DockerRepository = "mirror.example.com"
 		},
-		"Secret references": func(_ *Builder, request *builderv0.DeploymentRequest) {
+		"Secret references": func(_ *Builder, request *builderv1.DeploymentRequest) {
 			for _, reference := range request.GetDeployment().GetKubernetes().SecretReferences {
 				if reference.GetName() == "postgres-secrets" {
 					reference.Name = "renamed-postgres-secrets"
 				}
 			}
 		},
-		"database name": func(builder *Builder, _ *builderv0.DeploymentRequest) {
+		"database name": func(builder *Builder, _ *builderv1.DeploymentRequest) {
 			builder.DatabaseName = "accounts"
 		},
 	} {
@@ -504,9 +504,9 @@ func TestPromotableGitOpsDeploymentReportsExplicitValidationContext(t *testing.T
 
 	response, err := builder.Deploy(context.Background(), request)
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	validation := response.GetDeployment().GetKubernetes().GetValidation()
-	require.Equal(t, builderv0.KubernetesManifestValidation_STATUS_PASSED, validation.GetServerSideValidation())
+	require.Equal(t, builderv1.KubernetesManifestValidation_STATUS_PASSED, validation.GetServerSideValidation())
 	require.Equal(t, "k3d-codefly-test", validation.GetValidatedContext())
 	require.True(t, validation.GetRestricted())
 }
@@ -535,7 +535,7 @@ func TestPromotableGitOpsDeploymentRejectsMissingOrOptionalRequiredSecretReferen
 				references,
 			))
 			require.NoError(t, err)
-			require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
+			require.Equal(t, builderv1.DeploymentStatus_ERROR, response.GetState().GetState())
 			require.Contains(t, response.GetState().GetMessage(), "requires a typed Kubernetes Secret reference for "+configurationKey)
 			require.Nil(t, response.GetConfiguration())
 		})
@@ -556,7 +556,7 @@ func TestPromotableGitOpsDeploymentRejectsMissingOrOptionalRequiredSecretReferen
 				references,
 			))
 			require.NoError(t, err)
-			require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
+			require.Equal(t, builderv1.DeploymentStatus_ERROR, response.GetState().GetState())
 			require.Contains(t, response.GetState().GetMessage(), configurationKey+" Kubernetes Secret reference must not be optional")
 			require.Nil(t, response.GetConfiguration())
 		})
@@ -575,7 +575,7 @@ func TestPromotableExternalIdentityDeploymentPromotesNoCredentialSecrets(t *test
 		nil,
 	))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	values := response.GetConfiguration().GetInfos()[0].GetConfigurationValues()
 	require.Len(t, values, 2)
@@ -611,16 +611,16 @@ func TestPromotableDeploymentRejectsUnsupportedAuthMode(t *testing.T) {
 		promotablePostgresSecretReferences(),
 	))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.DeploymentStatus_ERROR, response.GetState().GetState())
 	require.Contains(t, response.GetState().GetMessage(), `unsupported postgres auth mode "external-idenity"`)
 	require.Nil(t, response.GetConfiguration())
 }
 
-func newDeploymentTestBuilder(t *testing.T) (*Builder, []*basev0.NetworkMapping) {
+func newDeploymentTestBuilder(t *testing.T) (*Builder, []*basev1.NetworkMapping) {
 	t.Helper()
 	ctx := context.Background()
 	builder := NewBuilder()
-	identity := &basev0.ServiceIdentity{
+	identity := &basev1.ServiceIdentity{
 		Workspace: "workspace",
 		Module:    "module",
 		Name:      "postgres",
@@ -633,7 +633,7 @@ func newDeploymentTestBuilder(t *testing.T) (*Builder, []*basev0.NetworkMapping)
 	}
 	builder.EnvironmentVariables.SetIdentity(identity)
 	builder.DatabaseName = "test"
-	builder.TcpEndpoint = &basev0.Endpoint{
+	builder.TcpEndpoint = &basev1.Endpoint{
 		Name:    "tcp",
 		Module:  identity.Module,
 		Service: identity.Name,
@@ -641,32 +641,32 @@ func newDeploymentTestBuilder(t *testing.T) (*Builder, []*basev0.NetworkMapping)
 	}
 	instance := resources.NewNetworkInstance("postgres.example.com", 5432)
 	instance.Access = resources.NewPublicNetworkAccess()
-	return builder, []*basev0.NetworkMapping{{
+	return builder, []*basev1.NetworkMapping{{
 		Endpoint:  builder.TcpEndpoint,
-		Instances: []*basev0.NetworkInstance{instance},
+		Instances: []*basev1.NetworkInstance{instance},
 	}}
 }
 
 func promotableDeploymentRequest(
 	destination string,
-	networkMappings []*basev0.NetworkMapping,
-	secretReferences map[string]*builderv0.KubernetesSecretKeyReference,
-) *builderv0.DeploymentRequest {
+	networkMappings []*basev1.NetworkMapping,
+	secretReferences map[string]*builderv1.KubernetesSecretKeyReference,
+) *builderv1.DeploymentRequest {
 	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	return &builderv0.DeploymentRequest{
-		Environment:     &basev0.Environment{Name: "test"},
+	return &builderv1.DeploymentRequest{
+		Environment:     &basev1.Environment{Name: "test"},
 		NetworkMappings: networkMappings,
 		// The environment says the store runs in the cluster (managed.go); a
 		// request saying nothing is refused, so every in-cluster render test
 		// starts from the declaration a render would carry.
 		Configuration: inClusterServiceConfiguration(),
-		Deployment: &builderv0.Deployment{
-			Kind: &builderv0.Deployment_Kubernetes{
-				Kubernetes: &builderv0.KubernetesDeployment{
+		Deployment: &builderv1.Deployment{
+			Kind: &builderv1.Deployment_Kubernetes{
+				Kubernetes: &builderv1.KubernetesDeployment{
 					Namespace:        "codefly-test",
 					Destination:      destination,
-					BuildContext:     &builderv0.DockerBuildContext{DockerRepository: "registry.example.com", ImageDigest: digest},
-					Profile:          builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1,
+					BuildContext:     &builderv1.DockerBuildContext{DockerRepository: "registry.example.com", ImageDigest: digest},
+					Profile:          builderv1.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1,
 					SecretReferences: secretReferences,
 				},
 			},
@@ -674,8 +674,8 @@ func promotableDeploymentRequest(
 	}
 }
 
-func promotablePostgresSecretReferences() map[string]*builderv0.KubernetesSecretKeyReference {
-	references := map[string]*builderv0.KubernetesSecretKeyReference{
+func promotablePostgresSecretReferences() map[string]*builderv1.KubernetesSecretKeyReference {
+	references := map[string]*builderv1.KubernetesSecretKeyReference{
 		"UNRELATED_SECRET": {Name: "unrelated-secret", Key: "token"},
 	}
 	for _, environmentVariable := range []string{
@@ -691,7 +691,7 @@ func promotablePostgresSecretReferences() map[string]*builderv0.KubernetesSecret
 			"postgres",
 			environmentVariable,
 		)
-		references[configurationKey] = &builderv0.KubernetesSecretKeyReference{
+		references[configurationKey] = &builderv1.KubernetesSecretKeyReference{
 			Name: "postgres-secrets",
 			Key:  configurationKey,
 		}

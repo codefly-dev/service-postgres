@@ -26,7 +26,7 @@ jobs:
     needs: image
     permissions:
       contents: read
-    uses: codefly-dev/core/.github/workflows/go-service-ci.yml@f16e045805dbd213cdbebf98d5f7cbe802496d7c
+    uses: codefly-dev/core/.github/workflows/go-service-ci.yml@18555ee1d782b6b37957d16c0a9195f7cd6f44ed
 
   # The jobs below ran as one serial job; the unit tests and the runtime
   # library need neither the image nor each other, so they run beside it. What

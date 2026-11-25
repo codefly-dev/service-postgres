@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
+	agentv1 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v1"
 )
 
 // hostResourceRecoveryCapability lets a host require recovery of this agent's
@@ -38,8 +38,8 @@ func (r hostResourceRecovery) summary() string {
 		r.SharedSegments, r.SemaphoreSets)
 }
 
-func recoverHostResourcesCommand() *agentv0.CommandDefinition {
-	return &agentv0.CommandDefinition{
+func recoverHostResourcesCommand() *agentv1.CommandDefinition {
+	return &agentv1.CommandDefinition{
 		Name:        recoverHostResourcesCommandName,
 		Description: "Remove host IPC resources leaked by an interrupted native run of this service",
 		Usage:       recoverHostResourcesCommandName,

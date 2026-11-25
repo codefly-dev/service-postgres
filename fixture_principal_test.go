@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/shared"
 	"github.com/lib/pq"
@@ -44,7 +44,7 @@ const fixtureTestPassword = "fixture-password"
 func (f *postgresFixture) askForFixturePrincipal() {
 	values := f.configuration.Infos[0]
 	values.ConfigurationValues = append(values.ConfigurationValues,
-		&basev0.ConfigurationValue{Key: fixturePasswordKey, Value: fixtureTestPassword, Secret: true})
+		&basev1.ConfigurationValue{Key: fixturePasswordKey, Value: fixtureTestPassword, Secret: true})
 }
 
 func (f *postgresFixture) withdrawFixturePrincipal() {
@@ -60,7 +60,7 @@ func (f *postgresFixture) withdrawFixturePrincipal() {
 
 // exportedConnection is one connection the agent handed out at Init, or empty
 // when it handed out none under that key.
-func exportedConnection(t *testing.T, ctx context.Context, init *runtimev0.InitResponse, key string) string {
+func exportedConnection(t *testing.T, ctx context.Context, init *runtimev1.InitResponse, key string) string {
 	t.Helper()
 	configuration, err := resources.ExtractConfiguration(init.RuntimeConfigurations, resources.NewRuntimeContextNative())
 	require.NoError(t, err)
@@ -83,7 +83,7 @@ func roleExists(t *testing.T, ctx context.Context, connection, role string) bool
 // login that writes and reads across a FORCEd row-security policy, which binds
 // every other principal; the owner connection keeps its meaning; and the
 // principal is gone once the service is released.
-func assertFixturePrincipal(t *testing.T, runtimeContext *basev0.RuntimeContext) {
+func assertFixturePrincipal(t *testing.T, runtimeContext *basev1.RuntimeContext) {
 	ctx := context.Background()
 	fixture := newPostgresFixture(t, ctx, runtimeContext)
 	fixture.environment.NamingScope = fmt.Sprintf("invfixture%d", time.Now().UnixNano()%1_000_000)
@@ -91,7 +91,7 @@ func assertFixturePrincipal(t *testing.T, runtimeContext *basev0.RuntimeContext)
 	fixture.askForFixturePrincipal()
 
 	runtime, init := fixture.start(t, ctx)
-	require.Equal(t, runtimev0.InitStatus_READY, init.GetStatus().GetState(), init.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.InitStatus_READY, init.GetStatus().GetState(), init.GetStatus().GetMessage())
 	fixtureConnection := exportedConnection(t, ctx, init, fixtureConnectionKey)
 	require.NotEmpty(t, fixtureConnection, "a disposable run that asks is handed %s", fixtureConnectionKey)
 	ownerConnection := exportedConnection(t, ctx, init, ownerConnectionKey)
@@ -185,12 +185,12 @@ func assertFixturePrincipal(t *testing.T, runtimeContext *basev0.RuntimeContext)
 
 	// The principal goes when the service is released: the same state, started
 	// again by a run that does not ask, holds no such role.
-	stopped, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+	stopped, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
 	fixture.withdrawFixturePrincipal()
 	restarted, again := fixture.start(t, ctx)
-	require.Equal(t, runtimev0.InitStatus_READY, again.GetStatus().GetState(), again.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.InitStatus_READY, again.GetStatus().GetState(), again.GetStatus().GetMessage())
 	require.Empty(t, exportedConnection(t, ctx, again, fixtureConnectionKey), "a run that does not ask is handed no fixture connection")
 	require.False(t, roleExists(t, ctx, restarted.connection, role), "the fixture principal must not outlive the service that asked for it")
 	require.Error(t, connects(ctx, fixtureConnection), "the connection handed out earlier no longer authenticates")
@@ -207,34 +207,34 @@ func assertFixturePrincipal(t *testing.T, runtimeContext *basev0.RuntimeContext)
 	// in the state it left. The same run starts over it, and a start that does
 	// not ask removes it.
 	earlier := []*Runtime{runtime, restarted}
-	_, err = restarted.Stop(ctx, &runtimev0.StopRequest{})
+	_, err = restarted.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
 	fixture.askForFixturePrincipal()
 	interrupted, _ := fixture.start(t, ctx)
 	interrupted.fixtureProvisioned = false
-	_, err = interrupted.Stop(ctx, &runtimev0.StopRequest{})
+	_, err = interrupted.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
 	resumed, init := fixture.start(t, ctx)
-	require.Equal(t, runtimev0.InitStatus_READY, init.GetStatus().GetState(), init.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.InitStatus_READY, init.GetStatus().GetState(), init.GetStatus().GetMessage())
 	require.NoError(t, connects(ctx, exportedConnection(t, ctx, init, fixtureConnectionKey)), "the run starts over the principal it left")
 	resumed.fixtureProvisioned = false
-	_, err = resumed.Stop(ctx, &runtimev0.StopRequest{})
+	_, err = resumed.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
 	earlier = append(earlier, interrupted, resumed)
 	fixture.withdrawFixturePrincipal()
 	restarted, again = fixture.start(t, ctx)
-	require.Equal(t, runtimev0.InitStatus_READY, again.GetStatus().GetState(), again.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.InitStatus_READY, again.GetStatus().GetState(), again.GetStatus().GetMessage())
 	require.False(t, roleExists(t, ctx, restarted.connection, role), "a start that does not ask removes the principal an interrupted run left")
 
 	// Each invocation that used the run's state claims it until it is destroyed.
 	for _, invocation := range earlier {
-		_, err = invocation.Destroy(ctx, &runtimev0.DestroyRequest{})
+		_, err = invocation.Destroy(ctx, &runtimev1.DestroyRequest{})
 		require.NoError(t, err)
 	}
 	native := restarted.nativeRoot
-	destroyed, err := restarted.Destroy(ctx, &runtimev0.DestroyRequest{})
+	destroyed, err := restarted.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
 	if native != "" {
 		require.NoDirExists(t, native, "a disposable run's server goes with the run, and every role on it")
 	}
@@ -244,7 +244,7 @@ func assertFixturePrincipal(t *testing.T, runtimeContext *basev0.RuntimeContext)
 // developer's is refused the principal by name, before anything is started,
 // whether it has no naming scope or one its caller named. Without the ask the
 // same run starts and holds no such role.
-func assertFixturePrincipalIsRefusedToAPersistentRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
+func assertFixturePrincipalIsRefusedToAPersistentRun(t *testing.T, runtimeContext *basev1.RuntimeContext) {
 	ctx := context.Background()
 	fixture := newPostgresFixture(t, ctx, runtimeContext)
 	fixture.askForFixturePrincipal()
@@ -252,20 +252,20 @@ func assertFixturePrincipalIsRefusedToAPersistentRun(t *testing.T, runtimeContex
 	for _, scope := range []string{"", "named-by-a-developer"} {
 		fixture.environment.NamingScope = scope
 		runtime := NewRuntime()
-		_, err := runtime.Load(ctx, &runtimev0.LoadRequest{
+		_, err := runtime.Load(ctx, &runtimev1.LoadRequest{
 			Identity:     fixture.identity,
 			Environment:  shared.Must(fixture.environment.Proto()),
 			DisableCatch: true,
 		})
 		require.NoError(t, err)
-		t.Cleanup(func() { _, _ = runtime.Destroy(context.Background(), &runtimev0.DestroyRequest{}) })
-		init, err := runtime.Init(ctx, &runtimev0.InitRequest{
+		t.Cleanup(func() { _, _ = runtime.Destroy(context.Background(), &runtimev1.DestroyRequest{}) })
+		init, err := runtime.Init(ctx, &runtimev1.InitRequest{
 			RuntimeContext:          fixture.runtimeContext,
 			Configuration:           fixture.configuration,
 			ProposedNetworkMappings: fixture.networkMappings,
 		})
 		require.NoError(t, err)
-		require.Equal(t, runtimev0.InitStatus_ERROR, init.GetStatus().GetState(), "scope %q", scope)
+		require.Equal(t, runtimev1.InitStatus_ERROR, init.GetStatus().GetState(), "scope %q", scope)
 		message := init.GetStatus().GetMessage()
 		require.Contains(t, message, "fixture principal")
 		require.Contains(t, message, fixturePasswordKey, "the refusal names what asked")
@@ -273,7 +273,7 @@ func assertFixturePrincipalIsRefusedToAPersistentRun(t *testing.T, runtimeContex
 		require.NotContains(t, message, fixtureTestPassword)
 		require.Empty(t, init.RuntimeConfigurations, "a refused run is handed no connection at all")
 		requireNoListener(t, fixture.address)
-		stopped, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+		stopped, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 		require.NoError(t, err)
 		require.Equal(t, "no postgres owned by this invocation; database state retained", stopped.GetStatus().GetMessage(),
 			"the refusal comes before anything is started")
@@ -282,7 +282,7 @@ func assertFixturePrincipalIsRefusedToAPersistentRun(t *testing.T, runtimeContex
 	fixture.environment.NamingScope = ""
 	fixture.withdrawFixturePrincipal()
 	runtime, init := fixture.start(t, ctx)
-	require.Equal(t, runtimev0.InitStatus_READY, init.GetStatus().GetState(), init.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.InitStatus_READY, init.GetStatus().GetState(), init.GetStatus().GetMessage())
 	require.Empty(t, exportedConnection(t, ctx, init, fixtureConnectionKey))
 	require.False(t, roleExists(t, ctx, runtime.connection, fixtureRole(runtime.DatabaseName)),
 		"a developer's database never holds a fixture principal")

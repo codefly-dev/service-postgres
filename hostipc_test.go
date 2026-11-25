@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/codefly-dev/core/agents/contract"
-	agentv0 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v0"
+	agentv1 "github.com/codefly-dev/core/generated/go/codefly/services/agent/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -15,7 +15,7 @@ import (
 // becomes this agent's to restate — and a host reads a dropped capability as
 // an agent that cannot do the thing, not as an oversight.
 func TestDeclaredContractCarriesTheSharedPromisesForward(t *testing.T) {
-	information, err := NewService().GetAgentInformation(t.Context(), &agentv0.AgentInformationRequest{})
+	information, err := NewService().GetAgentInformation(t.Context(), &agentv1.AgentInformationRequest{})
 	require.NoError(t, err)
 
 	declared := information.GetContract()
@@ -34,14 +34,14 @@ func TestDeclaredContractCarriesTheSharedPromisesForward(t *testing.T) {
 func TestAdvertisedHostResourceRecoveryIsServedByACommand(t *testing.T) {
 	service := NewService()
 
-	information, err := service.GetAgentInformation(t.Context(), &agentv0.AgentInformationRequest{})
+	information, err := service.GetAgentInformation(t.Context(), &agentv1.AgentInformationRequest{})
 	require.NoError(t, err)
 	require.NoError(t, contract.Check(information.GetContract(), hostResourceRecoveryCapability))
 
-	commands, err := service.ListCommands(t.Context(), &agentv0.ListCommandsRequest{})
+	commands, err := service.ListCommands(t.Context(), &agentv1.ListCommandsRequest{})
 	require.NoError(t, err)
 
-	var recovery *agentv0.CommandDefinition
+	var recovery *agentv1.CommandDefinition
 	for _, command := range commands.GetCommands() {
 		if command.GetName() == recoverHostResourcesCommandName {
 			recovery = command
@@ -59,7 +59,7 @@ func TestAdvertisedHostResourceRecoveryIsServedByACommand(t *testing.T) {
 // asks for a command this agent does not serve has to be told so, rather than
 // reading an empty success as a completed recovery.
 func TestUnknownCommandIsRefused(t *testing.T) {
-	response, err := NewService().RunPluginCommand(t.Context(), &agentv0.RunPluginCommandRequest{
+	response, err := NewService().RunPluginCommand(t.Context(), &agentv1.RunPluginCommandRequest{
 		Command: "not-a-command",
 	})
 	require.NoError(t, err)

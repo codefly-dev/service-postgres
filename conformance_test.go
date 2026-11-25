@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -79,7 +79,7 @@ func TestRestrictedRenderCarriesNoTransportBindings(t *testing.T) {
 		promotablePostgresSecretReferences(),
 	))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	require.NoError(t, filepath.WalkDir(destination, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {

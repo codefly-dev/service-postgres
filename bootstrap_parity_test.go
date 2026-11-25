@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/agents/services"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/stretchr/testify/require"
 )
@@ -187,7 +187,7 @@ func applyLocally(ctx context.Context, t *testing.T, location string, settings *
 func buildBootstrapImage(ctx context.Context, t *testing.T, location string, settings *Settings) string {
 	t.Helper()
 	builder := NewBuilder()
-	require.NoError(t, builder.HeadlessLoad(ctx, &basev0.ServiceIdentity{
+	require.NoError(t, builder.HeadlessLoad(ctx, &basev1.ServiceIdentity{
 		Workspace: "workspace", Module: "module", Name: "store", Version: "1.2.3",
 	}))
 	builder.Information = &services.Information{
@@ -200,7 +200,7 @@ func buildBootstrapImage(ctx context.Context, t *testing.T, location string, set
 	outputDirectory := t.TempDir()
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
 
 	tag := uniqueDockerName("service-postgres-parity:")
@@ -389,7 +389,7 @@ func TestBootstrapImageRefusesDriftedStagedSources(t *testing.T) {
 	settings := &Settings{DatabaseName: parityDatabase}
 
 	builder := NewBuilder()
-	require.NoError(t, builder.HeadlessLoad(ctx, &basev0.ServiceIdentity{
+	require.NoError(t, builder.HeadlessLoad(ctx, &basev1.ServiceIdentity{
 		Workspace: "workspace", Module: "module", Name: "store", Version: "1.2.3",
 	}))
 	builder.Information = &services.Information{
@@ -402,7 +402,7 @@ func TestBootstrapImageRefusesDriftedStagedSources(t *testing.T) {
 	outputDirectory := t.TempDir()
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	// Exactly what a concurrent build, a stray editor write, or a partly copied
 	// context leaves behind.
@@ -456,7 +456,7 @@ func TestBootstrapImageBuildsTheWayTheCLIBuildsIt(t *testing.T) {
 		[]byte("POSTGRES_PASSWORD=super-secret\n"), 0o600))
 
 	builder := NewBuilder()
-	require.NoError(t, builder.HeadlessLoad(ctx, &basev0.ServiceIdentity{
+	require.NoError(t, builder.HeadlessLoad(ctx, &basev1.ServiceIdentity{
 		Workspace: "workspace", Module: "module", Name: "store", Version: "1.2.3",
 	}))
 	builder.Information = &services.Information{
@@ -469,7 +469,7 @@ func TestBootstrapImageBuildsTheWayTheCLIBuildsIt(t *testing.T) {
 	outputDirectory := t.TempDir()
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	recipe := response.GetResult().GetDockerBuildPlan().GetRecipes()[0]
 	require.NotEmpty(t, recipe.GetDockerignore())

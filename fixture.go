@@ -39,7 +39,7 @@ import (
 	"fmt"
 	"time"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/runners/runstate"
 	"github.com/codefly-dev/core/wool"
@@ -68,7 +68,7 @@ func fixtureRole(database string) string {
 // admitFixturePrincipal refuses a run that asks for the fixture principal and
 // is not disposable. It reads the ask alone, before any credential is loaded or
 // any server reached, so a refused run has started nothing.
-func (s *Runtime) admitFixturePrincipal(ctx context.Context, configuration *basev0.Configuration) error {
+func (s *Runtime) admitFixturePrincipal(ctx context.Context, configuration *basev1.Configuration) error {
 	if configuration == nil {
 		return nil
 	}
@@ -94,12 +94,12 @@ func (s *Service) fixtureRequested() bool {
 
 // withFixtureConnection adds the fixture principal's connection to what Init
 // hands out for one network instance.
-func (s *Service) withFixtureConnection(configuration *basev0.Configuration, instance *basev0.NetworkInstance) {
+func (s *Service) withFixtureConnection(configuration *basev1.Configuration, instance *basev1.NetworkInstance) {
 	connection := postgresConnectionString(instance.Address, s.DatabaseName, fixtureRole(s.DatabaseName), s.fixturePassword, false, false)
 	for _, info := range configuration.Infos {
 		if info.Name == "postgres" {
 			info.ConfigurationValues = append(info.ConfigurationValues,
-				&basev0.ConfigurationValue{Key: fixtureConnectionKey, Value: connection, Secret: true})
+				&basev1.ConfigurationValue{Key: fixtureConnectionKey, Value: connection, Secret: true})
 		}
 	}
 }

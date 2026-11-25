@@ -6,7 +6,7 @@ import (
 	"slices"
 
 	coreservices "github.com/codefly-dev/core/agents/services"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 )
 
 // postgresSecretConfiguration is the one secret configuration group this agent
@@ -53,8 +53,8 @@ func (s *Service) requiredSecretConfigurationKeys() []string {
 // the requested environment needs from the host, without running a build. Every
 // answer comes from the loaded service's own settings: this probe reaches no
 // cluster, no registry and no database.
-func (s *Builder) BuildCapabilities(_ context.Context, req *builderv0.BuildCapabilitiesRequest) (*builderv0.BuildCapabilitiesResponse, error) {
-	response := &builderv0.BuildCapabilitiesResponse{
+func (s *Builder) BuildCapabilities(_ context.Context, req *builderv1.BuildCapabilitiesRequest) (*builderv1.BuildCapabilitiesResponse, error) {
+	response := &builderv1.BuildCapabilitiesResponse{
 		BuildxSelection:    true,
 		ExecutionContracts: []string{coreservices.SecretRequirementsContract},
 	}
@@ -63,7 +63,7 @@ func (s *Builder) BuildCapabilities(_ context.Context, req *builderv0.BuildCapab
 		return nil, err
 	}
 	if required != nil {
-		response.RequiredSecretConfigurations = []*builderv0.RequiredSecretConfiguration{required}
+		response.RequiredSecretConfigurations = []*builderv1.RequiredSecretConfiguration{required}
 	}
 	return response, nil
 }
@@ -73,7 +73,7 @@ func (s *Builder) BuildCapabilities(_ context.Context, req *builderv0.BuildCapab
 // all. The answer holds in every environment: whether a store is managed there
 // is the environment's declaration at render time (managed.go), and a managed
 // render references no credential either way.
-func (s *Builder) requiredSecretConfiguration() (*builderv0.RequiredSecretConfiguration, error) {
+func (s *Builder) requiredSecretConfiguration() (*builderv1.RequiredSecretConfiguration, error) {
 	if err := s.validateAuthMode(); err != nil {
 		return nil, err
 	}
@@ -81,14 +81,14 @@ func (s *Builder) requiredSecretConfiguration() (*builderv0.RequiredSecretConfig
 	if len(keys) == 0 {
 		return nil, nil
 	}
-	required := &builderv0.RequiredSecretConfiguration{
+	required := &builderv1.RequiredSecretConfiguration{
 		Configuration: postgresSecretConfiguration,
 		Keys:          keys,
 		// Only the secret-free contract references a credential through a
 		// secretKeyRef the host must have filled; a local apply carries the
 		// value inline, from the same configuration flow that runs the service.
-		Profiles: []builderv0.KubernetesOutputProfile{
-			builderv0.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1,
+		Profiles: []builderv1.KubernetesOutputProfile{
+			builderv1.KubernetesOutputProfile_KUBERNETES_OUTPUT_PROFILE_RESTRICTED_PORTABLE_V1,
 		},
 	}
 	if err := coreservices.ValidateRequiredSecretConfiguration(required); err != nil {

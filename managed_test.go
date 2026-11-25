@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
@@ -25,12 +25,12 @@ const (
 	testRuntime         = "obin-test-1b1b1b@obin-test-data.iam.gserviceaccount.com"
 )
 
-func managedServiceConfiguration(values map[string]string) *basev0.Configuration {
-	information := &basev0.ConfigurationInformation{Name: managedServiceInformation}
+func managedServiceConfiguration(values map[string]string) *basev1.Configuration {
+	information := &basev1.ConfigurationInformation{Name: managedServiceInformation}
 	for key, value := range values {
-		information.ConfigurationValues = append(information.ConfigurationValues, &basev0.ConfigurationValue{Key: key, Value: value})
+		information.ConfigurationValues = append(information.ConfigurationValues, &basev1.ConfigurationValue{Key: key, Value: value})
 	}
-	return &basev0.Configuration{Infos: []*basev0.ConfigurationInformation{information}}
+	return &basev1.Configuration{Infos: []*basev1.ConfigurationInformation{information}}
 }
 
 func completeManagedValues() map[string]string {
@@ -44,8 +44,8 @@ func completeManagedValues() map[string]string {
 
 // inClusterServiceConfiguration is the environment's explicit statement that
 // this store's server runs in the cluster.
-func inClusterServiceConfiguration() *basev0.Configuration {
-	return &basev0.Configuration{Infos: []*basev0.ConfigurationInformation{{Name: inClusterServiceInformation}}}
+func inClusterServiceConfiguration() *basev1.Configuration {
+	return &basev1.Configuration{Infos: []*basev1.ConfigurationInformation{{Name: inClusterServiceInformation}}}
 }
 
 // The mode is explicit in both directions: an environment that says nothing
@@ -56,10 +56,10 @@ func TestAnEnvironmentDeclaresManagedOrInClusterAndNothingIsRefused(t *testing.T
 	require.NoError(t, err)
 	require.Nil(t, managed)
 
-	for name, configuration := range map[string]*basev0.Configuration{
+	for name, configuration := range map[string]*basev1.Configuration{
 		"nothing":            nil,
-		"only own values":    {Infos: []*basev0.ConfigurationInformation{{Name: "postgres"}}},
-		"a misspelled block": {Infos: []*basev0.ConfigurationInformation{{Name: "in-cluster-services"}}},
+		"only own values":    {Infos: []*basev1.ConfigurationInformation{{Name: "postgres"}}},
+		"a misspelled block": {Infos: []*basev1.ConfigurationInformation{{Name: "in-cluster-services"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := storeDeploymentOf(configuration, "blue")
@@ -132,7 +132,7 @@ func TestManagedTemplateSetCannotDeployPostgres(t *testing.T) {
 
 // managedTestBuilder is a builder with one migration, the store a managed
 // render stages and binds.
-func managedTestBuilder(t *testing.T) (*Builder, []*basev0.NetworkMapping) {
+func managedTestBuilder(t *testing.T) (*Builder, []*basev1.NetworkMapping) {
 	t.Helper()
 	builder, networkMappings := newDeploymentTestBuilder(t)
 	builder.Location = t.TempDir()
@@ -229,7 +229,7 @@ func TestManagedRenderIsTheMigrationJobAlone(t *testing.T) {
 
 	response, err := builder.Deploy(context.Background(), request)
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	kinds, job, account := renderedManagedObjects(t, destination)
 	require.ElementsMatch(t, []string{"Job", "ServiceAccount"}, kinds, "a managed render emits the migration Job, the account it runs as, and nothing else")
@@ -296,7 +296,7 @@ func TestManagedBindingNamesThePlanBuildStages(t *testing.T) {
 // A refused declaration refuses through Deploy, and writes nothing: no file
 // reaches the destination that a later apply could pick up.
 func TestARefusedDeclarationWritesNothingThroughDeploy(t *testing.T) {
-	for name, configuration := range map[string]*basev0.Configuration{
+	for name, configuration := range map[string]*basev1.Configuration{
 		"nothing declared": nil,
 		"a managed store missing its instance": managedServiceConfiguration(map[string]string{
 			managedAuthModeKey: authModeExternalIdentity, managedOwnerKey: testOwner, managedRuntimeKey: testRuntime,
@@ -310,7 +310,7 @@ func TestARefusedDeclarationWritesNothingThroughDeploy(t *testing.T) {
 
 			response, err := builder.Deploy(context.Background(), request)
 			require.NoError(t, err)
-			require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
+			require.Equal(t, builderv1.DeploymentStatus_ERROR, response.GetState().GetState())
 			require.Contains(t, response.GetState().GetMessage(), "store")
 			entries, readErr := os.ReadDir(destination)
 			require.NoError(t, readErr)
@@ -332,7 +332,7 @@ func TestEmittedManagedBindingIsAcceptedByTheRunner(t *testing.T) {
 	request.Configuration = managedServiceConfiguration(completeManagedValues())
 	response, err := builder.Deploy(context.Background(), request)
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	_, job, _ := renderedManagedObjects(t, destination)
 	env := managedJobEnvironment(t, job)
 	var binding bootstrap.Binding

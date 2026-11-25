@@ -14,7 +14,7 @@ import (
 	"text/template"
 	"time"
 
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 )
 
 // testBootstrapTemplating mirrors what Build derives for a service with no
@@ -143,7 +143,7 @@ func TestBootstrapImageAppliesOnlyRealMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state := response.GetState().GetState(); state != builderv0.BuildStatus_SUCCESS {
+	if state := response.GetState().GetState(); state != builderv1.BuildStatus_SUCCESS {
 		t.Fatalf("build state = %v: %s", state, response.GetState().GetMessage())
 	}
 

@@ -14,8 +14,8 @@ import (
 
 	"cloud.google.com/go/cloudsqlconn/instance"
 	"github.com/codefly-dev/core/agents/services"
-	v0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	v0 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/shared"
 	postgres "github.com/codefly-dev/service-postgres/libs/go"
 	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
@@ -171,7 +171,7 @@ type ManagedDeploymentParameters struct {
 // with it and binds the Job's pod to that account (PodOverlay), so the identity
 // the Job presents to the cloud is the one the binding names, decided here
 // rather than at connect time by whatever account the namespace defaults to.
-func (s *Builder) deployManaged(ctx context.Context, req *builderv0.DeploymentRequest, managed *managedDeployment) (*builderv0.DeploymentResponse, error) {
+func (s *Builder) deployManaged(ctx context.Context, req *builderv1.DeploymentRequest, managed *managedDeployment) (*builderv1.DeploymentResponse, error) {
 	binding, err := s.managedBinding(managed)
 	if err != nil {
 		return s.Builder.DeployError(err)
@@ -207,7 +207,7 @@ func (s *Builder) deployManaged(ctx context.Context, req *builderv0.DeploymentRe
 			return deployment.ExportConfiguration(ctx, connection)
 		},
 	})
-	if err != nil || response.GetState().GetState() != builderv0.DeploymentStatus_SUCCESS || restrictedConfiguration == nil {
+	if err != nil || response.GetState().GetState() != builderv1.DeploymentStatus_SUCCESS || restrictedConfiguration == nil {
 		return response, err
 	}
 	response.Configuration = restrictedConfiguration

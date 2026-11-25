@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/network"
 	"github.com/codefly-dev/core/resources"
 	runners "github.com/codefly-dev/core/runners/base"
@@ -29,15 +29,15 @@ import (
 type postgresFixture struct {
 	serviceName     string
 	workspaceDir    string
-	identity        *basev0.ServiceIdentity
+	identity        *basev1.ServiceIdentity
 	environment     *resources.Environment
-	configuration   *basev0.Configuration
-	networkMappings []*basev0.NetworkMapping
-	runtimeContext  *basev0.RuntimeContext
+	configuration   *basev1.Configuration
+	networkMappings []*basev1.NetworkMapping
+	runtimeContext  *basev1.RuntimeContext
 	address         string
 }
 
-func newPostgresFixture(t *testing.T, ctx context.Context, runtimeContext *basev0.RuntimeContext) *postgresFixture {
+func newPostgresFixture(t *testing.T, ctx context.Context, runtimeContext *basev1.RuntimeContext) *postgresFixture {
 	t.Helper()
 	return newPostgresFixtureAt(t, ctx, t.TempDir(), "mod", fmt.Sprintf("svc-%v", time.Now().UnixMilli()), runtimeContext)
 }
@@ -45,14 +45,14 @@ func newPostgresFixture(t *testing.T, ctx context.Context, runtimeContext *basev
 // newPostgresFixtureAt scaffolds module/serviceName in workspaceDir, so
 // several fixtures can be services of one run. The scaffold's database is
 // named after the module.
-func newPostgresFixtureAt(t *testing.T, ctx context.Context, workspaceDir, module, serviceName string, runtimeContext *basev0.RuntimeContext) *postgresFixture {
+func newPostgresFixtureAt(t *testing.T, ctx context.Context, workspaceDir, module, serviceName string, runtimeContext *basev1.RuntimeContext) *postgresFixture {
 	t.Helper()
 
 	workspace := &resources.Workspace{Name: "test"}
 	service := resources.Service{Name: serviceName, Version: "test-me"}
 	require.NoError(t, service.SaveAtDir(ctx, path.Join(workspaceDir, module, service.Name)))
 
-	identity := &basev0.ServiceIdentity{
+	identity := &basev1.ServiceIdentity{
 		Name:                service.Name,
 		Module:              module,
 		Workspace:           workspace.Name,
@@ -61,14 +61,14 @@ func newPostgresFixtureAt(t *testing.T, ctx context.Context, workspaceDir, modul
 	}
 
 	builder := NewBuilder()
-	loaded, err := builder.Load(ctx, &builderv0.LoadRequest{
+	loaded, err := builder.Load(ctx, &builderv1.LoadRequest{
 		DisableCatch: true,
 		Identity:     identity,
-		CreationMode: &builderv0.CreationMode{Communicate: false},
+		CreationMode: &builderv1.CreationMode{Communicate: false},
 	})
 	require.NoError(t, err)
 	require.NotNil(t, loaded)
-	_, err = builder.Create(ctx, &builderv0.CreateRequest{})
+	_, err = builder.Create(ctx, &builderv1.CreateRequest{})
 	require.NoError(t, err)
 
 	environment := resources.LocalEnvironment()
@@ -77,7 +77,7 @@ func newPostgresFixtureAt(t *testing.T, ctx context.Context, workspaceDir, modul
 	// then reused by every lifecycle in this fixture: a restart must reattach to
 	// the same port and the same state, not draw a fresh one.
 	endpoints := NewRuntime()
-	_, err = endpoints.Load(ctx, &runtimev0.LoadRequest{
+	_, err = endpoints.Load(ctx, &runtimev1.LoadRequest{
 		Identity:     identity,
 		Environment:  shared.Must(environment.Proto()),
 		DisableCatch: true,
@@ -113,12 +113,12 @@ func newPostgresFixtureAt(t *testing.T, ctx context.Context, workspaceDir, modul
 		workspaceDir: workspaceDir,
 		identity:     identity,
 		environment:  environment,
-		configuration: &basev0.Configuration{
+		configuration: &basev1.Configuration{
 			Origin:         fmt.Sprintf("%s/%s", module, service.Name),
 			RuntimeContext: resources.NewRuntimeContextFree(),
-			Infos: []*basev0.ConfigurationInformation{
+			Infos: []*basev1.ConfigurationInformation{
 				{Name: "postgres",
-					ConfigurationValues: []*basev0.ConfigurationValue{
+					ConfigurationValues: []*basev1.ConfigurationValue{
 						{Key: "POSTGRES_USER", Value: "postgres"},
 						{Key: "POSTGRES_PASSWORD", Value: "owner-password"},
 						{Key: "POSTGRES_READ_ONLY_PASSWORD", Value: "read-only-password"},
@@ -135,11 +135,11 @@ func newPostgresFixtureAt(t *testing.T, ctx context.Context, workspaceDir, modul
 
 // start drives Load → Init → Start on a fresh Runtime against this fixture's
 // state, the way a new codefly invocation would.
-func (f *postgresFixture) start(t *testing.T, ctx context.Context) (*Runtime, *runtimev0.InitResponse) {
+func (f *postgresFixture) start(t *testing.T, ctx context.Context) (*Runtime, *runtimev1.InitResponse) {
 	t.Helper()
 
 	runtime := NewRuntime()
-	_, err := runtime.Load(ctx, &runtimev0.LoadRequest{
+	_, err := runtime.Load(ctx, &runtimev1.LoadRequest{
 		Identity:     f.identity,
 		Environment:  shared.Must(f.environment.Proto()),
 		DisableCatch: true,
@@ -147,7 +147,7 @@ func (f *postgresFixture) start(t *testing.T, ctx context.Context) (*Runtime, *r
 	require.NoError(t, err)
 	require.Equal(t, 1, len(runtime.Endpoints))
 
-	init, err := runtime.Init(ctx, &runtimev0.InitRequest{
+	init, err := runtime.Init(ctx, &runtimev1.InitRequest{
 		RuntimeContext:          f.runtimeContext,
 		Configuration:           f.configuration,
 		ProposedNetworkMappings: f.networkMappings,
@@ -159,17 +159,17 @@ func (f *postgresFixture) start(t *testing.T, ctx context.Context) (*Runtime, *r
 	// finds nothing, or catches a slow removal still in flight. Destroy's own
 	// contract is asserted in the test body; here a failure is only logged.
 	t.Cleanup(func() {
-		destroyed, destroyErr := runtime.Destroy(context.Background(), &runtimev0.DestroyRequest{})
+		destroyed, destroyErr := runtime.Destroy(context.Background(), &runtimev1.DestroyRequest{})
 		if destroyErr != nil {
 			t.Logf("cleanup destroy: %v", destroyErr)
 			return
 		}
-		if state := destroyed.GetStatus().GetState(); state != runtimev0.DestroyStatus_SUCCESS {
+		if state := destroyed.GetStatus().GetState(); state != runtimev1.DestroyStatus_SUCCESS {
 			t.Logf("cleanup destroy state = %v: %s", state, destroyed.GetStatus().GetMessage())
 		}
 	})
 
-	_, err = runtime.Start(ctx, &runtimev0.StartRequest{})
+	_, err = runtime.Start(ctx, &runtimev1.StartRequest{})
 	require.NoError(t, err)
 	return runtime, init
 }
@@ -188,7 +188,7 @@ func TestLifecycleContractNix(t *testing.T) {
 	assertLifecycleContract(t, resources.NewRuntimeContextNix())
 }
 
-func assertLifecycleContract(t *testing.T, runtimeContext *basev0.RuntimeContext) {
+func assertLifecycleContract(t *testing.T, runtimeContext *basev1.RuntimeContext) {
 	ctx := context.Background()
 	fixture := newPostgresFixture(t, ctx, runtimeContext)
 
@@ -207,9 +207,9 @@ func assertLifecycleContract(t *testing.T, runtimeContext *basev0.RuntimeContext
 	// docker can reattach to a live server, so nix must refuse to leave one
 	// rather than hand the next Init a locked data directory.
 	runtime.Settings.KeepRunning = true
-	kept, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+	kept, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, kept.GetStatus().GetState(), kept.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, kept.GetStatus().GetState(), kept.GetStatus().GetMessage())
 	if runtimeContext.Kind == resources.RuntimeContextNix {
 		require.Contains(t, kept.GetStatus().GetMessage(), "stopped native postgres")
 		requireNoListener(t, fixture.address)
@@ -223,15 +223,15 @@ func assertLifecycleContract(t *testing.T, runtimeContext *basev0.RuntimeContext
 	}
 
 	runtime.Settings.KeepRunning = false
-	stopped, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+	stopped, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
 	require.Contains(t, stopped.GetStatus().GetMessage(), "database state retained at "+retained)
 	requireNoListener(t, fixture.address)
 
-	repeated, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+	repeated, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, repeated.GetStatus().GetState(), repeated.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, repeated.GetStatus().GetState(), repeated.GetStatus().GetMessage())
 	requireNoListener(t, fixture.address)
 
 	restarted, _ := fixture.start(t, ctx)
@@ -240,9 +240,9 @@ func assertLifecycleContract(t *testing.T, runtimeContext *basev0.RuntimeContext
 		"stop must retain data a later invocation reads back",
 	)
 
-	destroyed, err := restarted.Destroy(ctx, &runtimev0.DestroyRequest{})
+	destroyed, err := restarted.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState(), destroyed.GetStatus().GetMessage())
 	require.Contains(t, destroyed.GetStatus().GetMessage(), "database state retained at "+retained)
 	requireNoListener(t, fixture.address)
 	// The cluster's own directory is mode 0700 and owned by the container's
@@ -251,9 +251,9 @@ func assertLifecycleContract(t *testing.T, runtimeContext *basev0.RuntimeContext
 	// a further invocation reads the sentinel back out of it.
 	require.DirExists(t, retained)
 
-	destroyedAgain, err := restarted.Destroy(ctx, &runtimev0.DestroyRequest{})
+	destroyedAgain, err := restarted.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, destroyedAgain.GetStatus().GetState(), destroyedAgain.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.DestroyStatus_SUCCESS, destroyedAgain.GetStatus().GetState(), destroyedAgain.GetStatus().GetMessage())
 
 	revived, _ := fixture.start(t, ctx)
 	require.True(t,
@@ -267,9 +267,9 @@ func assertLifecycleContract(t *testing.T, runtimeContext *basev0.RuntimeContext
 // leaves stop bounded rather than reaching for a stranger's postgres.
 func TestStopOwnsNothingWithoutInit(t *testing.T) {
 	runtime := NewRuntime()
-	stopped, err := runtime.Stop(context.Background(), &runtimev0.StopRequest{})
+	stopped, err := runtime.Stop(context.Background(), &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
 	require.Equal(t, "no postgres owned by this invocation; database state retained", stopped.GetStatus().GetMessage())
 }
 
@@ -284,9 +284,9 @@ func TestKeepRunningIsRefusedOnNix(t *testing.T) {
 	runtime.Runtime.WithContext(resources.NewRuntimeContextNix())
 	runtime.Settings.KeepRunning = true
 
-	stopped, err := runtime.Stop(context.Background(), &runtimev0.StopRequest{})
+	stopped, err := runtime.Stop(context.Background(), &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
 	require.NotContains(t, stopped.GetStatus().GetMessage(), "kept postgres running",
 		"nix cannot reattach to a live postmaster, so keep-running must not retain one")
 }
@@ -299,9 +299,9 @@ func TestKeepRunningIsHonouredOnDocker(t *testing.T) {
 	runtime.Runtime.WithContext(resources.NewRuntimeContextContainer())
 	runtime.Settings.KeepRunning = true
 
-	stopped, err := runtime.Stop(context.Background(), &runtimev0.StopRequest{})
+	stopped, err := runtime.Stop(context.Background(), &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
 	require.Contains(t, stopped.GetStatus().GetMessage(), "kept postgres running")
 }
 
@@ -313,9 +313,9 @@ func TestStartAfterStopFailsFast(t *testing.T) {
 	runtime.released = true
 
 	begun := time.Now()
-	started, err := runtime.Start(context.Background(), &runtimev0.StartRequest{})
+	started, err := runtime.Start(context.Background(), &runtimev1.StartRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StartStatus_ERROR, started.GetStatus().GetState())
+	require.Equal(t, runtimev1.StartStatus_ERROR, started.GetStatus().GetState())
 	require.Contains(t, started.GetStatus().GetMessage(), "run Init before Start")
 	require.Less(t, time.Since(begun), 5*time.Second, "start must refuse immediately, not probe a stopped server")
 }
@@ -328,25 +328,25 @@ func TestStopAfterFailedInitOwnsNothing(t *testing.T) {
 	fixture := newPostgresFixture(t, ctx, resources.NewRuntimeContextContainer())
 
 	runtime := NewRuntime()
-	_, err := runtime.Load(ctx, &runtimev0.LoadRequest{
+	_, err := runtime.Load(ctx, &runtimev1.LoadRequest{
 		Identity:     fixture.identity,
 		Environment:  shared.Must(fixture.environment.Proto()),
 		DisableCatch: true,
 	})
 	require.NoError(t, err)
 
-	init, err := runtime.Init(ctx, &runtimev0.InitRequest{
+	init, err := runtime.Init(ctx, &runtimev1.InitRequest{
 		RuntimeContext:          fixture.runtimeContext,
-		Configuration:           &basev0.Configuration{Origin: "mod/" + fixture.serviceName},
+		Configuration:           &basev1.Configuration{Origin: "mod/" + fixture.serviceName},
 		ProposedNetworkMappings: fixture.networkMappings,
 	})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.InitStatus_ERROR, init.GetStatus().GetState(),
+	require.Equal(t, runtimev1.InitStatus_ERROR, init.GetStatus().GetState(),
 		"init without postgres credentials must fail before it starts a server")
 
-	stopped, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+	stopped, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(), stopped.GetStatus().GetMessage())
 	require.Equal(t, "no postgres owned by this invocation; database state retained", stopped.GetStatus().GetMessage())
 }
 
@@ -426,16 +426,16 @@ func TestDestroyLoadedDockerContainer(t *testing.T) {
 	}
 	require.NotEmpty(t, containers(), "positive control: fixture must own a container")
 	loaded := NewRuntime()
-	_, err := loaded.Load(ctx, &runtimev0.LoadRequest{
+	_, err := loaded.Load(ctx, &runtimev1.LoadRequest{
 		Identity:     fixture.identity,
 		Environment:  shared.Must(fixture.environment.Proto()),
 		DisableCatch: true,
 	})
 	require.NoError(t, err)
 	require.Nil(t, loaded.runnerEnvironment)
-	destroyed, err := loaded.Destroy(ctx, &runtimev0.DestroyRequest{})
+	destroyed, err := loaded.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState())
+	require.Equal(t, runtimev1.DestroyStatus_SUCCESS, destroyed.GetStatus().GetState())
 	require.Empty(t, containers(), "Destroy must remove the container, not merely report success")
 	require.DirExists(t, started.retainedDataPath, "Destroy must retain database state")
 }

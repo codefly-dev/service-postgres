@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"testing"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
 	"github.com/codefly-dev/core/resources"
 	pgcontrol "github.com/codefly-dev/service-postgres/libs/go/controlplane"
 	"github.com/stretchr/testify/require"
@@ -24,7 +24,7 @@ func TestExportedReadWriteConnectionCarriesNoRoleStartupParameter(t *testing.T) 
 		configuration, err := svc.CreateConnectionConfiguration(
 			context.Background(),
 			testPostgresConfiguration("migration-owner", "owner-secret", "reader-secret", "writer-secret"),
-			&basev0.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
+			&basev1.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
 			true,
 		)
 		require.NoError(t, err)

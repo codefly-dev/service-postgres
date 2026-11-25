@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
 	"github.com/stretchr/testify/require"
@@ -83,10 +83,10 @@ func TestLocalConnectionConfigurationExportsEachLogin(t *testing.T) {
 			conf := testPostgresConfiguration("migration-owner", "owner-secret", "reader-secret", "writer-secret")
 			if configured != "" {
 				conf.Infos[0].ConfigurationValues = append(conf.Infos[0].ConfigurationValues,
-					&basev0.ConfigurationValue{Key: "POSTGRES_MAINTENANCE_PASSWORD", Value: configured})
+					&basev1.ConfigurationValue{Key: "POSTGRES_MAINTENANCE_PASSWORD", Value: configured})
 			}
 			configuration, err := svc.CreateConnectionConfiguration(context.Background(), conf,
-				&basev0.NetworkInstance{Address: "localhost:5432", Access: resources.NewNativeNetworkAccess()}, false)
+				&basev1.NetworkInstance{Address: "localhost:5432", Access: resources.NewNativeNetworkAccess()}, false)
 			require.NoError(t, err)
 			logins, err := svc.runtimeLogins()
 			require.NoError(t, err)
@@ -108,7 +108,7 @@ func TestLoginPasswordsMustBeDistinct(t *testing.T) {
 	svc.RuntimeLogins = maintenanceLogin()
 	conf := testPostgresConfiguration("migration-owner", "owner-secret", "reader-secret", "writer-secret")
 	conf.Infos[0].ConfigurationValues = append(conf.Infos[0].ConfigurationValues,
-		&basev0.ConfigurationValue{Key: "POSTGRES_MAINTENANCE_PASSWORD", Value: "writer-secret"})
+		&basev1.ConfigurationValue{Key: "POSTGRES_MAINTENANCE_PASSWORD", Value: "writer-secret"})
 	require.ErrorContains(t, svc.LoadConfiguration(context.Background(), conf), "distinct")
 }
 
@@ -128,11 +128,11 @@ func TestRestrictedRenderTemplatesEachLoginOverItsOwnPassword(t *testing.T) {
 	destination := t.TempDir()
 	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, references))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	logins, err := builder.runtimeLogins()
 	require.NoError(t, err)
-	var login *basev0.ConfigurationValue
+	var login *basev1.ConfigurationValue
 	for _, value := range response.GetConfiguration().GetInfos()[0].GetConfigurationValues() {
 		if value.GetKey() == "maintenance-connection" {
 			login = value
@@ -142,7 +142,7 @@ func TestRestrictedRenderTemplatesEachLoginOverItsOwnPassword(t *testing.T) {
 	require.Empty(t, login.GetValue())
 	require.NoError(t, resources.ValidateTemplatedConfigurationValue(login))
 	var literals strings.Builder
-	var referenced []*basev0.ConfigurationValueReference
+	var referenced []*basev1.ConfigurationValueReference
 	for _, segment := range login.GetTemplate().GetSegments() {
 		if reference := segment.GetReference(); reference != nil {
 			referenced = append(referenced, reference)
@@ -166,10 +166,10 @@ func TestRestrictedRenderTemplatesEachLoginOverItsOwnPassword(t *testing.T) {
 // declaration is the secretKeyRef the bootstrap Job carries. This is issue #165
 // at the level it failed — a restricted render refusing, not a list of names.
 func TestRestrictedRenderDeclaresEachLoginPasswordSecretReference(t *testing.T) {
-	for name, configure := range map[string]func(map[string]*builderv0.KubernetesSecretKeyReference, string){
-		"derived": func(map[string]*builderv0.KubernetesSecretKeyReference, string) {},
-		"configured": func(references map[string]*builderv0.KubernetesSecretKeyReference, key string) {
-			references[key] = &builderv0.KubernetesSecretKeyReference{Name: "postgres-secrets", Key: key}
+	for name, configure := range map[string]func(map[string]*builderv1.KubernetesSecretKeyReference, string){
+		"derived": func(map[string]*builderv1.KubernetesSecretKeyReference, string) {},
+		"configured": func(references map[string]*builderv1.KubernetesSecretKeyReference, key string) {
+			references[key] = &builderv1.KubernetesSecretKeyReference{Name: "postgres-secrets", Key: key}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -188,7 +188,7 @@ func TestRestrictedRenderDeclaresEachLoginPasswordSecretReference(t *testing.T) 
 			destination := t.TempDir()
 			response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, references))
 			require.NoError(t, err)
-			require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+			require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 			job := readDeploymentFile(t, destination, "base", "job.yaml")
 			for _, environmentVariable := range []string{"POSTGRES_CONTROL_PLANE_PASSWORD", "POSTGRES_MAINTENANCE_PASSWORD"} {
@@ -210,15 +210,15 @@ func TestRestrictedRenderRejectsUnusableLoginPasswordSecretReference(t *testing.
 	passwordKey := resources.ServiceSecretConfigurationKeyFromUnique(
 		"module/postgres", "postgres", "POSTGRES_MAINTENANCE_PASSWORD")
 	for name, broken := range map[string]struct {
-		reference *builderv0.KubernetesSecretKeyReference
+		reference *builderv1.KubernetesSecretKeyReference
 		message   string
 	}{
 		"optional": {
-			reference: &builderv0.KubernetesSecretKeyReference{Name: "postgres-secrets", Key: passwordKey, Optional: true},
+			reference: &builderv1.KubernetesSecretKeyReference{Name: "postgres-secrets", Key: passwordKey, Optional: true},
 			message:   passwordKey + " Kubernetes Secret reference must not be optional",
 		},
 		"another secret": {
-			reference: &builderv0.KubernetesSecretKeyReference{Name: "other-secrets", Key: passwordKey},
+			reference: &builderv1.KubernetesSecretKeyReference{Name: "other-secrets", Key: passwordKey},
 			message:   "postgres credential references must use one Kubernetes Secret",
 		},
 	} {
@@ -232,7 +232,7 @@ func TestRestrictedRenderRejectsUnusableLoginPasswordSecretReference(t *testing.
 			response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(
 				t.TempDir(), networkMappings, references))
 			require.NoError(t, err)
-			require.Equal(t, builderv0.DeploymentStatus_ERROR, response.GetState().GetState())
+			require.Equal(t, builderv1.DeploymentStatus_ERROR, response.GetState().GetState())
 			require.Contains(t, response.GetState().GetMessage(), broken.message)
 			require.Nil(t, response.GetConfiguration())
 		})
@@ -343,7 +343,7 @@ func TestBuildStagesEachDeclaredLoginForTheRunner(t *testing.T) {
 	outputDirectory := t.TempDir()
 	response, err := builder.Build(context.Background(), buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	var staged bootstrap.SelfHostedPackage
 	require.NoError(t, bootstrap.ReadJSON(filepath.Join(outputDirectory, "bootstrap", bootstrap.SelfHostedFile), &staged))

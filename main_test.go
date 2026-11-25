@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/resources"
 	runners "github.com/codefly-dev/core/runners/base"
 	"github.com/codefly-dev/core/wool"
@@ -45,7 +45,7 @@ func TestCreateToRunNix(t *testing.T) {
 
 // testCreateToRun drives Load → Init → Start → connect → SELECT 1 for one
 // runtime context, so docker and nix exercise the identical agent path.
-func testCreateToRun(t *testing.T, runtimeContext *basev0.RuntimeContext) {
+func testCreateToRun(t *testing.T, runtimeContext *basev1.RuntimeContext) {
 	wool.SetGlobalLogLevel(wool.DEBUG)
 	ctx := context.Background()
 
@@ -455,7 +455,7 @@ func assertDockerStateSurvivesContainerRecreation(
 ) {
 	t.Helper()
 
-	_, err := initial.Destroy(ctx, &runtimev0.DestroyRequest{})
+	_, err := initial.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
 
 	restarted, init := fixture.start(t, ctx)

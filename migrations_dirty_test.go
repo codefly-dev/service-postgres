@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/resources"
 	dockerrun "github.com/codefly-dev/core/runners/dockerrun"
 	migrationtest "github.com/codefly-dev/service-postgres/libs/go/migrationtest"
@@ -449,7 +449,7 @@ func TestDirtyMigrationFailsClosed(t *testing.T) {
 
 		response, initErr := runtime.Runtime.InitError(err)
 		require.NoError(t, initErr)
-		require.Equal(t, runtimev0.InitStatus_ERROR, response.GetStatus().GetState())
+		require.Equal(t, runtimev1.InitStatus_ERROR, response.GetStatus().GetState())
 		require.Contains(t, response.GetStatus().GetMessage(), "dirty")
 		require.NotContains(t, response.GetStatus().GetMessage(), disposableOwnerPassword)
 	})

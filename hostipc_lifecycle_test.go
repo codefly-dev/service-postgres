@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/shared"
 	"github.com/stretchr/testify/require"
@@ -36,7 +36,7 @@ func TestNativeLifecycleRecoversHostResources(t *testing.T) {
 	fixture := newPostgresFixture(t, ctx, resources.NewRuntimeContextNix())
 
 	runtime := NewRuntime()
-	_, err := runtime.Load(ctx, &runtimev0.LoadRequest{
+	_, err := runtime.Load(ctx, &runtimev1.LoadRequest{
 		Identity:     fixture.identity,
 		Environment:  shared.Must(fixture.environment.Proto()),
 		DisableCatch: true,
@@ -53,7 +53,7 @@ func TestNativeLifecycleRecoversHostResources(t *testing.T) {
 
 	// Init's own outcome is not the subject: on a host without nix it fails
 	// materializing the environment, which is already past the ordering claim.
-	_, _ = runtime.Init(ctx, &runtimev0.InitRequest{
+	_, _ = runtime.Init(ctx, &runtimev1.InitRequest{
 		RuntimeContext:          fixture.runtimeContext,
 		Configuration:           fixture.configuration,
 		ProposedNetworkMappings: fixture.networkMappings,
@@ -71,12 +71,12 @@ func TestNativeLifecycleRecoversHostResources(t *testing.T) {
 		require.NoError(t, err)
 	}
 	runtime.nixRuntime = &nixPostgres{}
-	_, err = runtime.Stop(ctx, &runtimev0.StopRequest{})
+	_, err = runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
 	require.Equal(t, 2, calls, "stopping a native cluster must recover the host resources it released")
 
 	runtime.nixRuntime = &nixPostgres{}
-	_, err = runtime.Destroy(ctx, &runtimev0.DestroyRequest{})
+	_, err = runtime.Destroy(ctx, &runtimev1.DestroyRequest{})
 	require.NoError(t, err)
 	require.Equal(t, 3, calls, "destroying a native cluster must recover the host resources it released")
 }
@@ -91,7 +91,7 @@ func TestLifecycleSurvivesUnrecoverableHostResources(t *testing.T) {
 	fixture := newPostgresFixture(t, ctx, resources.NewRuntimeContextNix())
 
 	runtime := NewRuntime()
-	_, err := runtime.Load(ctx, &runtimev0.LoadRequest{
+	_, err := runtime.Load(ctx, &runtimev1.LoadRequest{
 		Identity:     fixture.identity,
 		Environment:  shared.Must(fixture.environment.Proto()),
 		DisableCatch: true,
@@ -103,8 +103,8 @@ func TestLifecycleSurvivesUnrecoverableHostResources(t *testing.T) {
 	})
 
 	runtime.nixRuntime = &nixPostgres{}
-	stopped, err := runtime.Stop(ctx, &runtimev0.StopRequest{})
+	stopped, err := runtime.Stop(ctx, &runtimev1.StopRequest{})
 	require.NoError(t, err)
-	require.Equal(t, runtimev0.StopStatus_SUCCESS, stopped.GetStatus().GetState(),
+	require.Equal(t, runtimev1.StopStatus_SUCCESS, stopped.GetStatus().GetState(),
 		stopped.GetStatus().GetMessage())
 }

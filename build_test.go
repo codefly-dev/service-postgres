@@ -14,8 +14,8 @@ import (
 	"github.com/codefly-dev/service-postgres/libs/go/bootstrap"
 
 	"github.com/codefly-dev/core/agents/services"
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/wool"
 	"github.com/stretchr/testify/require"
@@ -30,7 +30,7 @@ func newBuildTestBuilder(t *testing.T) *Builder {
 	t.Helper()
 	ctx := context.Background()
 	builder := NewBuilder()
-	identity := &basev0.ServiceIdentity{
+	identity := &basev1.ServiceIdentity{
 		Workspace: "workspace",
 		Module:    "module",
 		Name:      "postgres",
@@ -55,11 +55,11 @@ func newBuildTestBuilder(t *testing.T) *Builder {
 	return builder
 }
 
-func buildRequest(outputDirectory string) *builderv0.BuildRequest {
-	return &builderv0.BuildRequest{
-		BuildContext: &builderv0.BuildContext{
-			Kind: &builderv0.BuildContext_DockerBuildContext{
-				DockerBuildContext: &builderv0.DockerBuildContext{DockerRepository: "registry.example.com"},
+func buildRequest(outputDirectory string) *builderv1.BuildRequest {
+	return &builderv1.BuildRequest{
+		BuildContext: &builderv1.BuildContext{
+			Kind: &builderv1.BuildContext_DockerBuildContext{
+				DockerBuildContext: &builderv1.DockerBuildContext{DockerRepository: "registry.example.com"},
 			},
 		},
 		OutputDirectory: outputDirectory,
@@ -81,7 +81,7 @@ func TestBuildRejectsUnresolvableSchemaDeclaration(t *testing.T) {
 
 			response, err := builder.Build(ctx, buildRequest(t.TempDir()))
 			require.NoError(t, err)
-			require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState(),
+			require.Equal(t, builderv1.BuildStatus_ERROR, response.GetState().GetState(),
 				"a declaration the runtime rejects must fail the build")
 		})
 	}
@@ -112,7 +112,7 @@ func TestBuildPackagesTheSchemaItReports(t *testing.T) {
 	outputDirectory := t.TempDir()
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	require.True(t, sink.saw("schema prerequisites resolved"),
 		"the build no longer reports what it resolved")
 	require.FileExists(t, filepath.Join(outputDirectory, "bootstrap", "sources", "01-api", "1_init.up.sql"),
@@ -126,7 +126,7 @@ func TestBuildEmitsRecipeToOutputDirectory(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	plan := response.GetResult().GetDockerBuildPlan()
 	require.NotNil(t, plan, "recipe build must return a DockerBuildPlan, not a legacy DockerBuildResult")
@@ -172,7 +172,7 @@ func TestBuildRecipeOmitsMigrationsWhenDisabled(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	// Extension-only bootstrap: the artifact is still emitted and the image
 	// still reconciles runtime grants, but no lineage is staged or applied.
@@ -202,7 +202,7 @@ func TestBuildRecipePurgesPreexistingOutputDirectory(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	require.NoFileExists(t, filepath.Join(outputDirectory, "stale-root.txt"))
 	require.NoFileExists(t, filepath.Join(outputDirectory, "migrations", "9_stale.up.sql"))
@@ -239,7 +239,7 @@ func TestBuildRecipeTreatsOwnSourceAbsenceAndEmptinessAlike(t *testing.T) {
 
 		response, err := builder.Build(ctx, buildRequest(outputDirectory))
 		require.NoError(t, err)
-		require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 		require.NoError(t, services.VerifyDockerBuildPlan(outputDirectory, response.GetResult().GetDockerBuildPlan()))
 		require.Empty(t, readPlanArtifact(t, outputDirectory).Lineages, name)
@@ -263,7 +263,7 @@ func TestBuildStagesSiblingSourcesIntoTheBuildContext(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	for _, contextRoot := range []string{builder.Location, outputDirectory} {
 		require.FileExists(t, filepath.Join(contextRoot, "bootstrap", "sources", "00-store", "1_create_table.up.sql"))
@@ -294,7 +294,7 @@ func TestBuildRejectsUnresolvedDeclaredSource(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.BuildStatus_ERROR, response.GetState().GetState())
 	require.Contains(t, response.GetState().GetMessage(), "api")
 }
 
@@ -308,7 +308,7 @@ func TestBuildPlanDigestTracksMigrationContent(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	before := readPlanArtifact(t, outputDirectory)
 	recipeDigestBefore := response.GetResult().GetDockerBuildPlan().GetDigest()
 
@@ -318,7 +318,7 @@ func TestBuildPlanDigestTracksMigrationContent(t *testing.T) {
 
 	response, err = builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	after := readPlanArtifact(t, outputDirectory)
 
 	require.NotEqual(t, before.Digest, after.Digest)
@@ -344,7 +344,7 @@ func TestBuildRecipeCarriesNoSecrets(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	require.NoError(t, filepath.WalkDir(outputDirectory, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil || entry.IsDir() {
@@ -386,17 +386,17 @@ func TestBuildRefusesToReplaceAForeignBootstrapDirectory(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(t.TempDir()))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState())
+	require.Equal(t, builderv1.BuildStatus_ERROR, response.GetState().GetState())
 	require.FileExists(t, handAuthored, "the build destroyed a directory it did not generate")
 
 	// A directory the agent generated is replaced without complaint.
 	require.NoError(t, os.RemoveAll(filepath.Join(builder.Location, "bootstrap")))
 	response, err = builder.Build(ctx, buildRequest(t.TempDir()))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	response, err = builder.Build(ctx, buildRequest(t.TempDir()))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 }
 
 // TestBuildStagesTreeThatGitIgnoresItself covers services that already exist:
@@ -409,7 +409,7 @@ func TestBuildStagesTreeThatGitIgnoresItself(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(t.TempDir()))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	ignore := string(mustReadFile(t, filepath.Join(builder.Location, "bootstrap", ".gitignore")))
 	require.Contains(t, ignore, "*")
@@ -428,7 +428,7 @@ func TestBuildStagesModesIndependentOfUmask(t *testing.T) {
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	syscall.Umask(previous)
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	require.NoError(t, filepath.WalkDir(filepath.Join(outputDirectory, "bootstrap"), func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -460,7 +460,7 @@ func TestBuildArtifactIsIdenticalAcrossCheckouts(t *testing.T) {
 		outputDirectory := t.TempDir()
 		response, err := builder.Build(ctx, buildRequest(outputDirectory))
 		require.NoError(t, err)
-		require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 		return string(mustReadFile(t, filepath.Join(outputDirectory, "bootstrap", "plan.json"))),
 			response.GetResult().GetDockerBuildPlan().GetDigest()
 	}
@@ -490,7 +490,7 @@ func TestBuildRecipeLocksBootstrapInputs(t *testing.T) {
 
 	response, err := builder.Build(ctx, buildRequest(outputDirectory))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	recipe := response.GetResult().GetDockerBuildPlan().GetRecipes()[0]
 	require.Equal(t, bootstrapLock.RecipeBuildArgs(), recipe.GetBuildArgs())
@@ -511,12 +511,12 @@ func TestBuildRecipeLocksBootstrapInputs(t *testing.T) {
 func TestBuildRecipeResolvesIdenticalInputsAcrossEmissions(t *testing.T) {
 	ctx := context.Background()
 
-	emit := func() (*builderv0.DockerBuildPlan, []byte) {
+	emit := func() (*builderv1.DockerBuildPlan, []byte) {
 		builder := newBuildTestBuilder(t)
 		outputDirectory := t.TempDir()
 		response, err := builder.Build(ctx, buildRequest(outputDirectory))
 		require.NoError(t, err)
-		require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 		dockerfile, err := os.ReadFile(filepath.Join(outputDirectory, "builder", "Dockerfile"))
 		require.NoError(t, err)
 		return response.GetResult().GetDockerBuildPlan(), dockerfile
@@ -540,7 +540,7 @@ func TestBuildRecipeContractOverGRPC(t *testing.T) {
 				require.NoError(t, os.MkdirAll(filepath.Dir(marker), 0o755))
 				require.NoError(t, os.WriteFile(marker, []byte("caller-owned"), 0o644))
 				server := grpc.NewServer()
-				builderv0.RegisterBuilderServer(server, builder)
+				builderv1.RegisterBuilderServer(server, builder)
 				listener, err := net.Listen("tcp", "127.0.0.1:0")
 				require.NoError(t, err)
 				go func() { _ = server.Serve(listener) }()
@@ -557,7 +557,7 @@ func TestBuildRecipeContractOverGRPC(t *testing.T) {
 					_, err := exec.LookPath(executable)
 					require.ErrorIs(t, err, exec.ErrNotFound)
 				}
-				capabilities, err := client.BuildCapabilities(ctx, &builderv0.BuildCapabilitiesRequest{})
+				capabilities, err := client.BuildCapabilities(ctx, &builderv1.BuildCapabilitiesRequest{})
 				require.NoError(t, err)
 				require.True(t, capabilities.GetBuildxSelection())
 
@@ -568,7 +568,7 @@ func TestBuildRecipeContractOverGRPC(t *testing.T) {
 					docker.BuildxBuilder = "cli-owned-builder"
 				}
 				if selection == "cache-selected" {
-					docker.Cache = &builderv0.BuildCacheOptions{
+					docker.Cache = &builderv1.BuildCacheOptions{
 						Backend: "registry", Scope: "postgres",
 						Imports: []string{"registry.example.com/cache/import"},
 						Exports: []string{"registry.example.com/cache/export"},
@@ -586,11 +586,11 @@ func TestBuildRecipeContractOverGRPC(t *testing.T) {
 				} else {
 					require.NoError(t, err)
 					if output == "missing" {
-						require.Equal(t, builderv0.BuildStatus_ERROR, response.GetState().GetState())
+						require.Equal(t, builderv1.BuildStatus_ERROR, response.GetState().GetState())
 						require.Contains(t, response.GetState().GetMessage(), "output_directory is required")
 						require.Nil(t, response.GetResult())
 					} else {
-						require.Equal(t, builderv0.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+						require.Equal(t, builderv1.BuildStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 						plan := response.GetResult().GetDockerBuildPlan()
 						require.NotNil(t, plan)
 						require.NoError(t, services.VerifyDockerBuildPlan(directory, plan))

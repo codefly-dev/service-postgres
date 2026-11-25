@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	builderv0 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	builderv1 "github.com/codefly-dev/core/generated/go/codefly/services/builder/v1"
 	"github.com/codefly-dev/core/resources"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
@@ -36,7 +36,7 @@ func TestRestrictedConnectionsAreTemplatesOverTheServicesOwnPasswords(t *testing
 	references := promotablePostgresSecretReferences()
 	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(t.TempDir(), networkMappings, references))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 
 	readOnlyRole, readWriteRole := runtimeRoleNames(builder.DatabaseName)
 	expected := map[string]struct{ role, password string }{
@@ -52,7 +52,7 @@ func TestRestrictedConnectionsAreTemplatesOverTheServicesOwnPasswords(t *testing
 		require.Empty(t, value.GetValue())
 
 		var literals strings.Builder
-		var referenced []*basev0.ConfigurationValueReference
+		var referenced []*basev1.ConfigurationValueReference
 		for _, segment := range value.GetTemplate().GetSegments() {
 			if reference := segment.GetReference(); reference != nil {
 				referenced = append(referenced, reference)
@@ -63,7 +63,7 @@ func TestRestrictedConnectionsAreTemplatesOverTheServicesOwnPasswords(t *testing
 		require.Len(t, referenced, 1, "%s must reference exactly its own password", value.GetKey())
 		require.Equal(t, "postgres", referenced[0].GetConfiguration())
 		require.Equal(t, want.password, referenced[0].GetKey())
-		require.Equal(t, basev0.ConfigurationValueEscape_CONFIGURATION_VALUE_ESCAPE_URL_USERINFO, referenced[0].GetEscape())
+		require.Equal(t, basev1.ConfigurationValueEscape_CONFIGURATION_VALUE_ESCAPE_URL_USERINFO, referenced[0].GetEscape())
 		// The referenced primitive is one the Deploy itself demanded a Secret
 		// reference for, so the store the consumer's value is assembled from
 		// already holds it.
@@ -79,7 +79,7 @@ func TestExternalIdentityConnectionsCarryNoTemplate(t *testing.T) {
 	builder.AuthMode = authModeExternalIdentity
 	response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(t.TempDir(), networkMappings, nil))
 	require.NoError(t, err)
-	require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+	require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 	for _, value := range response.GetConfiguration().GetInfos()[0].GetConfigurationValues() {
 		require.Nil(t, value.GetTemplate(), "%s: external identity holds no password to assemble from", value.GetKey())
 	}
@@ -149,7 +149,7 @@ func TestRestrictedBootstrapJobDisablesSSLForTheManagedServer(t *testing.T) {
 		destination := t.TempDir()
 		response, err := builder.Deploy(context.Background(), promotableDeploymentRequest(destination, networkMappings, promotablePostgresSecretReferences()))
 		require.NoError(t, err)
-		require.Equal(t, builderv0.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
+		require.Equal(t, builderv1.DeploymentStatus_SUCCESS, response.GetState().GetState(), response.GetState().GetMessage())
 		job := readDeploymentFile(t, destination, "base", "job.yaml")
 		require.Contains(t, job, "name: PGSSLMODE\n              value: \"disable\"")
 		require.NotContains(t, job, migrationConnectionEnvironmentKey)

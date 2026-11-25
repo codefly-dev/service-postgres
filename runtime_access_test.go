@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"testing"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
 	"github.com/codefly-dev/core/resources"
 )
 
@@ -19,7 +19,7 @@ func TestConnectionConfigurationExposesExplicitCapabilities(t *testing.T) {
 	configuration, err := svc.CreateConnectionConfiguration(
 		context.Background(),
 		testPostgresConfiguration("migration-owner", "owner-secret", "reader-secret", "writer-secret"),
-		&basev0.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
+		&basev1.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
 		true,
 	)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestConnectionConfigurationPreservesReservedCredentialCharacters(t *testing
 	configuration, err := svc.CreateConnectionConfiguration(
 		context.Background(),
 		testPostgresConfiguration("migration-owner", "owner:/?#[]@", "reader:/?#[]@", "writer:/?#[]@"),
-		&basev0.NetworkInstance{Address: "localhost:5432", Access: resources.NewNativeNetworkAccess()},
+		&basev1.NetworkInstance{Address: "localhost:5432", Access: resources.NewNativeNetworkAccess()},
 		false,
 	)
 	if err != nil {
@@ -87,7 +87,7 @@ func TestExternalIdentityModeAcceptsPasswordlessCredentialsAndDSNs(t *testing.T)
 	configuration, err := svc.CreateConnectionConfiguration(
 		context.Background(),
 		testPostgresConfiguration("app-principal", "", "", ""),
-		&basev0.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
+		&basev1.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
 		true,
 	)
 	if err != nil {
@@ -110,7 +110,7 @@ func TestExternalIdentityDSNsStayPasswordlessDespiteStrayCredentials(t *testing.
 	configuration, err := svc.CreateConnectionConfiguration(
 		context.Background(),
 		testPostgresConfiguration("app-principal", "stray-owner-secret", "", ""),
-		&basev0.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
+		&basev1.NetworkInstance{Address: "database.internal:5432", Access: resources.NewNativeNetworkAccess()},
 		true,
 	)
 	if err != nil {
@@ -224,11 +224,11 @@ func TestRuntimeReadWriteRolesAreValidatedAndDeduplicated(t *testing.T) {
 	}
 }
 
-func testPostgresConfiguration(user, ownerPassword, readerPassword, writerPassword string) *basev0.Configuration {
-	return &basev0.Configuration{
-		Infos: []*basev0.ConfigurationInformation{{
+func testPostgresConfiguration(user, ownerPassword, readerPassword, writerPassword string) *basev1.Configuration {
+	return &basev1.Configuration{
+		Infos: []*basev1.ConfigurationInformation{{
 			Name: "postgres",
-			ConfigurationValues: []*basev0.ConfigurationValue{
+			ConfigurationValues: []*basev1.ConfigurationValue{
 				{Key: "POSTGRES_USER", Value: user},
 				{Key: "POSTGRES_PASSWORD", Value: ownerPassword},
 				{Key: "POSTGRES_READ_ONLY_PASSWORD", Value: readerPassword},
@@ -244,7 +244,7 @@ func newTestPostgresService() *Service {
 	return svc
 }
 
-func configurationValue(t *testing.T, configuration *basev0.Configuration, key string) string {
+func configurationValue(t *testing.T, configuration *basev1.Configuration, key string) string {
 	t.Helper()
 	value, err := resources.GetConfigurationValue(context.Background(), configuration, "postgres", key)
 	if err != nil {

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	runtimev0 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v0"
+	runtimev1 "github.com/codefly-dev/core/generated/go/codefly/services/runtime/v1"
 )
 
 // A database that refuses connections is the easy case. The hard one is a peer
@@ -75,11 +75,11 @@ func TestStartReportsACancelledReadinessWaitAsAnError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	response, err := runtime.Start(ctx, &runtimev0.StartRequest{})
+	response, err := runtime.Start(ctx, &runtimev1.StartRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.GetStatus().GetState() != runtimev0.StartStatus_ERROR {
+	if response.GetStatus().GetState() != runtimev1.StartStatus_ERROR {
 		t.Fatalf("start state = %s, want ERROR", response.GetStatus().GetState())
 	}
 	if !strings.Contains(response.GetStatus().GetMessage(), "readiness wait cancelled") {
