@@ -26,7 +26,7 @@ func TestReleaseWorkflowRoutesDevTagsWithoutTheSharedGate(t *testing.T) {
 	workflow := readWorkflow(t, ".github/workflows/releaser.yml")
 	release := workflow.Jobs["release"]
 	require.Equal(t, "github.event_name == 'push' && !contains(github.ref_name, '-dev.')", release.If)
-	require.Equal(t, "image", release.Needs)
+	require.Equal(t, workflowNeeds{"image"}, release.Needs)
 	require.Equal(t, "codefly-dev/core/.github/workflows/go-service-release.yml@e54bc852f3d40cd1aeafc0ced2369a8c13a51bb8", release.Uses,
 		"core v0.16.0 enforces default-branch reachability for real releases")
 	for _, name := range []string{"dev-build", "dev-publish"} {
@@ -40,8 +40,8 @@ func TestDevReleaseBuildAndPublishAreSeparate(t *testing.T) {
 	workflow := readWorkflow(t, ".github/workflows/releaser.yml")
 	build := workflow.Jobs["dev-build"]
 	publish := workflow.Jobs["dev-publish"]
-	require.Equal(t, "image", build.Needs)
-	require.Equal(t, "dev-build", publish.Needs)
+	require.Equal(t, workflowNeeds{"image"}, build.Needs)
+	require.Equal(t, workflowNeeds{"dev-build"}, publish.Needs)
 	require.Equal(t, map[string]string{"contents": "read"}, build.Permissions)
 	require.Equal(t, map[string]string{"contents": "write"}, publish.Permissions)
 	checkout := findWorkflowAction(t, build, "actions/checkout")

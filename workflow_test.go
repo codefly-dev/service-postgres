@@ -27,11 +27,27 @@ type workflowConcurrency struct {
 
 type workflowJob struct {
 	If             string            `yaml:"if"`
-	Needs          string            `yaml:"needs"`
+	Needs          workflowNeeds     `yaml:"needs"`
 	Permissions    map[string]string `yaml:"permissions"`
 	TimeoutMinutes int               `yaml:"timeout-minutes"`
 	Steps          []workflowStep    `yaml:"steps"`
 	Uses           string            `yaml:"uses"`
+}
+
+// workflowNeeds is a job's `needs`, which Actions accepts as one name or a list.
+type workflowNeeds []string
+
+func (needs *workflowNeeds) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		*needs = workflowNeeds{value.Value}
+		return nil
+	}
+	var names []string
+	if err := value.Decode(&names); err != nil {
+		return err
+	}
+	*needs = names
+	return nil
 }
 
 type workflowStep struct {
@@ -64,7 +80,7 @@ func TestCIWorkflowEnforcesMigrationRegression(t *testing.T) {
 
 	// The unit-test step deliberately carries no container-booting test; the
 	// regression must therefore be excluded there and present here, not neither.
-	unitTests := findWorkflowStep(t, imageJob, "Run unit tests")
+	unitTests := findWorkflowStep(t, readWorkflow(t, ".github/workflows/ci.yml").Jobs["unit"], "Run unit tests")
 	require.Contains(t, unitTests.Run, "TestDirtyMigrationFailsClosed",
 		"the unit-test step must exclude the container-booting regression")
 }
@@ -79,8 +95,22 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	}, workflow.Jobs["image"].Permissions)
 	require.Regexp(t, `@[0-9a-f]{40}$`, workflow.Jobs["ci"].Uses)
 
-	unitTests := findWorkflowStep(t, workflow.Jobs["image"], "Run unit tests")
+	require.Equal(t, map[string]string{"contents": "read"}, workflow.Jobs["unit"].Permissions)
+	require.Equal(t, map[string]string{"contents": "read"}, workflow.Jobs["runtime-library"].Permissions)
+	require.Equal(t, map[string]string{
+		"contents": "read",
+		"packages": "write",
+	}, workflow.Jobs["tag"].Permissions)
+
+	unitTests := findWorkflowStep(t, workflow.Jobs["unit"], "Run unit tests")
 	require.Empty(t, unitTests.If)
+	require.Empty(t, workflow.Jobs["unit"].If)
+	// The arm64 case of the bootstrap image build test needs the emulator in
+	// the job that runs it.
+	findWorkflowAction(t, workflow.Jobs["unit"], "docker/setup-qemu-action")
+	library := findWorkflowStep(t, workflow.Jobs["runtime-library"], "Qualify standalone runtime library")
+	require.Empty(t, library.If)
+	require.Empty(t, workflow.Jobs["runtime-library"].If)
 	// The lifecycle contract drives a real agent against the LOCKED runtime
 	// image, so it cannot run in the pre-publish unit-test step: a commit that
 	// relocks the digest would send it pulling an image this job has not pushed
@@ -107,19 +137,24 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	publishedIndex, _ := findWorkflowStepAt(t, imageJob, "Verify published runtime image")
 	lifecycleIndex, _ := findWorkflowStepAt(t, imageJob, "Run runtime lifecycle tests")
 	scanIndex, scan := findWorkflowStepAt(t, imageJob, "Scan published runtime image")
-	tagIndex, tag := findWorkflowStepAt(t, imageJob, "Tag verified runtime image")
+	// The unit tests and the runtime library run beside the image job, so the
+	// tag move lives in a job of its own that needs all three: everything that
+	// gated the tag as an earlier step of one job still gates it.
+	tagJob := workflow.Jobs["tag"]
+	require.ElementsMatch(t, []string{"unit", "runtime-library", "image"}, []string(tagJob.Needs))
+	require.Empty(t, tagJob.If, "a condition on the job would skip the image evidence with the tag")
+	tagIndex, tag := findWorkflowStepAt(t, tagJob, "Tag verified runtime image")
 	require.Less(t, candidateIndex, verifyCandidateIndex)
 	require.Less(t, verifyCandidateIndex, publishedIndex)
 	require.Less(t, publishedIndex, lifecycleIndex)
 	require.Less(t, lifecycleIndex, scanIndex)
-	require.Less(t, scanIndex, tagIndex)
 	// Producing image evidence pulls every platform from the registry, so it
 	// must not stand between the verified digest and the tag move: a transient
 	// registry failure would strand the shared tag on the previous digest with
 	// nothing to retry it. The vulnerability scan above reads a local tar and
 	// keeps its place ahead of the tag for exactly that reason.
-	inventoryIndex, inventory := findWorkflowStepAt(t, imageJob, "Inventory published runtime image")
-	uploadIndex, upload := findWorkflowStepAt(t, imageJob, "Upload image SBOM evidence")
+	inventoryIndex, inventory := findWorkflowStepAt(t, tagJob, "Inventory published runtime image")
+	uploadIndex, upload := findWorkflowStepAt(t, tagJob, "Upload image SBOM evidence")
 	require.Less(t, tagIndex, inventoryIndex)
 	require.Less(t, inventoryIndex, uploadIndex)
 	require.Empty(t, inventory.If, "image evidence must never be conditionally skipped")
@@ -168,7 +203,7 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 // The guard is matched loosely because Actions treats `${{ ... }}` around it as
 // equivalent; what must not reappear is any pull_request term.
 func TestCIWorkflowMovesTheSharedRuntimeTagOnlyOnPush(t *testing.T) {
-	tag := findWorkflowStep(t, readWorkflow(t, ".github/workflows/ci.yml").Jobs["image"],
+	tag := findWorkflowStep(t, readWorkflow(t, ".github/workflows/ci.yml").Jobs["tag"],
 		"Tag verified runtime image")
 
 	require.Contains(t, tag.If, "github.event_name == 'push'")
@@ -187,8 +222,10 @@ func TestCIWorkflowNeverCancelsTheRunThatMovesTheTag(t *testing.T) {
 
 	require.Equal(t, "${{ github.workflow }}-${{ github.ref }}", workflow.Concurrency.Group)
 	require.Equal(t, "${{ github.event_name == 'pull_request' }}", workflow.Concurrency.CancelInProgress)
-	require.NotZero(t, workflow.Jobs["image"].TimeoutMinutes,
-		"a queued push must not wait out GitHub's six-hour default")
+	for _, name := range []string{"unit", "runtime-library", "image", "tag"} {
+		require.NotZerof(t, workflow.Jobs[name].TimeoutMinutes,
+			"job %s: a queued push must not wait out GitHub's six-hour default", name)
+	}
 }
 
 func TestReleaseWorkflowRetagsLockedImageWithLeastPrivilege(t *testing.T) {

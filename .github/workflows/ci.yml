@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # A branch with no pull request open has no run at all otherwise. A dispatched
+  # run is neither a push nor a pull request, so it publishes no candidate and
+  # moves no tag: it checks the locked image as a fork's pull request does.
+  workflow_dispatch:
 
 # A push to main is the only run that moves the shared runtime tag, so it must not
 # be cancelled by the next merge: a cancelled run leaves the tag on the previous
@@ -23,6 +27,85 @@ jobs:
     permissions:
       contents: read
     uses: codefly-dev/core/.github/workflows/go-service-ci.yml@f16e045805dbd213cdbebf98d5f7cbe802496d7c
+
+  # The jobs below ran as one serial job; the unit tests and the runtime
+  # library need neither the image nor each other, so they run beside it. What
+  # their place in that one job guaranteed is kept by `tag`, which needs all
+  # three: nothing moves the shared tag unless every one of them passed.
+  unit:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # The Go module and build caches, restored before setup-go and owned by
+      # this step (setup-go's own cache stays off): setup-go keys on the exact
+      # go.sum hash, so a branch that moves a dependency would compile from
+      # nothing, where `restore-keys` hands it the newest cache of the same job.
+      # One key per job, because each compiles different things. A restore that
+      # fails costs a cold build, never the job.
+      - name: Restore the Go module and build caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: service-postgres-unit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'libs/go/go.mod', 'libs/go/go.sum') }}
+          restore-keys: |
+            service-postgres-unit-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          cache: false
+          go-version-file: go.mod
+
+      # The bootstrap image build test verifies linux/arm64, which needs emulation on
+      # an amd64 runner. Without this the arm64 case would skip and a wrong arm64
+      # archive checksum would pass CI.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+
+      # -count=1: the restored build cache also holds test results, and these
+      # tests reach outside what Go tracks (the Docker daemon, the emulator).
+      - name: Run unit tests
+        run: go test ./... -count=1 -skip '^(TestCreateToRunDocker|TestDestroyLoadedDockerContainer|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
+
+  runtime-library:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # The Go module and build caches, restored before setup-go and owned by
+      # this step (setup-go's own cache stays off): setup-go keys on the exact
+      # go.sum hash, so a branch that moves a dependency would compile from
+      # nothing, where `restore-keys` hands it the newest cache of the same job.
+      # One key per job, because each compiles different things. A restore that
+      # fails costs a cold build, never the job.
+      - name: Restore the Go module and build caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: service-postgres-runtime-library-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'libs/go/go.mod', 'libs/go/go.sum') }}
+          restore-keys: |
+            service-postgres-runtime-library-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          cache: false
+          go-version-file: go.mod
+
+      - name: Qualify standalone runtime library
+        run: python3 scripts/qualify-runtime-library.py
 
   image:
     permissions:
@@ -43,11 +126,30 @@ jobs:
           name=$(jq -er '.name' runtime-image.json)
           tag=$(jq -er '.tag' runtime-image.json)
           digest=$(jq -er '.digest' runtime-image.json)
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-          echo "reference=$name@$digest" >> "$GITHUB_OUTPUT"
-          echo "tag_reference=$name:$tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=$name"
+            echo "tag=$tag"
+            echo "digest=$digest"
+            echo "reference=$name@$digest"
+            echo "tag_reference=$name:$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      # The Go module and build caches, restored before setup-go and owned by
+      # this step (setup-go's own cache stays off): setup-go keys on the exact
+      # go.sum hash, so a branch that moves a dependency would compile from
+      # nothing, where `restore-keys` hands it the newest cache of the same job.
+      # One key per job, because each compiles different things. A restore that
+      # fails costs a cold build, never the job.
+      - name: Restore the Go module and build caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: service-postgres-image-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'libs/go/go.mod', 'libs/go/go.sum') }}
+          restore-keys: |
+            service-postgres-image-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
@@ -55,17 +157,8 @@ jobs:
           cache: false
           go-version-file: go.mod
 
-      - name: Qualify standalone runtime library
-        run: python3 scripts/qualify-runtime-library.py
-
-      # Registered before the tests, not just before the multi-arch publish: the
-      # bootstrap image build test verifies linux/arm64, which needs emulation on an
-      # amd64 runner. Without this the arm64 case would skip and a wrong arm64
-      # archive checksum would pass CI.
+      # The multi-arch candidate below builds linux/arm64 on an amd64 runner.
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
-
-      - name: Run unit tests
-        run: go test ./... -skip '^(TestCreateToRunDocker|TestDestroyLoadedDockerContainer|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
@@ -211,13 +304,54 @@ jobs:
             image --quiet --format table --severity HIGH,CRITICAL \
             --exit-code 1 --input /image.tar
 
+  # Split from `image` so that it can wait on the jobs that now run beside it.
+  tag:
+    needs: [unit, runtime-library, image]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    # A queued push must not wait out GitHub's six-hour default on a hung registry read.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Resolve runtime image
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(jq -er '.name' runtime-image.json)
+          tag=$(jq -er '.tag' runtime-image.json)
+          digest=$(jq -er '.digest' runtime-image.json)
+          {
+            echo "name=$name"
+            echo "tag=$tag"
+            echo "digest=$digest"
+            echo "reference=$name@$digest"
+            echo "tag_reference=$name:$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        with:
+          driver-opts: image=moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+
       # The tag string is read from runtime-image.json, so every branch resolves
       # the same one. A PR build that moved it would race every other PR on that
       # single tag, and would repoint what releases consume while still unmerged,
       # with nothing to move it back if the PR is closed. The candidate publish
-      # above keeps the wider guard: it pushes by digest and moves no tag.
+      # in `image` keeps the wider guard: it pushes by digest and moves no tag.
       #
-      # Every step above gates this one, so a commit that relocks the digest and
+      # Every job this one needs gates it, so a commit that relocks the digest and
       # then fails the scan leaves the tag on the older digest until a later push
       # to main goes green. That is the point — an image that fails a CRITICAL
       # scan must not become what a plain `docker pull` of the tag returns.
@@ -233,7 +367,7 @@ jobs:
       # per platform the lock declares, so the inventory a consumer retrieves
       # describes exactly the image it deploys.
       #
-      # It runs after the tag move, unlike the scan above. The scan reads a
+      # It runs after the tag move, unlike the scan in `image`. The scan reads a
       # local `docker save` tar and needs no network, so gating the tag on it
       # costs nothing; producing evidence pulls every platform from the registry
       # again, and a transient registry failure there must not be what strands

@@ -83,10 +83,10 @@ go mod tidy -diff        # CI fails on any diff
 go test ./... -skip '^(TestCreateToRunDocker|TestDestroyLoadedDockerContainer|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 ```
 
-That skip list is CI's unit step, and it is the inventory of what needs a
+That skip list is CI's `unit` job, and it is the inventory of what needs a
 container. Everything else is template rendering, lock parsing, workflow
-assertions and unit tests. The three migration regressions run after it,
-against a locally built image:
+assertions and unit tests. The three migration regressions run beside it, in
+the `image` job, against a locally built image:
 
 ```bash
 docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
@@ -94,7 +94,8 @@ SERVICE_POSTGRES_TEST_IMAGE=service-postgres:test go test . \
   -run '^(TestDirtyMigrationFailsClosed|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 ```
 
-`TestLifecycleContractDocker` and `TestDestroyLoadedDockerContainer` run later still, against the *published* image.
+`TestLifecycleContractDocker` and `TestDestroyLoadedDockerContainer` run later in that job, against the *published* image.
+The `tag` job needs `unit`, `runtime-library` and `image`: only a push to `main` that passed all three moves the tag.
 `TestCreateToRunDocker` runs in no ci.yml step at all — but the release
 workflow runs a plain `go test -v ./...` with no skip list, so every excluded
 test gates the release. A test that only fails there fails late.
