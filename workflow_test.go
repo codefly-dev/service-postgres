@@ -62,8 +62,7 @@ func TestCIWorkflowEnforcesMigrationRegression(t *testing.T) {
 		"the regression must run against the locally built image, which also makes the prerequisite mandatory")
 	require.Contains(t, regression.Run, "TestDirtyMigrationFailsClosed")
 
-	// The unit-test step deliberately carries no container-booting test; the
-	// regression must therefore be excluded there and present here, not neither.
+	// The migration regression has its own step against the locally built image.
 	unitTests := findWorkflowStep(t, imageJob, "Run unit tests")
 	require.Contains(t, unitTests.Run, "TestDirtyMigrationFailsClosed",
 		"the unit-test step must exclude the container-booting regression")
@@ -81,10 +80,7 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 
 	unitTests := findWorkflowStep(t, workflow.Jobs["image"], "Run unit tests")
 	require.Empty(t, unitTests.If)
-	// The lifecycle contract drives a real agent against the LOCKED runtime
-	// image, so it cannot run in the pre-publish unit-test step: a commit that
-	// relocks the digest would send it pulling an image this job has not pushed
-	// yet. It runs unconditionally once that image is verified present.
+	// The lifecycle contract has its own unconditional step against the locked image.
 	require.Contains(t, unitTests.Run, "TestLifecycleContractDocker")
 	lifecycle := findWorkflowStep(t, workflow.Jobs["image"], "Run runtime lifecycle tests")
 	require.Empty(t, lifecycle.If)
@@ -110,7 +106,9 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	tagIndex, tag := findWorkflowStepAt(t, imageJob, "Tag verified runtime image")
 	require.Less(t, candidateIndex, verifyCandidateIndex)
 	require.Less(t, verifyCandidateIndex, publishedIndex)
-	require.Less(t, publishedIndex, lifecycleIndex)
+	unitIndex, _ := findWorkflowStepAt(t, imageJob, "Run unit tests")
+	require.Less(t, publishedIndex, unitIndex, "bootstrap and fixture tests pull the locked runtime digest")
+	require.Less(t, unitIndex, lifecycleIndex)
 	require.Less(t, lifecycleIndex, scanIndex)
 	require.Less(t, scanIndex, tagIndex)
 	// Producing image evidence pulls every platform from the registry, so it
@@ -247,7 +245,7 @@ func TestRuntimeDockerfilePinsReproducibleBuildInputs(t *testing.T) {
 	require.Contains(t, dockerfile, "libcrypto3=3.5.9-r1")
 	require.Contains(t, dockerfile, "libssl3=3.5.9-r1")
 	require.Contains(t, dockerfile, "libuuid=2.42.3-r1")
-	require.Contains(t, dockerfile, "libxml2=2.13.9-r3")
+	require.Contains(t, dockerfile, "libxml2=2.13.9-r5")
 	require.Contains(t, dockerfile, "xz-libs=5.8.4-r0")
 	require.Contains(t, dockerfile, "musl=1.2.6-r3")
 	require.Contains(t, dockerfile, "musl-utils=1.2.6-r3")
