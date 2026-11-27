@@ -64,9 +64,6 @@ jobs:
       # archive checksum would pass CI.
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
-      - name: Run unit tests
-        run: go test ./... -skip '^(TestCreateToRunDocker|TestDestroyLoadedDockerContainer|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
-
       - name: Build runtime image
         run: docker build --build-arg SOURCE_DATE_EPOCH=0 --tag service-postgres:test .
 
@@ -194,6 +191,11 @@ jobs:
             ["linux/amd64", "linux/arm64"]
           ' <<< "$manifest"
           docker --config "$anonymous_docker_config" pull "$RUNTIME_IMAGE"
+
+      # Bootstrap parity and fixture tests run the locked digest on Docker.
+      # A relock makes it available to a clean runner at the pull above.
+      - name: Run unit tests
+        run: go test ./... -skip '^(TestCreateToRunDocker|TestDestroyLoadedDockerContainer|TestDirtyMigrationFailsClosed|TestLifecycleContractDocker|TestMigrationLockBudgetExpiresWhilePeerHoldsTheLock|TestMigrationStatementBudgetExpiresAndPreservesTheLedger)$' -timeout 20m
 
       - name: Run runtime lifecycle tests
         run: go test . -run '^(TestLifecycleContractDocker|TestDestroyLoadedDockerContainer)$' -count=1
