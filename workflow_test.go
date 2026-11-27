@@ -247,7 +247,7 @@ func TestRuntimeDockerfilePinsReproducibleBuildInputs(t *testing.T) {
 	require.Contains(t, dockerfile, "libcrypto3=3.5.9-r1")
 	require.Contains(t, dockerfile, "libssl3=3.5.9-r1")
 	require.Contains(t, dockerfile, "libuuid=2.42.3-r1")
-	require.Contains(t, dockerfile, "libxml2=2.13.9-r3")
+	require.Contains(t, dockerfile, "libxml2=2.13.9-r5")
 	require.Contains(t, dockerfile, "xz-libs=5.8.4-r0")
 	require.Contains(t, dockerfile, "musl=1.2.6-r3")
 	require.Contains(t, dockerfile, "musl-utils=1.2.6-r3")
