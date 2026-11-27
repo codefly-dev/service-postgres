@@ -222,3 +222,21 @@ or authorize changing previously applied migration bytes. Preserve the original
 inventory for an existing lineage and use its owner's reviewed forward migration
 path. Migration completion and access reconciliation remain separately recorded;
 schema changes are not undone when a later access check refuses a binding.
+
+### Cloud SQL consumer access
+
+The environment supplies the instance connection name, migration owner and
+runtime principals for each managed store. The platform's infrastructure
+creates the logical database named by the store's `spec.database-name`.
+Bootstrap connects to that database and applies its schema and grants.
+
+By default the runtime principals are members of the writer group. Codefly
+can select a subset through the managed service's `read-only-principals`
+setting, a comma-separated list of service account emails. These identities
+go into the reader group only. The CLI requests the scoped login mode when
+this setting is present, so an older agent rejects the deployment. Every reader
+must be a runtime consumer, and the migration owner cannot be a consumer.
+
+For a reader that should see only selected tables, use a delegated reader
+role as described above and grant it the required SQL privileges in the
+store's migrations. Tenant policies still apply to those tables.

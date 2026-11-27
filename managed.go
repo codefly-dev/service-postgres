@@ -49,6 +49,7 @@ const (
 	managedInstanceKey = "instance"
 	managedOwnerKey    = "owner-principal"
 	managedRuntimeKey  = "runtime-principals"
+	managedReadersKey  = "read-only-principals"
 
 	// managedAuthMode is the one managed mode: the cloud issues every login's
 	// credential, and no password exists to seed, store or rotate.
@@ -82,6 +83,7 @@ type managedDeployment struct {
 	OwnerPrincipal string
 	OwnerLogin     string
 	RuntimeLogins  []string
+	ReaderLogins   []string
 }
 
 // storeDeploymentOf reads the environment's declaration about this store from
@@ -121,7 +123,10 @@ func storeDeploymentOf(configuration *v0.Configuration, environment string) (*ma
 			return nil, fmt.Errorf("the environment declares this store managed but its %s has no %s: a managed store renders its migration and nothing else, so it is refused rather than deployed in the cluster", managedServiceInformation, key)
 		}
 	}
-	if values[managedAuthModeKey] != managedAuthMode {
+	if (values[managedAuthModeKey] == "external-identity-scoped") != (values[managedReadersKey] != "") {
+		return nil, fmt.Errorf("external-identity-scoped requires read-only principals")
+	}
+	if values[managedAuthModeKey] != managedAuthMode && values[managedAuthModeKey] != "external-identity-scoped" {
 		return nil, fmt.Errorf("managed store %s %q: the only managed mode is %q, where the cloud issues every credential", managedAuthModeKey, values[managedAuthModeKey], managedAuthMode)
 	}
 	if _, err := instance.ParseConnName(values[managedInstanceKey]); err != nil {
@@ -132,16 +137,40 @@ func storeDeploymentOf(configuration *v0.Configuration, environment string) (*ma
 		return nil, err
 	}
 	managed := &managedDeployment{Instance: values[managedInstanceKey], OwnerPrincipal: values[managedOwnerKey], OwnerLogin: owner}
+	readers := map[string]bool{}
+	if values[managedReadersKey] != "" {
+		for _, principal := range strings.Split(values[managedReadersKey], ",") {
+			login, err := cloudSQLLogin(managedReadersKey, strings.TrimSpace(principal))
+			if err != nil {
+				return nil, err
+			}
+			if readers[login] {
+				return nil, fmt.Errorf("duplicate read-only principal %q", login)
+			}
+			readers[login] = true
+		}
+	}
+	seen := map[string]bool{owner: true}
 	for _, principal := range strings.Split(values[managedRuntimeKey], ",") {
 		login, err := cloudSQLLogin(managedRuntimeKey, strings.TrimSpace(principal))
 		if err != nil {
 			return nil, err
 		}
-		if login == owner || slices.Contains(managed.RuntimeLogins, login) {
+		if seen[login] {
 			return nil, fmt.Errorf("managed store %s names %q twice or as the migration owner: each login is distinct", managedRuntimeKey, login)
 		}
-		managed.RuntimeLogins = append(managed.RuntimeLogins, login)
+		seen[login] = true
+		if readers[login] {
+			managed.ReaderLogins = append(managed.ReaderLogins, login)
+			delete(readers, login)
+		} else {
+			managed.RuntimeLogins = append(managed.RuntimeLogins, login)
+		}
 	}
+	if len(readers) != 0 {
+		return nil, fmt.Errorf("read-only principals must be consumers of this store")
+	}
+	slices.Sort(managed.ReaderLogins)
 	slices.Sort(managed.RuntimeLogins)
 	return managed, nil
 }
@@ -238,8 +267,8 @@ func (s *Builder) managedBinding(managed *managedDeployment) (string, error) {
 		PlanSHA256:          hex.EncodeToString(digest[:]),
 		PlanDigest:          plan.artifact().Digest,
 		OwnerRole:           managed.OwnerLogin,
-		ReadOnlyPrincipals:  []string{},
-		ReadWritePrincipals: managed.RuntimeLogins,
+		ReadOnlyPrincipals:  append([]string{}, managed.ReaderLogins...),
+		ReadWritePrincipals: append([]string{}, managed.RuntimeLogins...),
 	})
 	if err != nil {
 		return "", err

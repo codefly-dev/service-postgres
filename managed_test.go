@@ -365,3 +365,16 @@ func TestEmittedManagedBindingIsAcceptedByTheRunner(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "managed bootstrap connector:", "the runner stopped before the connector: it refused what the render emitted")
 }
+
+func TestManagedReadOnlyConsumers(t *testing.T) {
+	values := completeManagedValues()
+	values[managedAuthModeKey] = "external-identity-scoped"
+	values[managedReadersKey] = testRuntime
+	managed, err := storeDeploymentOf(managedServiceConfiguration(values), "test")
+	require.NoError(t, err)
+	require.Empty(t, managed.RuntimeLogins)
+	require.Equal(t, []string{strings.TrimSuffix(testRuntime, ".gserviceaccount.com")}, managed.ReaderLogins)
+	values[managedReadersKey] = testOwner
+	_, err = storeDeploymentOf(managedServiceConfiguration(values), "test")
+	require.Error(t, err)
+}
