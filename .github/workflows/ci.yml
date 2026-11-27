@@ -28,11 +28,10 @@ jobs:
       contents: read
     uses: codefly-dev/core/.github/workflows/go-service-ci.yml@18555ee1d782b6b37957d16c0a9195f7cd6f44ed
 
-  # The jobs below ran as one serial job; the unit tests and the runtime
-  # library need neither the image nor each other, so they run beside it. What
-  # their place in that one job guaranteed is kept by `tag`, which needs all
-  # three: nothing moves the shared tag unless every one of them passed.
+  # Bootstrap parity and fixture tests pull the locked digest. A relock
+  # first publishes and verifies that digest in the image job.
   unit:
+    needs: image
     permissions:
       contents: read
     runs-on: ubuntu-latest

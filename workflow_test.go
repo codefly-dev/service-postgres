@@ -105,6 +105,7 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	unitTests := findWorkflowStep(t, workflow.Jobs["unit"], "Run unit tests")
 	require.Empty(t, unitTests.If)
 	require.Empty(t, workflow.Jobs["unit"].If)
+	require.Equal(t, workflowNeeds{"image"}, workflow.Jobs["unit"].Needs, "bootstrap and fixture tests pull the locked digest")
 	// The arm64 case of the bootstrap image build test needs the emulator in
 	// the job that runs it.
 	findWorkflowAction(t, workflow.Jobs["unit"], "docker/setup-qemu-action")
@@ -137,7 +138,7 @@ func TestCIWorkflowValidatesLockedImageForEveryPullRequest(t *testing.T) {
 	publishedIndex, _ := findWorkflowStepAt(t, imageJob, "Verify published runtime image")
 	lifecycleIndex, _ := findWorkflowStepAt(t, imageJob, "Run runtime lifecycle tests")
 	scanIndex, scan := findWorkflowStepAt(t, imageJob, "Scan published runtime image")
-	// The unit tests and the runtime library run beside the image job, so the
+	// The unit tests, runtime library and image each gate the tag, so the
 	// tag move lives in a job of its own that needs all three: everything that
 	// gated the tag as an earlier step of one job still gates it.
 	tagJob := workflow.Jobs["tag"]
